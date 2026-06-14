@@ -4,39 +4,36 @@
 [![Built with Ona](https://ona.com/build-with-ona.svg)](https://app.ona.com/#https://github.com/Interested-Deving-1896/talos)
 
 <!-- AI:start:what-it-does -->
-Talos Linux is a container-optimized Linux distribution designed specifically for running Kubernetes clusters. It provides a minimal, immutable operating system with automated management workflows, ensuring consistency and security for infrastructure operators and platform engineers.
+Talos Linux is a container-optimized Linux distribution designed specifically for Kubernetes deployments. It provides a minimal, immutable operating system with automated management and security features tailored for running Kubernetes clusters. It is used by infrastructure engineers and platform teams to streamline cluster provisioning, maintenance, and operations.
 <!-- AI:end:what-it-does -->
 
 ## Architecture
 
 <!-- AI:start:architecture -->
-Talos Linux is designed as a minimal, immutable operating system for Kubernetes. The architecture consists of several key components:
+Talos Linux consists of modular components designed to support Kubernetes environments. The architecture includes the following key elements:
 
-1. **API Server**: Provides a gRPC-based interface for managing and configuring the system.
-2. **Controller Manager**: Handles system-level operations such as node initialization, updates, and service orchestration.
-3. **Bootstrap Process**: Ensures the system is configured and ready to join a Kubernetes cluster.
-4. **Immutable Filesystem**: Enforces immutability for the root filesystem, ensuring consistency and security.
-5. **Kubernetes Integration**: Includes built-in support for Kubernetes, with optimized configurations for cluster management.
+1. **API**: Provides a gRPC-based interface for managing and configuring Talos nodes.
+2. **cmd**: Contains CLI tools for interacting with Talos, including `talosctl`.
+3. **Internal Services**: Implements core functionalities such as bootstrapping, networking, and system management.
+4. **Configuration**: YAML-based configuration files define cluster and node settings.
+5. **Workflows**: GitHub Actions workflows automate CI/CD, artifact management, and repository synchronization.
 
-The repository is organized as follows:
+The components interact through well-defined APIs and configuration files. Talos nodes are immutable and managed declaratively, ensuring consistency across Kubernetes clusters.
 
+Directory structure:
 ```plaintext
 .
-├── api                # Protobuf definitions for Talos API
-├── cmd                # CLI tools and entry points
-├── config             # Configuration templates and schemas
-├── internal           # Internal libraries and utilities
-├── hack               # Development and testing scripts
-├── .github            # GitHub workflows for CI/CD
-├── Dockerfile         # Docker build configuration
-├── Makefile           # Build and utility tasks
-├── go.mod             # Go module dependencies
-├── go.sum             # Go module checksums
-├── README.md          # Project documentation
-└── SECURITY.md        # Security policies and guidelines
+├── api                 # gRPC API definitions
+├── cmd                 # CLI tools (e.g., talosctl)
+├── config              # Default configuration files
+├── internal            # Core services and utilities
+├── hack                # Development and debugging scripts
+├── .github             # GitHub Actions workflows
+├── Makefile            # Build and test automation
+├── go.mod              # Go module dependencies
+├── README.md           # Project documentation
+└── Dockerfile          # Container build configuration
 ```
-
-Components interact via the API server, which serves as the central point for managing system state and operations. Kubernetes integration is achieved through automated workflows and configuration management.
 <!-- AI:end:architecture -->
 
 ## Install
