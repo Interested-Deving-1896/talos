@@ -10,30 +10,30 @@ Talos Linux is a container-optimized Linux distribution designed specifically fo
 ## Architecture
 
 <!-- AI:start:architecture -->
-Talos Linux consists of modular components designed to support Kubernetes environments. The architecture includes the following key elements:
+Talos Linux consists of modular components designed to support Kubernetes clusters. The architecture includes a minimal, immutable operating system optimized for container orchestration. Core components include:
 
-1. **API**: Provides a gRPC-based interface for managing and configuring Talos nodes.
-2. **cmd**: Contains CLI tools for interacting with Talos, including `talosctl`.
-3. **Internal Services**: Implements core functionalities such as bootstrapping, networking, and system management.
-4. **Configuration**: YAML-based configuration files define cluster and node settings.
-5. **Workflows**: GitHub Actions workflows automate CI/CD, artifact management, and repository synchronization.
+- **API Server**: Manages system configuration and state via a gRPC API.
+- **Kubernetes Integration**: Provides seamless interaction with Kubernetes, including bootstrapping and lifecycle management.
+- **Immutable Filesystem**: Ensures system integrity by disallowing direct modifications to the root filesystem.
+- **Configuration Management**: Uses declarative YAML files to define system and cluster configurations.
 
-The components interact through well-defined APIs and configuration files. Talos nodes are immutable and managed declaratively, ensuring consistency across Kubernetes clusters.
+The repository is organized as follows:
 
-Directory structure:
 ```plaintext
 .
-├── api                 # gRPC API definitions
-├── cmd                 # CLI tools (e.g., talosctl)
-├── config              # Default configuration files
-├── internal            # Core services and utilities
-├── hack                # Development and debugging scripts
-├── .github             # GitHub Actions workflows
-├── Makefile            # Build and test automation
+├── api                 # Protobuf definitions for the Talos API
+├── cmd                 # CLI tools for interacting with Talos
+├── config              # Default configuration templates
+├── hack                # Development and testing scripts
+├── internal            # Internal libraries and utilities
+├── .github             # GitHub workflows for CI/CD
+├── Makefile            # Build and development tasks
 ├── go.mod              # Go module dependencies
 ├── README.md           # Project documentation
-└── Dockerfile          # Container build configuration
+└── Dockerfile          # Docker build configuration
 ```
+
+Components communicate via gRPC and are designed to be stateless, relying on Kubernetes for state management.
 <!-- AI:end:architecture -->
 
 ## Install
@@ -93,7 +93,7 @@ Direct commits to OSP or OOC are detected and opened as PRs back to `Interested-
 [@rsmitty](https://github.com/rsmitty) - 243 commits  
 [@Unix4ever](https://github.com/Unix4ever) - 175 commits  
 [@bradbeam](https://github.com/bradbeam) - 159 commits  
-[@Interested-Deving-1896](https://github.com/Interested-Deving-1896) - 153 commits  
+[@Interested-Deving-1896](https://github.com/Interested-Deving-1896) - 157 commits  
 [@AlekSi](https://github.com/AlekSi) - 113 commits  
 [@shanduur](https://github.com/shanduur) - 96 commits  
 [@utkuozdemir](https://github.com/utkuozdemir) - 91 commits  
