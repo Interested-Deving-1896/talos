@@ -92,8 +92,8 @@ Direct commits to OSP or OOC are detected and opened as PRs back to `Interested-
 [@frezbo](https://github.com/frezbo) - 522 commits  
 [@rsmitty](https://github.com/rsmitty) - 243 commits  
 [@Unix4ever](https://github.com/Unix4ever) - 175 commits  
+[@Interested-Deving-1896](https://github.com/Interested-Deving-1896) - 160 commits  
 [@bradbeam](https://github.com/bradbeam) - 159 commits  
-[@Interested-Deving-1896](https://github.com/Interested-Deving-1896) - 157 commits  
 [@AlekSi](https://github.com/AlekSi) - 113 commits  
 [@shanduur](https://github.com/shanduur) - 96 commits  
 [@utkuozdemir](https://github.com/utkuozdemir) - 91 commits  
