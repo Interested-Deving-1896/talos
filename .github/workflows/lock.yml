@@ -19,3 +19,7 @@ jobs:
           issue-inactive-days: "60"
           log-output: "true"
           process-only: issues
+          issue-lock-reason: resolved
+          pr-inactive-days: "365"
+          pr-lock-reason: resolved
+          discussion-inactive-days: "365"
