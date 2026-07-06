@@ -10,30 +10,32 @@ Talos Linux is a container-optimized Linux distribution designed specifically fo
 ## Architecture
 
 <!-- AI:start:architecture -->
-Talos Linux architecture consists of modular components designed for Kubernetes environments. The system is immutable, with a minimal userland and a focus on declarative configuration. Key components include:
+Talos Linux is designed as a minimal, immutable Linux distribution tailored for Kubernetes. The architecture consists of several key components:
 
-- **API Server**: Manages system configuration and state through a gRPC API.
-- **Kubernetes Integration**: Provides seamless integration with Kubernetes, including kubelet and CRI support.
-- **Bootloader and Init System**: Handles system initialization and ensures the system is ready for Kubernetes workloads.
-- **Filesystem Layout**: Uses an immutable root filesystem with a writable overlay for runtime changes.
-- **Workflows**: Automates CI/CD, artifact management, and repository synchronization.
+1. **API**: Provides a gRPC-based interface for managing and configuring the system.
+2. **Kernel and OS**: A minimal Linux kernel and userland optimized for containerized workloads.
+3. **Control Plane**: Handles cluster management, including bootstrapping and lifecycle operations.
+4. **CLI (`cmd/talosctl`)**: A command-line tool for interacting with Talos clusters.
+5. **Integration Workflows**: Automated workflows for CI/CD, artifact management, and repository synchronization.
 
-Components interact through well-defined APIs, ensuring modularity and maintainability. The repository structure is organized as follows:
+The repository is organized as follows:
 
 ```plaintext
 .
-├── api/               # gRPC API definitions
-├── cmd/               # CLI tools and entry points
-├── config/            # Default configuration files
-├── internal/          # Internal libraries and utilities
-├── hack/              # Development and testing scripts
-├── Dockerfile         # Container build definition
-├── Makefile           # Build and automation tasks
-├── go.mod             # Go module dependencies
-└── README.md          # Project documentation
+├── api                 # Protobuf definitions for Talos API
+├── cmd                 # CLI and other command-line tools
+├── config              # Configuration templates and examples
+├── internal            # Internal libraries and utilities
+├── hack                # Development and testing scripts
+├── internal            # Internal packages for core functionality
+├── .github             # GitHub Actions workflows
+├── Makefile            # Build and automation tasks
+├── go.mod              # Go module dependencies
+├── README.md           # Project documentation
+└── Dockerfile          # Docker image definition
 ```
 
-Workflows are defined in `.github/workflows/` and support CI/CD, artifact mirroring, and repository synchronization.
+Components interact via the API, enabling declarative configuration and management of Kubernetes clusters. Workflows in `.github/workflows` automate tasks like CI, artifact publishing, and repository synchronization.
 <!-- AI:end:architecture -->
 
 ## Install
