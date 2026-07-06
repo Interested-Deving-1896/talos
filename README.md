@@ -56,16 +56,16 @@ cd talos
 ## CI
 
 <!-- AI:start:ci -->
-- `ci.yaml`: Runs unit tests, linting, and builds the project. Requires no secrets.
-- `integration-*.yaml`: Various workflows for integration testing across environments (e.g., AWS, GCP, QEMU). Some workflows require secrets like `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, or `GCP_CREDENTIALS`.
-- `grype-scan-cron.yaml`: Performs vulnerability scans using Grype. Requires no secrets.
-- `artifacts-cron.yaml`: Periodically builds and uploads artifacts. Requires `ARTIFACTS_BUCKET` secret.
-- `mirror-*.yaml`: Synchronizes repositories and artifacts across mirrors (e.g., GitLab, OSP). Requires secrets like `GITLAB_TOKEN` and `OSP_TOKEN`.
+- `ci.yaml`: Runs unit tests, linting, and builds for the project. Requires no secrets.
+- `integration-*triggered.yaml`: Executes various integration tests for Kubernetes environments (e.g., AWS, GCP, QEMU). Requires secrets for cloud provider credentials and Kubernetes configurations.
+- `grype-scan-cron.yaml`: Performs vulnerability scanning on dependencies using Grype. Requires no secrets.
+- `artifacts-cron.yaml`: Periodically builds and uploads artifacts. Requires secrets for artifact storage credentials.
+- `mirror-*`: Synchronizes repositories, artifacts, and releases across GitHub, GitLab, and other mirrors. Requires secrets for API tokens of respective platforms.
 - `slack-notify-ci-failure.yaml`: Sends Slack notifications for CI failures. Requires `SLACK_WEBHOOK_URL` secret.
-- `update-homebrew.yaml`: Updates Homebrew formulas for the project. Requires `HOMEBREW_GITHUB_TOKEN` secret.
-- `validate-readme-render.yml`: Validates README rendering for correctness. Requires no secrets.
-- `rotate-token.yml`: Rotates access tokens for external services. Requires `ROTATION_SECRET` secret.
-- `quota-monitor.yml`: Monitors resource quotas and usage. Requires no secrets.
+- `update-homebrew.yaml`: Updates Homebrew formulas for Talos. Requires no secrets.
+- `validate-readme-render.yml`: Ensures README formatting and rendering correctness. Requires no secrets.
+- `rotate-token.yml`: Rotates API tokens for security. Requires secrets for token management.
+- `quota-monitor.yml`: Monitors resource quotas for cloud environments. Requires secrets for cloud provider credentials.
 <!-- AI:end:ci -->
 
 ## Mirror chain
