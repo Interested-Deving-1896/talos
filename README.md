@@ -1,7 +1,8 @@
 [update-readmes]   Mode: rewrite — migrating to template structure...
 # talos
 
-[![Built with Ona](https://ona.com/build-with-ona.svg)](https://app.ona.com/#https://github.com/Interested-Deving-1896/talos)
+[![Built with Ona](https://ona.com/build-with-ona.svg)](https://app.ona.com/#https://github.com/Interested-Deving-1896/talos) [![KDE Eco](https://img.shields.io/badge/KDE%20Eco-certified-brightgreen?logo=kde&logoColor=white&style=flat-square)](https://eco.kde.org/) [![Blue Angel](https://img.shields.io/badge/Blue%20Angel-DE--UZ%20215-0055a4?style=flat-square)](https://www.blauer-engel.de/en/certification/criteria) [![Energy](https://api.green-coding.io/v1/ci/badge/get?repo=Interested-Deving-1896%2Ftalos&branch=main&workflow=eco-audit.yml)](https://metrics.green-coding.io/ci-index.html)
+
 
 <!-- AI:start:what-it-does -->
 Talos Linux is a container-optimized Linux distribution designed specifically for running Kubernetes clusters. It provides a minimal, immutable operating system with a focus on security and automation, making it suitable for operators and developers managing Kubernetes infrastructure.
@@ -87,36 +88,36 @@ Direct commits to OSP or OOC are detected and opened as PRs back to `Interested-
 ## Contributors
 
 <!-- AI:start:contributors -->
-[@smira](https://github.com/smira) - 2734 commits  
-[@andrewrynhard](https://github.com/andrewrynhard) - 1105 commits  
-[@frezbo](https://github.com/frezbo) - 522 commits  
-[@rsmitty](https://github.com/rsmitty) - 243 commits  
-[@Unix4ever](https://github.com/Unix4ever) - 175 commits  
-[@Interested-Deving-1896](https://github.com/Interested-Deving-1896) - 162 commits  
-[@bradbeam](https://github.com/bradbeam) - 159 commits  
-[@AlekSi](https://github.com/AlekSi) - 113 commits  
-[@shanduur](https://github.com/shanduur) - 96 commits  
-[@utkuozdemir](https://github.com/utkuozdemir) - 91 commits  
-[@sergelogvinov](https://github.com/sergelogvinov) - 85 commits  
-[@dsseng](https://github.com/dsseng) - 74 commits  
-[@Ulexus](https://github.com/Ulexus) - 68 commits  
-[@Orzelius](https://github.com/Orzelius) - 49 commits  
-[@TimJones](https://github.com/TimJones) - 42 commits  
-[@steverfrancis](https://github.com/steverfrancis) - 40 commits  
-[@rothgar](https://github.com/rothgar) - 23 commits  
-[@tgerla](https://github.com/tgerla) - 23 commits  
-[@Iheanacho-ai](https://github.com/Iheanacho-ai) - 19 commits  
-[@mcanevet](https://github.com/mcanevet) - 15 commits  
-[@nberlee](https://github.com/nberlee) - 15 commits  
-[@laurazard](https://github.com/laurazard) - 13 commits  
-[@jnohlgard](https://github.com/jnohlgard) - 12 commits  
-[@jonkerj](https://github.com/jonkerj) - 10 commits  
-[@salkin](https://github.com/salkin) - 9 commits  
-[@oscr](https://github.com/oscr) - 9 commits  
-[@patatman](https://github.com/patatman) - 8 commits  
-[@oguzkilcan](https://github.com/oguzkilcan) - 8 commits  
-[@flokli](https://github.com/flokli) - 6 commits  
-[@alongwill](https://github.com/alongwill) - 5 commits  
+[@smira](https://github.com/smira) - 2734 commits
+[@andrewrynhard](https://github.com/andrewrynhard) - 1105 commits
+[@frezbo](https://github.com/frezbo) - 522 commits
+[@rsmitty](https://github.com/rsmitty) - 243 commits
+[@Unix4ever](https://github.com/Unix4ever) - 175 commits
+[@Interested-Deving-1896](https://github.com/Interested-Deving-1896) - 162 commits
+[@bradbeam](https://github.com/bradbeam) - 159 commits
+[@AlekSi](https://github.com/AlekSi) - 113 commits
+[@shanduur](https://github.com/shanduur) - 96 commits
+[@utkuozdemir](https://github.com/utkuozdemir) - 91 commits
+[@sergelogvinov](https://github.com/sergelogvinov) - 85 commits
+[@dsseng](https://github.com/dsseng) - 74 commits
+[@Ulexus](https://github.com/Ulexus) - 68 commits
+[@Orzelius](https://github.com/Orzelius) - 49 commits
+[@TimJones](https://github.com/TimJones) - 42 commits
+[@steverfrancis](https://github.com/steverfrancis) - 40 commits
+[@rothgar](https://github.com/rothgar) - 23 commits
+[@tgerla](https://github.com/tgerla) - 23 commits
+[@Iheanacho-ai](https://github.com/Iheanacho-ai) - 19 commits
+[@mcanevet](https://github.com/mcanevet) - 15 commits
+[@nberlee](https://github.com/nberlee) - 15 commits
+[@laurazard](https://github.com/laurazard) - 13 commits
+[@jnohlgard](https://github.com/jnohlgard) - 12 commits
+[@jonkerj](https://github.com/jonkerj) - 10 commits
+[@salkin](https://github.com/salkin) - 9 commits
+[@oscr](https://github.com/oscr) - 9 commits
+[@patatman](https://github.com/patatman) - 8 commits
+[@oguzkilcan](https://github.com/oguzkilcan) - 8 commits
+[@flokli](https://github.com/flokli) - 6 commits
+[@alongwill](https://github.com/alongwill) - 5 commits
 <!-- AI:end:contributors -->
 
 ## Origins
@@ -130,6 +131,20 @@ _Original project — no upstream fork._
 <!-- AI:start:resources -->
 _No additional resource files found._
 <!-- AI:end:resources -->
+
+<!-- AI:start:accessibility -->
+This repo uses automated accessibility auditing via `check-accessibility.yml`.
+
+Checks include: CODEOWNERS ownership coverage, README screen-reader compatibility,
+WCAG 2.1 AA HTML compliance, audio overview (espeak-ng), and Braille output (liblouis).
+
+
+
+
+Run the [Check Accessibility](https://github.com/Interested-Deving-1896/talos/actions/workflows/check-accessibility.yml)
+workflow to generate the first report and accessibility artifacts.
+See [DOCS/accessibility.md](https://github.com/Interested-Deving-1896/talos/blob/main/DOCS/accessibility.md) for the full reference.
+<!-- AI:end:accessibility -->
 
 ## License
 
