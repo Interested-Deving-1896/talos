@@ -52,7 +52,7 @@ jobs:
           endpoint: tcp://buildkit-amd64.ci.svc.cluster.local:1234
         timeout-minutes: 10
       - name: login-to-registry
-        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # version: v4.1.0
+        uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # version: v4.5.1
         with:
           password: ${{ secrets.GITHUB_TOKEN }}
           registry: ghcr.io
