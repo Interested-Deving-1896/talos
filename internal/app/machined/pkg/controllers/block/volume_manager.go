@@ -31,7 +31,6 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/proto"
 	"github.com/siderolabs/talos/pkg/machinery/resources/block"
 	"github.com/siderolabs/talos/pkg/machinery/resources/hardware"
-	"github.com/siderolabs/talos/pkg/machinery/resources/runtime"
 	"github.com/siderolabs/talos/pkg/machinery/resources/secrets"
 )
 
@@ -73,14 +72,9 @@ func (ctrl *VolumeManagerController) Inputs() []controller.Input {
 			Kind:      controller.InputWeak,
 		},
 		{
-			Namespace: runtime.NamespaceName,
-			Type:      runtime.DevicesStatusType,
-			ID:        optional.Some(runtime.DevicesID),
-			Kind:      controller.InputWeak,
-		},
-		{
 			Namespace: block.NamespaceName,
-			Type:      block.DiscoveryRefreshStatusType,
+			Type:      block.DiscoveredVolumesStatusType,
+			ID:        optional.Some(block.DiscoveredVolumesStatusID),
 			Kind:      controller.InputWeak,
 		},
 		{
@@ -116,10 +110,6 @@ func (ctrl *VolumeManagerController) Outputs() []controller.Output {
 			Type: block.VolumeStatusType,
 			Kind: controller.OutputExclusive,
 		},
-		{
-			Type: block.DiscoveryRefreshRequestType,
-			Kind: controller.OutputExclusive,
-		},
 	}
 }
 
@@ -127,11 +117,6 @@ func (ctrl *VolumeManagerController) Outputs() []controller.Output {
 //
 //nolint:gocyclo,cyclop
 func (ctrl *VolumeManagerController) Run(ctx context.Context, r controller.Runtime, logger *zap.Logger) error {
-	var (
-		deviceReadyObserved bool
-		deviceReadyRequest  int
-	)
-
 	retryTicker := time.NewTicker(30 * time.Second)
 	defer retryTicker.Stop()
 
@@ -150,35 +135,12 @@ func (ctrl *VolumeManagerController) Run(ctx context.Context, r controller.Runti
 			shouldRetry = false
 		}
 
-		// if devices are not ready, we can't provision and locate most volumes
-		devicesStatus, err := safe.ReaderGetByID[*runtime.DevicesStatus](ctx, r, runtime.DevicesID)
+		discoveredVolumesStatus, err := safe.ReaderGetByID[*block.DiscoveredVolumesStatus](ctx, r, block.DiscoveredVolumesStatusID)
 		if err != nil && !state.IsNotFoundError(err) {
-			return fmt.Errorf("error fetching devices status: %w", err)
+			return fmt.Errorf("error fetching discovered volumes status: %w", err)
 		}
 
-		devicesReady := devicesStatus != nil && devicesStatus.TypedSpec().Ready
-
-		if devicesReady && !deviceReadyObserved {
-			deviceReadyObserved = true
-
-			// udevd reports that devices are ready, now it's time to refresh the discovery volumes
-			if err = safe.WriterModify(ctx, r, block.NewDiscoveryRefreshRequest(block.NamespaceName, block.RefreshID), func(drr *block.DiscoveryRefreshRequest) error {
-				drr.TypedSpec().Request++
-				deviceReadyRequest = drr.TypedSpec().Request
-
-				return nil
-			}); err != nil {
-				return fmt.Errorf("error updating discovery refresh request: %w", err)
-			}
-		}
-
-		refreshStatus, err := safe.ReaderGetByID[*block.DiscoveryRefreshStatus](ctx, r, block.RefreshID)
-		if err != nil && !state.IsNotFoundError(err) {
-			return fmt.Errorf("error fetching discovery refresh status: %w", err)
-		}
-
-		// now devicesReady is only true if the refresh status is up to date
-		devicesReady = devicesReady && refreshStatus != nil && refreshStatus.TypedSpec().Request == deviceReadyRequest
+		devicesReady := discoveredVolumesStatus != nil && discoveredVolumesStatus.TypedSpec().Ready
 
 		discoveredVolumes, err := safe.ReaderListAll[*block.DiscoveredVolume](ctx, r)
 		if err != nil {
@@ -359,6 +321,14 @@ func (ctrl *VolumeManagerController) Run(ctx context.Context, r controller.Runti
 				volumeStatuses[vc.Metadata().ID()] = volumeStatus
 			}
 
+			// propagate resolved trim/scrub configuration and the encryption discard setting to the status,
+			// so consumers (e.g. the trim/scrub schedule controllers) don't need to read the volume config.
+			volumeStatus.TypedSpec().TrimEnabled = vc.TypedSpec().TrimEnabled
+			volumeStatus.TypedSpec().TrimInterval = vc.TypedSpec().TrimInterval
+			volumeStatus.TypedSpec().ScrubEnabled = vc.TypedSpec().ScrubEnabled
+			volumeStatus.TypedSpec().ScrubInterval = vc.TypedSpec().ScrubInterval
+			volumeStatus.TypedSpec().EncryptionAllowDiscards = vc.TypedSpec().Encryption.AllowDiscards
+
 			if tearingDown && volumeStatus.Metadata().Phase() != resource.PhaseTearingDown {
 				// volume status is not yet in the tearing down phase, so move it there
 				_, err = r.Teardown(ctx, volumeStatus.Metadata())
@@ -447,7 +417,9 @@ func (ctrl *VolumeManagerController) Run(ctx context.Context, r controller.Runti
 			}
 
 			// when closing, ignore META volume, we want it to stay longer, so no problem if is not closed yet
-			allClosed = allClosed && (volumeStatus.TypedSpec().Phase == block.VolumePhaseClosed || vc.Metadata().ID() == constants.MetaPartitionLabel)
+			allClosed = allClosed && (volumeStatus.TypedSpec().Phase == block.VolumePhaseClosed ||
+				vc.Metadata().ID() == constants.MetaPartitionLabel ||
+				isFailedUserVolumeProvisioning(volumeLifecycleTearingDown, vc, volumeStatus))
 
 			if shouldCloseVolume && volumeStatus.TypedSpec().Phase == block.VolumePhaseClosed {
 				if volumeParentStatus != nil {
@@ -490,6 +462,54 @@ func (ctrl *VolumeManagerController) Run(ctx context.Context, r controller.Runti
 				return fmt.Errorf("error removing finalizer from volume lifecycle: %w", err)
 			}
 		}
+	}
+}
+
+// userConfiguredVolumeLabels are the labels for volumes provisioned from user machine
+// configuration (as opposed to system volumes). A failing allocation of any of these
+// must not block a global volume lifecycle teardown (e.g. reset/reboot/upgrade).
+var userConfiguredVolumeLabels = []string{
+	block.UserVolumeLabel,
+	block.RawVolumeLabel,
+	block.ExistingVolumeLabel,
+	block.SwapVolumeLabel,
+}
+
+// isFailedUserVolumeProvisioning reports whether a volume is a user-configured volume
+// whose provisioning failed before it was ever provisioned/mounted, during a global
+// volume lifecycle teardown. Such volumes have nothing to close (no mount, no open
+// crypto device), so they should not hold up the teardown - otherwise a user volume
+// referencing a non-existent disk blocks reset until the teardown times out.
+func isFailedUserVolumeProvisioning(volumeLifecycleTearingDown bool, volumeConfig *block.VolumeConfig, volumeStatus *block.VolumeStatus) bool {
+	if !volumeLifecycleTearingDown || volumeStatus.TypedSpec().Phase != block.VolumePhaseFailed {
+		return false
+	}
+
+	isUserConfigured := false
+
+	for _, label := range userConfiguredVolumeLabels {
+		if _, ok := volumeConfig.Metadata().Labels().Raw()[label]; ok {
+			isUserConfigured = true
+
+			break
+		}
+	}
+
+	if !isUserConfigured {
+		return false
+	}
+
+	switch volumeStatus.TypedSpec().PreFailPhase {
+	case block.VolumePhaseWaiting, block.VolumePhaseMissing, block.VolumePhaseLocated,
+		block.VolumePhaseProvisioned, block.VolumePhaseFailed, block.VolumePhaseClosed:
+		// never opened a device or a mount, so there is nothing to close: safe to skip
+		return true
+	case block.VolumePhaseReady, block.VolumePhasePrepared:
+		// volume was decrypted and/or mounted, it needs a real close - must not skip
+		return false
+	default:
+		// unknown/new phase: stay strict and keep blocking the teardown
+		return false
 	}
 }
 

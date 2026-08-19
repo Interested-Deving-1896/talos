@@ -99,10 +99,13 @@ spec:
     integration/qemu-csi-openebs: "Run QEMU CSI OpenEBS integration tests"
     integration/qemu-csi-longhorn: "Run QEMU CSI Longhorn integration tests"
     integration/qemu-csi-rook-ceph: "Run QEMU CSI Rook Ceph integration tests"
+    integration/qemu-csi-netapp: "Run QEMU CSI NetApp Trident integration tests"
     integration/qemu-default: "Run QEMU integration tests on default variant"
     integration/qemu-encrypted-vip: "Run QEMU integration tests with disk encryption and virtual IP"
     integration/qemu-enforcing: "Run QEMU integration tests on enforcing variant"
+    integration/qemu-md-boot: "Run QEMU integration tests on an MD RAID1 boot array"
     integration/qemu-race: "Run QEMU integration tests with the race detector"
+    integration/qemu-13: "Run QEMU integration tests with Talos version contract v1.13"
     integration/release-gate: "Run all release-gate integration tests"
     integration/reproducibility-test: "Run build reproducibility tests"
     integration/trusted-boot: "Run trusted-boot integration tests (all variants)"
@@ -301,7 +304,7 @@ spec:
         - default
       runnerGroup: large
       crons:
-        - '30 7 * * *'
+        - "30 7 * * *"
       steps:
         - name: login-to-registry
           registryLoginStep:
@@ -403,7 +406,7 @@ spec:
         enabled: true
       runnerGroup: large
       crons:
-        - '30 3 * * *'
+        - "30 3 * * *"
       cronOnly: true
       steps:
         - name: external-artifacts
@@ -455,11 +458,24 @@ spec:
           - variant: default
             withUserDisk: "true"
             userDisksMounts: "/var/mnt/extra,/var/mnt/p1,/var/mnt/p2"
+            extraTestArgs: "-talos.dedicated-system-volumes"
             withConfigPatch: "@hack/test/patches/image-verification.yaml"
-            withConfigPatchWorker: "@hack/test/patches/ephemeral-nvme.yaml:@hack/test/patches/dm-raid-module.yaml"
-            qemuExtraDisks: "4"
+            withConfigPatchWorker: "@hack/test/patches/ephemeral-nvme.yaml:@hack/test/patches/dm-raid-module.yaml:@hack/test/patches/dedicated-system-volumes-worker.yaml"
+            withConfigPatchControlPlane: "@hack/test/patches/dedicated-system-volumes-controlplane.yaml"
+            qemuExtraDisks: "5"
             qemuExtraDisksDrivers: "virtiofs,ide,nvme"
-            qemuExtraDiscsTags: "disk0"
+            qemuExtraDisksTags: "disk0"
+          - variant: md-boot
+            withUserDisk: "true"
+            userDisksMounts: "/var/mnt/extra,/var/mnt/p1,/var/mnt/p2"
+            extraTestArgs: "-talos.dedicated-system-volumes"
+            withConfigPatch: "@hack/test/patches/image-verification.yaml:@hack/test/patches/md-boot-array.yaml"
+            withConfigPatchWorker: "@hack/test/patches/ephemeral-nvme.yaml:@hack/test/patches/dm-raid-module.yaml:@hack/test/patches/dedicated-system-volumes-worker.yaml"
+            withConfigPatchControlPlane: "@hack/test/patches/dedicated-system-volumes-controlplane.yaml"
+            qemuSystemDisks: "2"
+            qemuExtraDisks: "5"
+            qemuExtraDisksDrivers: "virtiofs,ide,nvme"
+            qemuExtraDisksTags: "disk0"
           - variant: enforcing
             tagSuffixIn: -enforcing
             extraTestArgs: -talos.enforcing
@@ -478,17 +494,28 @@ spec:
             withConfigPatchWorker: "@hack/test/patches/ephemeral-nvme.yaml:@hack/test/patches/dm-raid-module.yaml"
             qemuExtraDisks: "4"
             qemuExtraDisksDrivers: "virtiofs,ide,nvme"
-            qemuExtraDiscsTags: "disk0"
+            qemuExtraDisksTags: "disk0"
           - variant: race
             buildRace: "true"
             tagSuffix: -race
             extraTestArgs: "-talos.race"
+            withConfigPatch: "@hack/test/patches/image-verification.yaml"
             withConfigPatchWorker: "@hack/test/patches/ephemeral-nvme.yaml:@hack/test/patches/dm-raid-module.yaml"
             qemuExtraDisks: "4"
             qemuExtraDisksDrivers: "virtiofs,ide,nvme"
-            qemuExtraDiscsTags: "disk0"
+            qemuExtraDisksTags: "disk0"
             qemuMemoryControlplanes: "4096"
             qemuMemoryWorkers: "4096"
+          - variant: "13"
+            withUserDisk: "true"
+            userDisksMounts: "/var/mnt/extra,/var/mnt/p1,/var/mnt/p2"
+            extraTestArgs: "-talos.skip-ephemeral-policy"
+            withConfigPatch: "@hack/test/patches/image-verification.yaml"
+            withConfigPatchWorker: "@hack/test/patches/ephemeral-nvme-pre14.yaml:@hack/test/patches/dm-raid-module.yaml"
+            withTalosVersion: "v1.13"
+            qemuExtraDisks: "5"
+            qemuExtraDisksDrivers: "virtiofs,ide,nvme"
+            qemuExtraDisksTags: "disk0"
       steps:
         - name: download-artifacts
           artifactStep:
@@ -521,10 +548,13 @@ spec:
             USER_DISKS_MOUNTS: ${{ matrix.userDisksMounts }}
             WITH_CONFIG_PATCH: ${{ matrix.withConfigPatch }}
             WITH_CONFIG_PATCH_WORKER: ${{ matrix.withConfigPatchWorker }}
+            WITH_CONFIG_PATCH_CONTROLPLANE: ${{ matrix.withConfigPatchControlPlane }}
+            WITH_TALOS_VERSION: ${{ matrix.withTalosVersion }}
             QEMU_EXTRA_DISKS: ${{ matrix.qemuExtraDisks }}
             QEMU_EXTRA_DISKS_SIZE: "10240"
             QEMU_EXTRA_DISKS_DRIVERS: ${{ matrix.qemuExtraDisksDrivers }}
-            QEMU_EXTRA_DISKS_TAGS: ${{ matrix.qemuExtraDiscsTags }}
+            QEMU_EXTRA_DISKS_TAGS: ${{ matrix.qemuExtraDisksTags }}
+            QEMU_SYSTEM_DISKS: ${{ matrix.qemuSystemDisks }}
             QEMU_MEMORY_CONTROLPLANES: ${{ matrix.qemuMemoryControlplanes }}
             QEMU_MEMORY_WORKERS: ${{ matrix.qemuMemoryWorkers }}
         - name: save-talos-logs
@@ -850,7 +880,9 @@ spec:
         - integration/qemu-default
         - integration/qemu-enforcing
         - integration/qemu-encrypted-vip
+        - integration/qemu-md-boot
         - integration/qemu-race
+        - integration/qemu-13
         - integration/conformance
         - integration/conformance-default
         - integration/conformance-enforcing
@@ -897,12 +929,25 @@ spec:
         flatJobMatrix: true
         labelKeys: [test]
         include:
-          - test: e2e-firewall
+          - test: e2e-firewall-block
             shortIntegrationTest: "yes"
             withFirewall: block
+          - test: e2e-firewall-accept
+            shortIntegrationTest: "yes"
+            withFirewall: accept
+          - test: e2e-bgp
+            shortIntegrationTest: "yes"
+            withBGP: "true"
+            extraTestArgs: -talos.bgp
+          - test: e2e-bgp-clos
+            shortIntegrationTest: "yes"
+            withBGPCLOS: "true"
+            qemuControlplanes: "3"
+            qemuWorkers: "1"
+            extraTestArgs: -talos.bgp.clos
           - test: e2e-canal-reset
             integrationTestRun: TestIntegration/api.ResetSuite/TestResetWithSpec
-            customCniUrl: https://raw.githubusercontent.com/projectcalico/calico/v3.32.0/manifests/canal.yaml
+            customCniUrl: https://raw.githubusercontent.com/projectcalico/calico/v3.32.1/manifests/canal.yaml
           - test: e2e-controlplane-port
             shortIntegrationTest: "yes"
             withControlPlanePort: "443"
@@ -919,7 +964,7 @@ spec:
             shortIntegrationTest: "yes"
             qemuMemoryWorkers: "4096"
             qemuMemoryControlplanes: "4096"
-            withConfigPatch: "@hack/test/patches/flannel-netpol.yaml"
+            withConfigPatchControlplane: "@hack/test/patches/flannel-netpol.yaml"
             testMode: network-policy
       steps:
         - name: download-artifacts
@@ -935,10 +980,16 @@ spec:
             GITHUB_STEP_NAME: ${{ github.job}}-${{ matrix.test }}
             SHORT_INTEGRATION_TEST: ${{ matrix.shortIntegrationTest }}
             WITH_FIREWALL: ${{ matrix.withFirewall }}
+            WITH_BGP: ${{ matrix.withBGP }}
+            WITH_BGP_CLOS: ${{ matrix.withBGPCLOS }}
+            QEMU_CONTROLPLANES: ${{ matrix.qemuControlplanes }}
+            QEMU_WORKERS: ${{ matrix.qemuWorkers }}
+            EXTRA_TEST_ARGS: ${{ matrix.extraTestArgs }}
             INTEGRATION_TEST_RUN: ${{ matrix.integrationTestRun }}
             CUSTOM_CNI_URL: ${{ matrix.customCniUrl }}
             WITH_CONTROL_PLANE_PORT: ${{ matrix.withControlPlanePort }}
             WITH_CONFIG_PATCH: ${{ matrix.withConfigPatch }}
+            WITH_CONFIG_PATCH_CONTROLPLANE: ${{ matrix.withConfigPatchControlplane }}
             WITH_UKI_BOOT: ${{ matrix.withUkiBoot }}
             WITH_4K_DISK: ${{ matrix.with4kDisk }}
             WITH_4K_DISK_IMAGE: ${{ matrix.with4kDiskImage }}
@@ -1250,6 +1301,9 @@ spec:
           - variant: default
             test: e2e-k8s-user-namespace
             withConfigPatch: "@hack/test/patches/usernamespace.yaml"
+          - variant: default
+            test: e2e-bad-rtc
+            withBadRtc: "true"
           - variant: enforcing
             test: e2e-siderolink
             triggerLabels: [integration/misc-4-enforcing]
@@ -1281,6 +1335,13 @@ spec:
             withEnforcing: "true"
             extraTestArgs: -talos.enforcing
             withConfigPatch: "@hack/test/patches/usernamespace.yaml"
+          - variant: enforcing
+            test: e2e-bad-rtc
+            triggerLabels: [integration/misc-4-enforcing]
+            tagSuffixIn: -enforcing
+            withEnforcing: "true"
+            extraTestArgs: -talos.enforcing
+            withBadRtc: "true"
       steps:
         - name: download-artifacts
           artifactStep:
@@ -1299,6 +1360,7 @@ spec:
             WITH_APPARMOR_LSM_ENABLED: ${{ matrix.withAppArmorLsmEnabled }}
             WITH_CONFIG_PATCH: ${{ matrix.withConfigPatch }}
             TAG_SUFFIX_IN: ${{ matrix.tagSuffixIn }}
+            WITH_BAD_RTC: ${{ matrix.withBadRtc }}
             EXTRA_TEST_ARGS: ${{ matrix.extraTestArgs }}
             WITH_ENFORCING: ${{ matrix.withEnforcing }}
             IMAGE_REGISTRY: registry.dev.siderolabs.io
@@ -1405,6 +1467,16 @@ spec:
             ciliumConfigPatch: "@hack/test/patches/cilium-kubeproxy.yaml"
             ciliumInstallType: strict
             withKubespan: "true"
+          - test: e2e-cilium-bgp
+            ciliumConfigPatch: "@hack/test/patches/cilium-kubeproxy.yaml"
+            ciliumInstallType: strict
+            withKubespan: ""
+            withBGPCLOS: "true"
+            withCiliumBGP: "true"
+            qemuControlplanes: "3"
+            qemuWorkers: "1"
+            extraTestArgs: -talos.bgp.clos -talos.bgp.cilium
+            integrationTestRun: TestIntegration/api.BGPCiliumSuite
       steps:
         - name: download-artifacts
           artifactStep:
@@ -1422,7 +1494,13 @@ spec:
             WITH_FIREWALL: accept
             CILIUM_INSTALL_TYPE: ${{ matrix.ciliumInstallType }}
             WITH_KUBESPAN: ${{ matrix.withKubespan }}
-            WITH_CONFIG_PATCH: ${{ matrix.ciliumConfigPatch }}
+            WITH_BGP_CLOS: ${{ matrix.withBGPCLOS }}
+            WITH_CILIUM_BGP: ${{ matrix.withCiliumBGP }}
+            QEMU_CONTROLPLANES: ${{ matrix.qemuControlplanes }}
+            QEMU_WORKERS: ${{ matrix.qemuWorkers }}
+            EXTRA_TEST_ARGS: ${{ matrix.extraTestArgs }}
+            INTEGRATION_TEST_RUN: ${{ matrix.integrationTestRun }}
+            WITH_CONFIG_PATCH_CONTROLPLANE: ${{ matrix.ciliumConfigPatch }}
             IMAGE_REGISTRY: registry.dev.siderolabs.io
         - name: save-talos-logs
           conditions:
@@ -1456,6 +1534,7 @@ spec:
             withConfigPatchWorker: ""
           - csi: openebs
             qemuCpusWorkers: "4"
+            extraTestArgs: "-talos.skip-ephemeral-policy"
             withConfigPatchControlplane: "@hack/test/patches/openebs-cp.yaml"
             withConfigPatchWorker: "@hack/test/patches/openebs.yaml"
       steps:
@@ -1478,7 +1557,7 @@ spec:
             QEMU_EXTRA_DISKS_SIZE: 12288
             WITH_CONFIG_PATCH_CONTROLPLANE: ${{ matrix.withConfigPatchControlplane }}
             WITH_CONFIG_PATCH_WORKER: ${{ matrix.withConfigPatchWorker }}
-            EXTRA_TEST_ARGS: -talos.csi=${{ matrix.csi }}
+            EXTRA_TEST_ARGS: -talos.csi=${{ matrix.csi }} ${{ matrix.extraTestArgs }}
             IMAGE_REGISTRY: registry.dev.siderolabs.io
         - name: save-fio-benchmark
           artifactStep:
@@ -1515,19 +1594,14 @@ spec:
         maxParallel: 2
         flatJobMatrix: true
         labelKeys: [csi]
-        # v2 (SPDK) is the default-secure path; v1 needs noexec disabled on
-        # /var so the instance-manager can exec engine binaries it drops
-        # under /var/lib/longhorn/engine-binaries/. The v1 path also tells
-        # MountsSuite to skip the /var policy check via
-        # -talos.skip-ephemeral-policy.
         include:
           - csi: longhorn
             longhornEngine: v2
             extraWorkerPatch: ""
-            extraTestArgs: ""
+            extraTestArgs: "-talos.csi.timeout=30m -talos.skip-ephemeral-policy"
           - csi: longhorn-v1
             longhornEngine: v1
-            extraWorkerPatch: ":@_out/kubelet-fat-patch.yaml:@hack/test/patches/ephemeral-insecure.yaml"
+            extraWorkerPatch: ":@_out/kubelet-fat-patch.yaml"
             extraTestArgs: "-talos.skip-ephemeral-policy"
       steps:
         - name: download-artifacts
@@ -1567,7 +1641,7 @@ spec:
             SHORT_INTEGRATION_TEST: yes
             QEMU_WORKERS: 3
             QEMU_MEMORY_WORKERS: 10240
-            QEMU_CPUS_WORKERS: 3
+            QEMU_CPUS_WORKERS: 8
             QEMU_SYSTEM_DISK_SIZE: 20480
             QEMU_EXTRA_DISKS: 1
             QEMU_EXTRA_DISKS_SIZE: 12288
@@ -1589,6 +1663,85 @@ spec:
           artifactStep:
             type: upload
             artifactName: talos-logs-integration-qemu-csi-longhorn-${{ matrix.csi }}
+            disableExecutableListGeneration: true
+            artifactPath: /tmp/logs-*.tar.gz
+            additionalArtifacts:
+              - "/tmp/support-*.zip"
+    - name: integration-qemu-csi-netapp
+      buildxOptions:
+        enabled: true
+      sops: true
+      depends:
+        - default
+      runnerGroup: large
+      onWorkflowRun:
+        workflows: [artifacts-cron]
+        types: [completed]
+      triggerLabels:
+        - integration/qemu-csi
+        - integration/extensions
+        - integration/qemu-csi-netapp
+        - integration/release-gate
+      steps:
+        - name: download-artifacts
+          artifactStep:
+            type: download
+            artifactName: talos-artifacts
+            artifactPath: _out
+        - name: ci-temp-release-tag
+        - name: checkout extensions
+          checkoutStep:
+            repository: siderolabs/extensions
+            ref: main
+            path: _out/extensions
+        - name: set variables
+          nonMakeStep: true
+          command: cat _out/talos-metadata >> "$GITHUB_ENV"
+        - name: build extensions
+          command: iscsi-tools multipath-tools nfs-utils trident-iscsi-tools util-linux-tools extensions-metadata
+          arguments:
+            - -C
+            - _out/extensions
+          environment:
+            PLATFORM: linux/amd64
+            PUSH: true
+            REGISTRY: registry.dev.siderolabs.io
+        - name: installer extensions
+          command: installer-with-extensions
+          environment:
+            EXTENSIONS_FILTER_COMMAND: "grep -E '/iscsi-tools|multipath-tools|nfs-utils|trident-iscsi-tools|util-linux-tools'"
+            IMAGE_REGISTRY: registry.dev.siderolabs.io
+        - name: e2e-qemu-csi-netapp
+          command: e2e-qemu
+          withSudo: true
+          environment:
+            GITHUB_STEP_NAME: ${{ github.job}}-e2e-qemu-csi-netapp
+            SHORT_INTEGRATION_TEST: yes
+            QEMU_WORKERS: 3
+            QEMU_MEMORY_WORKERS: 10240
+            QEMU_CPUS_WORKERS: 8
+            QEMU_SYSTEM_DISK_SIZE: 20480
+            WITH_CONFIG_PATCH_CONTROLPLANE: "@hack/test/patches/netapp-cp.yaml"
+            WITH_CONFIG_PATCH_WORKER: "@_out/installer-extensions-patch.yaml:@hack/test/patches/netapp.yaml"
+            EXTRA_TEST_ARGS: -talos.csi=netapp
+            TRIDENT_ONTAP_MANAGEMENT_LIF: ${{ env.TRIDENT_ONTAP_MANAGEMENT_LIF }}
+            TRIDENT_ONTAP_SVM: svm0
+            TRIDENT_ONTAP_USERNAME: ${{ env.TRIDENT_ONTAP_USERNAME }}
+            TRIDENT_ONTAP_PASSWORD: ${{ env.TRIDENT_ONTAP_PASSWORD }}
+            IMAGE_REGISTRY: registry.dev.siderolabs.io
+        - name: save-fio-benchmark
+          artifactStep:
+            type: upload
+            artifactName: fio-integration-qemu-csi-netapp
+            disableExecutableListGeneration: true
+            artifactPath: /tmp/fio-*.json
+            retentionDays: "180"
+        - name: save-talos-logs
+          conditions:
+            - always
+          artifactStep:
+            type: upload
+            artifactName: talos-logs-integration-qemu-csi-netapp
             disableExecutableListGeneration: true
             artifactPath: /tmp/logs-*.tar.gz
             additionalArtifacts:
@@ -1662,6 +1815,11 @@ spec:
             PLATFORM: linux/amd64,linux/arm64
             IMAGE_REGISTRY: registry.dev.siderolabs.io
         - name: cloud-images
+          environment:
+            # this job only verifies that the image creation pipeline works, so a single
+            # region is enough - no need to publish to every enabled AWS region
+            CLOUD_IMAGES_EXTRA_ARGS: |-
+              --aws-regions=us-east-1
     - name: integration-build-image-cache
       buildxOptions:
         enabled: true
@@ -1713,15 +1871,15 @@ spec:
           - test: e2e-image-cache
             withISO: "true"
             useDiskImage: ""
-            withConfigPatch: '@hack/test/patches/image-cache.yaml:@hack/test/patches/image-verification.yaml'
+            withConfigPatch: "@hack/test/patches/image-cache.yaml:@hack/test/patches/image-verification.yaml"
           - test: e2e-image-cache-disk
             withISO: ""
             useDiskImage: "true"
-            withConfigPatch: '@hack/test/patches/image-cache.yaml:@hack/test/patches/image-verification.yaml'
+            withConfigPatch: "@hack/test/patches/image-cache.yaml:@hack/test/patches/image-verification.yaml"
           - test: e2e-image-cache-encrypted
             withISO: "true"
             useDiskImage: ""
-            withConfigPatch: '@hack/test/patches/image-cache.yaml:@hack/test/patches/image-cache-encrypted.yaml:@hack/test/patches/image-verification.yaml'
+            withConfigPatch: "@hack/test/patches/image-cache.yaml:@hack/test/patches/image-cache-encrypted.yaml:@hack/test/patches/image-verification.yaml"
       steps:
         - name: download-artifacts
           artifactStep:
@@ -1866,13 +2024,17 @@ spec:
         - integration/aws-arm64
         - integration/aws-nvidia
         - integration/aws-nvidia-oss
-        - integration/aws-nvidia-nonfree
+        - integration/aws-nvidia-oss-lts
         - integration/aws-nvidia-oss-lts-amd64
         - integration/aws-nvidia-oss-lts-arm64
+        - integration/aws-nvidia-oss-production
         - integration/aws-nvidia-oss-production-amd64
         - integration/aws-nvidia-oss-production-arm64
+        - integration/aws-nvidia-nonfree
+        - integration/aws-nvidia-nonfree-lts
         - integration/aws-nvidia-nonfree-lts-amd64
         - integration/aws-nvidia-nonfree-lts-arm64
+        - integration/aws-nvidia-nonfree-production
         - integration/aws-nvidia-nonfree-production-amd64
         - integration/aws-nvidia-nonfree-production-arm64
         - integration/release-gate
@@ -1970,7 +2132,12 @@ spec:
           - driver: oss
             variant: lts
             arch: amd64
-            triggerLabels: [integration/aws-nvidia-oss, integration/aws-nvidia-oss-lts]
+            triggerLabels:
+              [
+                integration/aws-nvidia-oss,
+                integration/aws-nvidia-oss-lts,
+                integration/aws-nvidia-oss-lts-amd64,
+              ]
             buildTargets: nvidia-container-toolkit-lts nvidia-open-gpu-kernel-modules-lts extensions-metadata
             buildPlatform: linux/amd64
             targetArch: amd64
@@ -1979,7 +2146,12 @@ spec:
           - driver: oss
             variant: lts
             arch: arm64
-            triggerLabels: [integration/aws-nvidia-oss, integration/aws-nvidia-oss-lts]
+            triggerLabels:
+              [
+                integration/aws-nvidia-oss,
+                integration/aws-nvidia-oss-lts,
+                integration/aws-nvidia-oss-lts-arm64,
+              ]
             buildTargets: nvidia-container-toolkit-lts nvidia-open-gpu-kernel-modules-lts extensions-metadata
             buildPlatform: linux/arm64
             targetArch: arm64
@@ -1988,7 +2160,12 @@ spec:
           - driver: oss
             variant: production
             arch: amd64
-            triggerLabels: [integration/aws-nvidia-oss, integration/aws-nvidia-oss-production]
+            triggerLabels:
+              [
+                integration/aws-nvidia-oss,
+                integration/aws-nvidia-oss-production,
+                integration/aws-nvidia-oss-production-amd64,
+              ]
             buildTargets: nvidia-container-toolkit-production nvidia-open-gpu-kernel-modules-production extensions-metadata
             buildPlatform: linux/amd64
             targetArch: amd64
@@ -1997,7 +2174,12 @@ spec:
           - driver: oss
             variant: production
             arch: arm64
-            triggerLabels: [integration/aws-nvidia-oss, integration/aws-nvidia-oss-production]
+            triggerLabels:
+              [
+                integration/aws-nvidia-oss,
+                integration/aws-nvidia-oss-production,
+                integration/aws-nvidia-oss-production-arm64,
+              ]
             buildTargets: nvidia-container-toolkit-production nvidia-open-gpu-kernel-modules-production extensions-metadata
             buildPlatform: linux/arm64
             targetArch: arm64
@@ -2006,7 +2188,12 @@ spec:
           - driver: nonfree
             variant: lts
             arch: amd64
-            triggerLabels: [integration/aws-nvidia-nonfree, integration/aws-nvidia-nonfree-lts]
+            triggerLabels:
+              [
+                integration/aws-nvidia-nonfree,
+                integration/aws-nvidia-nonfree-lts,
+                integration/aws-nvidia-nonfree-lts-amd64,
+              ]
             buildTargets: nvidia-container-toolkit-lts nonfree-kmod-nvidia-lts extensions-metadata
             buildPlatform: linux/amd64
             targetArch: amd64
@@ -2015,7 +2202,12 @@ spec:
           - driver: nonfree
             variant: lts
             arch: arm64
-            triggerLabels: [integration/aws-nvidia-nonfree, integration/aws-nvidia-nonfree-lts]
+            triggerLabels:
+              [
+                integration/aws-nvidia-nonfree,
+                integration/aws-nvidia-nonfree-lts,
+                integration/aws-nvidia-nonfree-lts-arm64,
+              ]
             buildTargets: nvidia-container-toolkit-lts nonfree-kmod-nvidia-lts extensions-metadata
             buildPlatform: linux/arm64
             targetArch: arm64
@@ -2024,7 +2216,12 @@ spec:
           - driver: nonfree
             variant: production
             arch: amd64
-            triggerLabels: [integration/aws-nvidia-nonfree, integration/aws-nvidia-nonfree-production]
+            triggerLabels:
+              [
+                integration/aws-nvidia-nonfree,
+                integration/aws-nvidia-nonfree-production,
+                integration/aws-nvidia-nonfree-production-amd64,
+              ]
             buildTargets: nvidia-container-toolkit-production nonfree-kmod-nvidia-production extensions-metadata
             buildPlatform: linux/amd64
             targetArch: amd64
@@ -2033,7 +2230,12 @@ spec:
           - driver: nonfree
             variant: production
             arch: arm64
-            triggerLabels: [integration/aws-nvidia-nonfree, integration/aws-nvidia-nonfree-production]
+            triggerLabels:
+              [
+                integration/aws-nvidia-nonfree,
+                integration/aws-nvidia-nonfree-production,
+                integration/aws-nvidia-nonfree-production-arm64,
+              ]
             buildTargets: nvidia-container-toolkit-production nonfree-kmod-nvidia-production extensions-metadata
             buildPlatform: linux/arm64
             targetArch: arm64

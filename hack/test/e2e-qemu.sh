@@ -35,6 +35,12 @@ case "${WITH_UEFI:-none}" in
     ;;
 esac
 
+case "${WITH_BAD_RTC:-none}" in
+  true)
+    QEMU_FLAGS+=("--bad-rtc")
+    ;;
+esac
+
 case "${WITH_VIRTUAL_IP:-false}" in
   true)
     QEMU_FLAGS+=("--use-vip")
@@ -58,6 +64,18 @@ esac
 case "${WITH_KUBESPAN:-false}" in
   true)
     QEMU_FLAGS+=("--with-kubespan")
+    ;;
+esac
+
+case "${WITH_BGP:-false}" in
+  true)
+    QEMU_FLAGS+=("--with-bgp")
+    ;;
+esac
+
+case "${WITH_BGP_CLOS:-false}" in
+  true)
+    QEMU_FLAGS+=("--with-bgp-clos")
     ;;
 esac
 
@@ -106,7 +124,7 @@ case "${USE_DISK_IMAGE:-false}" in
   false)
     ;;
   *)
-    QEMU_FLAGS+=("--disk-image-path=_out/metal-amd64.raw.zst")
+    QEMU_FLAGS+=("--disk-image-path=_out/metal-amd64.raw.zst" "--skip-unattended-install-config")
     ;;
 esac
 
@@ -267,6 +285,14 @@ case "${WITH_USER_DISK:-false}" in
     ;;
 esac
 
+case "${WITH_TALOS_VERSION:-none}" in
+  none)
+    ;;
+  *)
+    QEMU_FLAGS+=("--talos-version=${WITH_TALOS_VERSION}")
+    ;;
+esac
+
 case "${WITH_ENFORCING:-false}" in
   false)
     ;;
@@ -321,18 +347,19 @@ function create_cluster {
     --provisioner="${PROVISIONER}" \
     --name="${CLUSTER_NAME}" \
     --kubernetes-version="${KUBERNETES_VERSION}" \
-    --controlplanes=3 \
+    --controlplanes="${QEMU_CONTROLPLANES:-3}" \
     --workers="${QEMU_WORKERS:-2}" \
     --disk="${QEMU_SYSTEM_DISK_SIZE:-15360}" \
+    --primary-disks="${QEMU_SYSTEM_DISKS:-1}" \
     --extra-disks="${QEMU_EXTRA_DISKS:-0}" \
     --extra-disks-size="${QEMU_EXTRA_DISKS_SIZE:-6144}" \
     --extra-disks-drivers="${QEMU_EXTRA_DISKS_DRIVERS:-}" \
     --extra-disks-serials="${QEMU_EXTRA_DISKS_SERIALS:-}" \
     --extra-disks-tags="${QEMU_EXTRA_DISKS_TAGS:-}" \
     --mtu=1430 \
-    --memory="${QEMU_MEMORY_CONTROLPLANES:-2048}" \
+    --memory="${QEMU_MEMORY_CONTROLPLANES:-4096}" \
     --memory-workers="${QEMU_MEMORY_WORKERS:-2048}" \
-    --cpus="${QEMU_CPUS:-2}" \
+    --cpus="${QEMU_CPUS:-4}" \
     --cpus-workers="${QEMU_CPUS_WORKERS:-2}" \
     --cidr=172.20.1.0/24 \
     --install-image="${INSTALLER_IMAGE}" \

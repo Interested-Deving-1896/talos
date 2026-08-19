@@ -19,16 +19,16 @@ NAME = Talos
 CLOUD_IMAGES_EXTRA_ARGS ?= ""
 ZSTD_COMPRESSION_LEVEL ?= 18
 
-CI_RELEASE_TAG := $(shell git log --oneline --format=%B -n 1 HEAD^2 -- 2>/dev/null | head -n 1 | sed -r "/^release\(.*\)/ s/^release\((.*)\):.*$$/\\1/; t; Q")
+CI_RELEASE_TAG := $(shell git log --oneline --format=%B -n 1 HEAD^2 -- 2>/dev/null | head -n 1 | sed -nE "s/^release\((.*)\):.*$$/\\1/p")
 
 ARTIFACTS := _out
 
 EMBED_TARGET ?= embed
 
 TOOLS_PREFIX ?= ghcr.io/siderolabs/tools
-TOOLS ?= v1.14.0-alpha.0-10-g808f34f
+TOOLS ?= v1.15.0-alpha.0-1-gfd531a3
 PKGS_PREFIX ?= ghcr.io/siderolabs
-PKGS ?= v1.14.0-alpha.0-63-gc0ec8f3
+PKGS ?= v1.15.0-alpha.0-2-gc9173bb
 GENERATE_VEX_PREFIX ?= ghcr.io/siderolabs/generate-vex
 GENERATE_VEX ?= latest
 
@@ -37,6 +37,7 @@ CONFORMANCE_IMAGE ?= ghcr.io/siderolabs/conform:latest
 IMAGE_SIGNER_RELEASE ?= v0.3.2
 
 PKG_APPARMOR ?= $(PKGS_PREFIX)/apparmor:$(PKGS)
+PKG_BTRFSPROGS ?= $(PKGS_PREFIX)/btrfsprogs:$(PKGS)
 PKG_CA_CERTIFICATES ?= $(PKGS_PREFIX)/ca-certificates:$(PKGS)
 PKG_CNI ?= $(PKGS_PREFIX)/cni:$(PKGS)
 PKG_CONTAINERD ?= $(PKGS_PREFIX)/containerd:$(PKGS)
@@ -69,9 +70,11 @@ PKG_LIBNFTNL ?= $(PKGS_PREFIX)/libnftnl:$(PKGS)
 PKG_LIBPOPT ?= $(PKGS_PREFIX)/libpopt:$(PKGS)
 PKG_LIBSELINUX ?= $(PKGS_PREFIX)/libselinux:$(PKGS)
 PKG_LIBSEPOL ?= $(PKGS_PREFIX)/libsepol:$(PKGS)
+PKG_LIBUCONTEXT ?= $(PKGS_PREFIX)/libucontext:$(PKGS)
 PKG_LIBURCU ?= $(PKGS_PREFIX)/liburcu:$(PKGS)
 PKG_LINUX_FIRMWARE ?= $(PKGS_PREFIX)/linux-firmware:$(PKGS)
 PKG_LVM2 ?= $(PKGS_PREFIX)/lvm2:$(PKGS)
+PKG_MDADM ?= $(PKGS_PREFIX)/mdadm-pkg:$(PKGS)
 PKG_MTOOLS ?= $(PKGS_PREFIX)/mtools:$(PKGS)
 PKG_MUSL ?= $(PKGS_PREFIX)/musl:$(PKGS)
 PKG_NFTABLES ?= $(PKGS_PREFIX)/nftables:$(PKGS)
@@ -95,7 +98,7 @@ PKG_ZSTD ?= $(PKGS_PREFIX)/zstd:$(PKGS)
 # renovate: datasource=github-tags depName=golang/go
 GO_VERSION ?= 1.26
 # renovate: datasource=npm depName=markdownlint-cli
-MARKDOWNLINTCLI_VERSION ?= 0.48.0
+MARKDOWNLINTCLI_VERSION ?= 0.49.1
 OPERATING_SYSTEM := $(shell uname -s | tr "[:upper:]" "[:lower:]")
 ARCH := $(shell uname -m | sed 's/x86_64/amd64/' | sed 's/aarch64/arm64/')
 TALOSCTL_DEFAULT_TARGET := talosctl-$(OPERATING_SYSTEM)
@@ -103,13 +106,13 @@ TALOSCTL_EXECUTABLE := $(PWD)/$(ARTIFACTS)/$(TALOSCTL_DEFAULT_TARGET)-$(ARCH)
 INTEGRATION_TEST := integration-test
 INTEGRATION_TEST_PROVISION_DEFAULT_TARGET := integration-test-provision-$(OPERATING_SYSTEM)
 # renovate: datasource=github-releases depName=kubernetes/kubernetes
-KUBECTL_VERSION ?= v1.36.1
+KUBECTL_VERSION ?= v1.37.0-rc.0
 # renovate: datasource=github-releases depName=kastenhq/kubestr
 KUBESTR_VERSION ?= v0.4.49
 # renovate: datasource=github-releases depName=helm/helm
-HELM_VERSION ?= v4.1.4
+HELM_VERSION ?= v4.2.3
 # renovate: datasource=github-releases depName=cilium/cilium-cli
-CILIUM_CLI_VERSION ?= v0.19.2
+CILIUM_CLI_VERSION ?= v0.19.7
 # renovate: datasource=github-releases depName=microsoft/secureboot_objects
 MICROSOFT_SECUREBOOT_RELEASE ?= v1.1.3
 
@@ -118,7 +121,7 @@ KUBESTR_URL ?= https://github.com/kastenhq/kubestr/releases/download/$(KUBESTR_V
 HELM_URL ?= https://get.helm.sh/helm-$(HELM_VERSION)-linux-amd64.tar.gz
 CILIUM_CLI_URL ?= https://github.com/cilium/cilium-cli/releases/download/$(CILIUM_CLI_VERSION)/cilium-$(OPERATING_SYSTEM)-amd64.tar.gz
 TESTPKGS ?= github.com/siderolabs/talos/...
-RELEASES ?= v1.12.6 v1.13.0
+RELEASES ?= v1.12.9 v1.13.7
 SHORT_INTEGRATION_TEST ?=
 CUSTOM_CNI_URL ?=
 
@@ -165,6 +168,8 @@ COMMON_ARGS := --file=Dockerfile
 COMMON_ARGS += --progress=$(PROGRESS)
 COMMON_ARGS += --platform=$(PLATFORM)
 COMMON_ARGS += --push=$(PUSH)
+COMMON_ARGS += --provenance=false
+COMMON_ARGS += --sbom=false
 
 COMMON_ARGS += --build-arg=ABBREV_TAG=$(ABBREV_TAG)
 COMMON_ARGS += --build-arg=ARTIFACTS=$(ARTIFACTS)
@@ -183,6 +188,7 @@ COMMON_ARGS += --build-arg=MARKDOWNLINTCLI_VERSION=$(MARKDOWNLINTCLI_VERSION)
 COMMON_ARGS += --build-arg=MICROSOFT_SECUREBOOT_RELEASE=$(MICROSOFT_SECUREBOOT_RELEASE)
 COMMON_ARGS += --build-arg=NAME="$(NAME)"
 COMMON_ARGS += --build-arg=PKG_APPARMOR=$(PKG_APPARMOR)
+COMMON_ARGS += --build-arg=PKG_BTRFSPROGS=$(PKG_BTRFSPROGS)
 COMMON_ARGS += --build-arg=PKG_CA_CERTIFICATES=$(PKG_CA_CERTIFICATES)
 COMMON_ARGS += --build-arg=PKG_CNI=$(PKG_CNI)
 COMMON_ARGS += --build-arg=PKG_CONTAINERD=$(PKG_CONTAINERD)
@@ -215,9 +221,11 @@ COMMON_ARGS += --build-arg=PKG_LIBNFTNL=$(PKG_LIBNFTNL)
 COMMON_ARGS += --build-arg=PKG_LIBPOPT=$(PKG_LIBPOPT)
 COMMON_ARGS += --build-arg=PKG_LIBSELINUX=$(PKG_LIBSELINUX)
 COMMON_ARGS += --build-arg=PKG_LIBSEPOL=$(PKG_LIBSEPOL)
+COMMON_ARGS += --build-arg=PKG_LIBUCONTEXT=$(PKG_LIBUCONTEXT)
 COMMON_ARGS += --build-arg=PKG_LIBURCU=$(PKG_LIBURCU)
 COMMON_ARGS += --build-arg=PKG_LINUX_FIRMWARE=$(PKG_LINUX_FIRMWARE)
 COMMON_ARGS += --build-arg=PKG_LVM2=$(PKG_LVM2)
+COMMON_ARGS += --build-arg=PKG_MDADM=$(PKG_MDADM)
 COMMON_ARGS += --build-arg=PKG_MTOOLS=$(PKG_MTOOLS)
 COMMON_ARGS += --build-arg=PKG_NFTABLES=$(PKG_NFTABLES)
 COMMON_ARGS += --build-arg=PKG_MUSL=$(PKG_MUSL)
@@ -256,7 +264,7 @@ COMMON_ARGS += --build-arg=ZSTD_COMPRESSION_LEVEL=$(ZSTD_COMPRESSION_LEVEL)
 
 CI_ARGS ?=
 
-EXTENSIONS_FILTER_COMMAND ?= grep -vE 'tailscale|xen-guest-agent|nvidia|vmtoolsd-guest-agent|metal-agent|cloudflared|zerotier|nebula|newt|netbird|multipath-tools|trident-iscsi-tools'
+EXTENSIONS_FILTER_COMMAND ?= grep -vE 'tailscale|xen-guest-agent|nvidia|vmtoolsd-guest-agent|metal-agent|cloudflared|zerotier|nebula|newt|netbird|multipath-tools|trident-iscsi-tools|-snapshotter|hyperv-guest-agent|/qemu:'
 
 all: initramfs kernel installer imager talosctl talosctl-image talos
 
@@ -442,8 +450,8 @@ image-%: ## Builds the specified image. Valid options are aws, azure, digital-oc
 .PHONY: images-essential
 images-essential: image-metal image-metal-uki installer secureboot-installer ## Builds only essential images used in the CI.
 
-# Defines all known images (AWS, Azure, DigitalOcean, Exoscale, Cloudstack, GCP, HCloud, Metal, NoCloud, OpenNebula, OpenStack, Oracle, Scaleway, UpCloud, Vultr and VMware).
-IMAGES := image-akamai image-aws image-azure image-digital-ocean image-exoscale image-cloudstack image-gcp image-hcloud image-iso image-metal image-metal-uki image-nocloud image-opennebula image-openstack image-oracle image-scaleway image-upcloud image-vmware image-vultr
+# Defines all known images (Akamai, Alibaba Cloud, AWS, Azure, DigitalOcean, Exoscale, Cloudstack, GCP, HCloud, Metal, NoCloud, OpenNebula, OpenStack, Oracle, Scaleway, UpCloud, Vultr and VMware).
+IMAGES := image-akamai image-alibabacloud image-aws image-azure image-digital-ocean image-exoscale image-cloudstack image-gcp image-hcloud image-iso image-metal image-metal-uki image-nocloud image-opennebula image-openstack image-oracle image-scaleway image-upcloud image-vmware image-vultr
 
 .PHONY: images
 images: $(IMAGES)
@@ -460,12 +468,13 @@ IMAGES_LIST :=
 installer: ## Builds the installer and outputs it to the artifact directory.
 	@$(MAKE) image-installer IMAGER_ARGS="--base-installer-image $(REGISTRY_AND_USERNAME)/installer-base$(IMAGE_NAME_SUFFIX):$(IMAGE_TAG_IN) $(IMAGER_ARGS)"
 
-	@crane_args=""
-	@for platform in $(subst $(,),$(space),$(PLATFORM)); do \
-		arch=$$(basename "$${platform}") && \
-		image=$$(crane push $(ARTIFACTS)/installer-$${arch}.tar $(REGISTRY_AND_USERNAME)/installer$(IMAGE_NAME_SUFFIX):$(IMAGE_TAG_OUT)-$${arch}) && \
-		crane_args="$${crane_args} -m $${image}" && \
-		rm -f $(ARTIFACTS)/installer-$${arch}.tar ; \
+	@set -e; \
+	crane_args=""; \
+	for platform in $(subst $(,),$(space),$(PLATFORM)); do \
+		arch=$$(basename "$${platform}"); \
+		image=$$(crane push $(ARTIFACTS)/installer-$${arch}.tar $(REGISTRY_AND_USERNAME)/installer$(IMAGE_NAME_SUFFIX):$(IMAGE_TAG_OUT)-$${arch}); \
+		crane_args="$${crane_args} -m $${image}"; \
+		rm -f $(ARTIFACTS)/installer-$${arch}.tar; \
 	done; \
 	crane index append -t "${REGISTRY_AND_USERNAME}/installer$(IMAGE_NAME_SUFFIX):${IMAGE_TAG_OUT}" $${crane_args}
 	@echo "${REGISTRY_AND_USERNAME}/installer$(IMAGE_NAME_SUFFIX):${IMAGE_TAG_OUT}" > $(ARTIFACTS)/installer_image
@@ -474,18 +483,20 @@ installer: ## Builds the installer and outputs it to the artifact directory.
 .PHONY: secureboot-installer
 secureboot-installer: ## Builds UEFI only installer which uses UKI and push it to the registry.
 	@$(MAKE) image-secureboot-installer IMAGER_ARGS="--base-installer-image $(REGISTRY_AND_USERNAME)/installer-base$(IMAGE_NAME_SUFFIX):$(IMAGE_TAG_IN) $(IMAGER_ARGS)"
-	@for platform in $(subst $(,),$(space),$(PLATFORM)); do \
-		arch=$$(basename "$${platform}") && \
-		crane push $(ARTIFACTS)/installer-$${arch}-secureboot.tar $(REGISTRY_AND_USERNAME)/installer$(IMAGE_NAME_SUFFIX):$(IMAGE_TAG_OUT)-$${arch}-secureboot && \
-		rm -f $(ARTIFACTS)/installer-$${arch}-secureboot.tar ; \
+	@set -e; \
+	for platform in $(subst $(,),$(space),$(PLATFORM)); do \
+		arch=$$(basename "$${platform}"); \
+		crane push $(ARTIFACTS)/installer-$${arch}-secureboot.tar $(REGISTRY_AND_USERNAME)/installer$(IMAGE_NAME_SUFFIX):$(IMAGE_TAG_OUT)-$${arch}-secureboot; \
+		rm -f $(ARTIFACTS)/installer-$${arch}-secureboot.tar; \
 	done
 
 .PHONY: talosctl-cni-bundle
-talosctl-cni-bundle: ## Creates a compressed tarball that includes CNI bundle for talosctl.
+talosctl-cni-bundle: | $(ARTIFACTS) ## Creates a compressed tarball that includes CNI bundle for talosctl.
 	@$(MAKE) local-$@ DEST=$(ARTIFACTS)
-	@for platform in $(subst $(,),$(space),$(PLATFORM)); do \
-		arch=`basename "$${platform}"` ; \
-		tar  -C $(ARTIFACTS)/talosctl-cni-bundle-$${arch} -czf $(ARTIFACTS)/talosctl-cni-bundle-$${arch}.tar.gz . ; \
+	@set -e; \
+	for platform in $(subst $(,),$(space),$(PLATFORM)); do \
+		arch=`basename "$${platform}"`; \
+		tar -C $(ARTIFACTS)/talosctl-cni-bundle-$${arch} -czf $(ARTIFACTS)/talosctl-cni-bundle-$${arch}.tar.gz .; \
 	done
 	@rm -rf $(ARTIFACTS)/talosctl-cni-bundle-*/
 
@@ -505,10 +516,11 @@ uki-certs: talosctl ## Generate test certificates for SecureBoot/PCR Signing
 	@$(TALOSCTL_EXECUTABLE) gen secureboot database
 
 .PHONY: integration-images-list
-integration-images-list: ## Generate list of integration images.
-	@docker run --entrypoint /usr/local/bin/e2e.test registry.k8s.io/conformance:$(KUBECTL_VERSION) --list-images | \
-		$(TALOSCTL_EXECUTABLE) images integration --installer-tag=$(IMAGE_TAG_IN) --registry-and-user=$(REGISTRY_AND_USERNAME) \
-		> $(ARTIFACTS)/integration-images.txt
+integration-images-list: | $(ARTIFACTS) ## Generate list of integration images.
+	@docker run --entrypoint /usr/local/bin/e2e.test registry.k8s.io/conformance:$(KUBECTL_VERSION) --list-images > $(ARTIFACTS)/integration-images-raw.txt
+	@$(TALOSCTL_EXECUTABLE) images integration --installer-tag=$(IMAGE_TAG_IN) --registry-and-user=$(REGISTRY_AND_USERNAME) \
+		< $(ARTIFACTS)/integration-images-raw.txt > $(ARTIFACTS)/integration-images.txt
+	@rm -f $(ARTIFACTS)/integration-images-raw.txt
 
 IGNORE_CACHE_IMAGES ?= registry.k8s.io/e2e-test-images/node-perf/pytorch-wide-deep
 # Convert space-separated list into grep-compatible regex (img1|img2|img3)
@@ -520,8 +532,9 @@ empty :=
 
 .PHONY: cache-create
 cache-create: installer imager integration-images-list ## Generate image cache.
-	@grep -vE "$(IGNORE_CACHE_IMAGES_RE)" $(ARTIFACTS)/integration-images.txt | \
-		$(TALOSCTL_EXECUTABLE) images cache-create --image-cache-path=/tmp/cache.tar --images=- --force
+	@grep -vE "$(IGNORE_CACHE_IMAGES_RE)" $(ARTIFACTS)/integration-images.txt > $(ARTIFACTS)/integration-images.filtered.txt
+	@$(TALOSCTL_EXECUTABLE) images cache-create --image-cache-path=/tmp/cache.tar --images=- --force < $(ARTIFACTS)/integration-images.filtered.txt
+	@rm -f $(ARTIFACTS)/integration-images.filtered.txt
 	@crane push /tmp/cache.tar $(REGISTRY_AND_USERNAME)/image-cache:$(IMAGE_TAG_OUT)
 	@$(MAKE) image-iso IMAGER_ARGS="--image-cache=$(REGISTRY_AND_USERNAME)/image-cache:$(IMAGE_TAG_OUT) --extra-kernel-arg='console=ttyS0'"
 	@$(MAKE) image-metal IMAGER_ARGS="--image-cache=$(REGISTRY_AND_USERNAME)/image-cache:$(IMAGE_TAG_OUT) --extra-kernel-arg='console=ttyS0'"
@@ -546,6 +559,10 @@ lint: ## Runs linters on go, vulncheck, deadcode, protobuf, and markdown file ty
 .PHONY: lint-fmt
 lint-fmt: ## Run all linter formatters and fix up the source tree.
 	@$(MAKE) local-lint-golangci-lint-fmt DEST=./ PLATFORM=linux/$(ARCH)
+
+.PHONY: golangci-lint-custom
+golangci-lint-custom: ## Builds the custom golangci-lint binary with the loglinter plugin for the host OS/arch and outputs it to the artifact directory.
+	@$(MAKE) local-$@ DEST=$(ARTIFACTS) PLATFORM=$(OPERATING_SYSTEM)/$(ARCH) PUSH=false
 
 check-dirty: ## Verifies that source tree is not dirty
 	@if test -n "`git status --porcelain`"; then echo "Source tree is dirty"; git status; git diff; exit 1 ; fi
@@ -586,19 +603,25 @@ $(ARTIFACTS)/$(INTEGRATION_TEST_PROVISION_DEFAULT_TARGET)-amd64:
 	@$(MAKE) local-$(INTEGRATION_TEST_PROVISION_DEFAULT_TARGET) DEST=$(ARTIFACTS) PLATFORM=linux/amd64 WITH_RACE=true
 
 $(ARTIFACTS)/kubectl: | $(ARTIFACTS)
-	@curl -L -o $(ARTIFACTS)/kubectl "$(KUBECTL_URL)"
+	@curl --fail -L -o $(ARTIFACTS)/kubectl "$(KUBECTL_URL)"
 	@chmod +x $(ARTIFACTS)/kubectl
 
 $(ARTIFACTS)/kubestr: | $(ARTIFACTS)
-	@curl -L "$(KUBESTR_URL)" | tar xzf - -C $(ARTIFACTS) kubestr
+	@curl --fail -L -o $(ARTIFACTS)/kubestr.tar.gz "$(KUBESTR_URL)"
+	@tar xzf $(ARTIFACTS)/kubestr.tar.gz -C $(ARTIFACTS) kubestr
+	@rm -f $(ARTIFACTS)/kubestr.tar.gz
 	@chmod +x $(ARTIFACTS)/kubestr
 
 $(ARTIFACTS)/helm: | $(ARTIFACTS)
-	@curl -L "$(HELM_URL)" | tar xzf - -C $(ARTIFACTS) --strip-components=1 linux-amd64/helm
+	@curl --fail -L -o $(ARTIFACTS)/helm.tar.gz "$(HELM_URL)"
+	@tar xzf $(ARTIFACTS)/helm.tar.gz -C $(ARTIFACTS) --strip-components=1 linux-amd64/helm
+	@rm -f $(ARTIFACTS)/helm.tar.gz
 	@chmod +x $(ARTIFACTS)/helm
 
 $(ARTIFACTS)/cilium: | $(ARTIFACTS)
-	@curl -L "$(CILIUM_CLI_URL)" | tar xzf - -C $(ARTIFACTS) cilium
+	@curl --fail -L -o $(ARTIFACTS)/cilium.tar.gz "$(CILIUM_CLI_URL)"
+	@tar xzf $(ARTIFACTS)/cilium.tar.gz -C $(ARTIFACTS) cilium
+	@rm -f $(ARTIFACTS)/cilium.tar.gz
 	@chmod +x $(ARTIFACTS)/cilium
 
 external-artifacts: $(ARTIFACTS)/kubectl $(ARTIFACTS)/kubestr $(ARTIFACTS)/helm $(ARTIFACTS)/cilium
@@ -644,10 +667,10 @@ installer-with-extensions: $(ARTIFACTS)/extensions/_out/extensions-metadata
 	$(MAKE) image-installer \
 		IMAGER_ARGS="--base-installer-image=$(REGISTRY_AND_USERNAME)/installer-base$(IMAGE_NAME_SUFFIX):$(IMAGE_TAG_IN) $(shell cat $(ARTIFACTS)/extensions/_out/extensions-metadata | $(EXTENSIONS_FILTER_COMMAND) | xargs -n 1 echo --system-extension-image)"
 	crane push $(ARTIFACTS)/installer-amd64.tar $(REGISTRY_AND_USERNAME)/installer$(IMAGE_NAME_SUFFIX):$(IMAGE_TAG_OUT)-amd64-extensions
-	INSTALLER_IMAGE_EXTENSIONS="$(REGISTRY_AND_USERNAME)/installer$(IMAGE_NAME_SUFFIX):$(IMAGE_TAG_OUT)-amd64-extensions" yq eval -n '.machine.install.image = strenv(INSTALLER_IMAGE_EXTENSIONS)' > $(ARTIFACTS)/installer-extensions-patch.yaml
+	INSTALLER_IMAGE_EXTENSIONS="$(REGISTRY_AND_USERNAME)/installer$(IMAGE_NAME_SUFFIX):$(IMAGE_TAG_OUT)-amd64-extensions" yq eval -n '.apiVersion = "v1alpha1" | .kind = "UnattendedInstallConfig" | .installer.image = strenv(INSTALLER_IMAGE_EXTENSIONS) | .provisioning.diskSelector.match = "disk.dev_path == \"/dev/vda\""' > $(ARTIFACTS)/installer-extensions-patch.yaml
 
 kubelet-fat-patch:
-	K8S_VERSION=$(KUBECTL_VERSION) yq eval -n '.machine.kubelet.image = "ghcr.io/siderolabs/kubelet:" + strenv(K8S_VERSION) + "-fat"' > $(ARTIFACTS)/kubelet-fat-patch.yaml
+	K8S_VERSION=$(KUBECTL_VERSION) yq eval -n '.apiVersion = "v1alpha1" | .kind = "KubeletConfig" | .image = "ghcr.io/siderolabs/kubelet:" + strenv(K8S_VERSION) + "-fat"' > $(ARTIFACTS)/kubelet-fat-patch.yaml
 
 # Assets for releases
 
@@ -655,20 +678,21 @@ kubelet-fat-patch:
 $(ARTIFACTS)/$(TALOS_RELEASE): $(ARTIFACTS)/$(TALOS_RELEASE)/vmlinuz $(ARTIFACTS)/$(TALOS_RELEASE)/initramfs.xz
 
 # download release artifacts for specific version
-$(ARTIFACTS)/$(TALOS_RELEASE)/%:
+$(ARTIFACTS)/$(TALOS_RELEASE)/%: | $(ARTIFACTS)
 	@mkdir -p $(ARTIFACTS)/$(TALOS_RELEASE)/
 	@case "$*" in \
 		vmlinuz) \
-			curl -L -o "$(ARTIFACTS)/$(TALOS_RELEASE)/$*" "https://github.com/siderolabs/talos/releases/download/$(TALOS_RELEASE)/vmlinuz-amd64" \
+			curl --fail -L -o "$(ARTIFACTS)/$(TALOS_RELEASE)/$*" "https://github.com/siderolabs/talos/releases/download/$(TALOS_RELEASE)/vmlinuz-amd64" \
 			;; \
 		initramfs.xz) \
-			curl -L -o "$(ARTIFACTS)/$(TALOS_RELEASE)/$*" "https://github.com/siderolabs/talos/releases/download/$(TALOS_RELEASE)/initramfs-amd64.xz" \
+			curl --fail -L -o "$(ARTIFACTS)/$(TALOS_RELEASE)/$*" "https://github.com/siderolabs/talos/releases/download/$(TALOS_RELEASE)/initramfs-amd64.xz" \
 			;; \
 	esac
 
 .PHONY: release-artifacts
-release-artifacts:
-	@for release in $(RELEASES); do \
+release-artifacts: | $(ARTIFACTS)
+	@set -e; \
+	for release in $(RELEASES); do \
 		$(MAKE) $(ARTIFACTS)/$$release TALOS_RELEASE=$$release; \
 	done
 
@@ -720,16 +744,17 @@ clean: ## Cleans up all artifacts.
 
 .PHONY: image-list
 image-list: ## Prints a list of all images built by this Makefile with digests.
-	@echo -n installer-base$(IMAGE_NAME_SUFFIX) talos$(IMAGE_NAME_SUFFIX) imager$(IMAGE_NAME_SUFFIX) talosctl$(IMAGE_NAME_SUFFIX) talosctl-all$(IMAGE_NAME_SUFFIX) | xargs -d ' ' -I{} sh -c 'echo $(REGISTRY_AND_USERNAME)/{}:$(IMAGE_TAG_IN)' | xargs -I{} sh -c 'echo {}@$$(crane digest {})'
+	@echo -n installer-base$(IMAGE_NAME_SUFFIX) talos$(IMAGE_NAME_SUFFIX) imager$(IMAGE_NAME_SUFFIX) talosctl$(IMAGE_NAME_SUFFIX) talosctl-all$(IMAGE_NAME_SUFFIX) | xargs -d ' ' -I{} sh -c 'echo $(REGISTRY_AND_USERNAME)/{}:$(IMAGE_TAG_IN)' | xargs -I{} sh -ec 'digest=$$(crane digest {}) || exit 1; echo {}@$$digest'
 
 $(ARTIFACTS)/image-signer-$(IMAGE_SIGNER_RELEASE): | $(ARTIFACTS) ## Downloads image-signer binary
-	@curl -sSL https://github.com/siderolabs/go-tools/releases/download/$(IMAGE_SIGNER_RELEASE)/image-signer-$(OPERATING_SYSTEM)-$(ARCH) -o $(ARTIFACTS)/image-signer-$(IMAGE_SIGNER_RELEASE)
+	@curl --fail -sSL https://github.com/siderolabs/go-tools/releases/download/$(IMAGE_SIGNER_RELEASE)/image-signer-$(OPERATING_SYSTEM)-$(ARCH) -o $(ARTIFACTS)/image-signer-$(IMAGE_SIGNER_RELEASE)
 	@chmod +x $(ARTIFACTS)/image-signer-$(IMAGE_SIGNER_RELEASE)
 
 
 .PHONY: sign-images
 sign-images: $(ARTIFACTS)/image-signer-$(IMAGE_SIGNER_RELEASE) ## Run image-signer to sign all images built by this Makefile.
-	@$(ARTIFACTS)/image-signer-$(IMAGE_SIGNER_RELEASE) sign $(shell $(MAKE) --quiet image-list REGISTRY_AND_USERNAME=$(REGISTRY_AND_USERNAME) IMAGE_TAG_IN=$(IMAGE_TAG_IN) IMAGE_NAME_SUFFIX=$(IMAGE_NAME_SUFFIX))
+	@images="$$($(MAKE) --quiet image-list REGISTRY_AND_USERNAME=$(REGISTRY_AND_USERNAME) IMAGE_TAG_IN=$(IMAGE_TAG_IN) IMAGE_NAME_SUFFIX=$(IMAGE_NAME_SUFFIX))" || exit 1; \
+		$(ARTIFACTS)/image-signer-$(IMAGE_SIGNER_RELEASE) sign $$images
 
 .PHONY: reproducibility-test
 reproducibility-test: $(ARTIFACTS)

@@ -8,7 +8,6 @@ package provision
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -32,6 +31,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/cri"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/network"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/meta"
 	"github.com/siderolabs/talos/pkg/machinery/resources/block"
@@ -89,8 +89,7 @@ func (suite *MaintenanceSideroLinkSuite) TestAPI() {
 
 		maintenanceClients[i], err = client.New(
 			suite.ctx,
-			client.WithTLSConfig(&tls.Config{InsecureSkipVerify: true}),
-			client.WithEndpoints(machine.IPs[0].String()),
+			client.WithMaintenanceMode(machine.IPs[0].String(), nil),
 		)
 		suite.Require().NoError(err)
 	}
@@ -126,9 +125,20 @@ func (suite *MaintenanceSideroLinkSuite) TestAPI() {
 	)
 	suite.Require().NoError(err)
 
+	hostDNSConfig := network.NewResolverConfigV1Alpha1()
+	hostDNSConfig.ResolverHostDNS = network.HostDNSConfig{
+		HostDNSEnabled: new(true),
+	}
+
+	hostDNSPatch, err := container.New(hostDNSConfig)
+	suite.Require().NoError(err)
+
 	maintenancePatched, err := configpatcher.Apply(
 		configpatcher.WithConfig(sideroLinkConfig),
-		[]configpatcher.Patch{configpatcher.NewStrategicMergePatch(registryMirrorConfig)},
+		[]configpatcher.Patch{
+			configpatcher.NewStrategicMergePatch(registryMirrorConfig),
+			configpatcher.NewStrategicMergePatch(hostDNSPatch),
+		},
 	)
 	suite.Require().NoError(err)
 
@@ -166,8 +176,7 @@ func (suite *MaintenanceSideroLinkSuite) TestAPI() {
 
 		sideroLinkMaintenanceClients[i], err = client.New(
 			suite.ctx,
-			client.WithTLSConfig(&tls.Config{InsecureSkipVerify: true}),
-			client.WithEndpoints(sideroLinkIP.String()),
+			client.WithMaintenanceMode(sideroLinkIP.String(), nil),
 		)
 		suite.Require().NoError(err)
 	}

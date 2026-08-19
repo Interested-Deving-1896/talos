@@ -2,13 +2,13 @@
 (call system_f (init_exec_t))
 (context init_exec_t (system_u object_r init_exec_t (systemLow systemLow)))
 (filecon "/usr/bin/init" file init_exec_t)
-(filecon "/usr/bin/poweroff" any init_exec_t)
-(filecon "/usr/bin/shutdown" any init_exec_t)
-(filecon "/usr/bin/dashboard" any init_exec_t)
 
 (type init_t)
 (roletype system_r init_t)
 (allow init_t init_exec_t (file (execute entrypoint)))
+; machined runs at systemLow and labels, relabels and supervises every other
+; domain and file on the host, including any that carry MCS categories.
+(typeattributeset mcs_exempt_p init_t)
 
 ; System daemon sockets
 (type machine_socket_t)
@@ -89,7 +89,11 @@
 ; rootfs.sqsh
 (allow kernel_t rootfs_t (file (read)))
 
-; initramfs init before switching root
+; initramfs init before switching root.
+; this context does persist even after exiting the initramfs phase
+; when rootfs is mounted using overlay, initramfs_t is still checked
+; as the FS creator, and must have some permissions (most often execute)
+; for the callers to be able to have these permissions on the overlay
 (allow initramfs_t device_t (fs_classes (rw)))
 (allow initramfs_t rootfs_t (fs_classes (ro)))
 (allow initramfs_t self (process_classes (full)))

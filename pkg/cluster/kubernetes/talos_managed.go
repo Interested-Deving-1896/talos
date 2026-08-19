@@ -23,15 +23,16 @@ import (
 	ssacli "github.com/siderolabs/go-kubernetes/kubernetes/ssa/cli"
 	"github.com/siderolabs/go-kubernetes/kubernetes/upgrade"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/siderolabs/talos/pkg/cluster"
+	"github.com/siderolabs/talos/pkg/kubernetes"
 	"github.com/siderolabs/talos/pkg/machinery/api/common"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	"github.com/siderolabs/talos/pkg/machinery/config"
@@ -164,7 +165,7 @@ func Upgrade(ctx context.Context, cluster UpgradeProvider, options UpgradeOption
 
 	useSSA := minTalosVersion.SupportsSSAManifestSync()
 
-	return PerformManifestsSync(ctx, cluster, useSSA, options)
+	return PerformManifestsSync(client.WithNode(ctx, options.controlPlaneNodes[0]), cluster, useSSA, options)
 }
 
 func prePullImages(ctx context.Context, talosClient *client.Client, options UpgradeOptions) error {
@@ -384,14 +385,15 @@ func upgradeStaticPodPatcher(
 		}
 
 		logUpdate := func(oldImage string) {
-			oldImage, _, _ = strings.Cut(oldImage, "@") // ignore digest if present
-			_, version, _ := strings.Cut(oldImage, ":")
+			oldVersion, _ := kubernetes.VersionFromImageRef(oldImage)
 
-			if version == "" {
-				version = options.Path.FromVersion()
+			if oldVersion == "" {
+				oldVersion = options.Path.FromVersion()
 			}
 
-			options.Log(" > update %s: %s -> %s", service, version, options.Path.ToVersion())
+			oldVersion = strings.TrimLeft(oldVersion, "v")
+
+			options.Log(" > update %s: %s -> %s", service, oldVersion, options.Path.ToVersion())
 
 			if options.DryRun {
 				options.Log(" > skipped in dry-run")
@@ -436,6 +438,8 @@ func upgradeStaticPodPatcher(
 }
 
 // PerformManifestsSync performs manifests sync from Talos manifest list to Kubernetes.
+//
+// The context passed should be tied to a single Talos controlplane node.
 func PerformManifestsSync(
 	ctx context.Context,
 	cluster UpgradeProvider,
@@ -462,11 +466,6 @@ func getManifests(ctx context.Context, cluster UpgradeProvider) ([]*unstructured
 	}
 
 	defer cluster.Close() //nolint:errcheck
-
-	md, _ := metadata.FromOutgoingContext(ctx)
-	if nodes := md["nodes"]; len(nodes) > 0 {
-		ctx = client.WithNode(ctx, nodes[0])
-	}
 
 	return manifests.GetBootstrapManifests(ctx, talosclient.COSI, nil)
 }
@@ -534,6 +533,13 @@ func syncManifestsSSA(ctx context.Context, objects []*unstructured.Unstructured,
 		WaitTimeout:     options.ReconcileTimeout,
 		NoPrune:         options.NoPrune,
 		Force:           options.ForceManifests,
+		CustomStageKinds: map[schema.GroupKind]struct{}{
+			// perform sync for configmaps/secrets before e.g. deployments/daemonsets,
+			// as there is a common pattern of linking them via a label/annotation checksum,
+			// to ensure that the dependent resources are reconciled after the configmap/secret is updated.
+			schema.ParseGroupKind("ConfigMap"): {},
+			schema.ParseGroupKind("Secret"):    {},
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("error applying manifests: %w", err)
@@ -576,7 +582,7 @@ func checkPodStatus(ctx context.Context, cluster UpgradeProvider, options Upgrad
 		}),
 	)
 
-	notifyCh := make(chan *v1.Pod)
+	notifyCh := make(chan *corev1.Pod)
 
 	informer := informerFactory.Core().V1().Pods().Informer()
 
@@ -587,9 +593,9 @@ func checkPodStatus(ctx context.Context, cluster UpgradeProvider, options Upgrad
 	}
 
 	if _, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj any) { channel.SendWithContext(ctx, notifyCh, obj.(*v1.Pod)) },
+		AddFunc:    func(obj any) { channel.SendWithContext(ctx, notifyCh, obj.(*corev1.Pod)) },
 		DeleteFunc: func(_ any) {},
-		UpdateFunc: func(_, obj any) { channel.SendWithContext(ctx, notifyCh, obj.(*v1.Pod)) },
+		UpdateFunc: func(_, obj any) { channel.SendWithContext(ctx, notifyCh, obj.(*corev1.Pod)) },
 	}); err != nil {
 		return fmt.Errorf("error adding watch event handler: %w", err)
 	}
@@ -619,11 +625,11 @@ func checkPodStatus(ctx context.Context, cluster UpgradeProvider, options Upgrad
 			ready := false
 
 			for _, condition := range pod.Status.Conditions {
-				if condition.Type != v1.PodReady {
+				if condition.Type != corev1.PodReady {
 					continue
 				}
 
-				if condition.Status == v1.ConditionTrue {
+				if condition.Status == corev1.ConditionTrue {
 					ready = true
 
 					break

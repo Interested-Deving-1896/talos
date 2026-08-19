@@ -15,6 +15,7 @@ import (
 	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
 	kubespanctrl "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/kubespan"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/network"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1"
 	"github.com/siderolabs/talos/pkg/machinery/resources/config"
@@ -74,7 +75,10 @@ func (suite *ConfigSuite) TestReconcileDisabled() {
 			&v1alpha1.Config{
 				ConfigVersion: "v1alpha1",
 				MachineConfig: &v1alpha1.MachineConfig{},
-				ClusterConfig: &v1alpha1.ClusterConfig{},
+				ClusterConfig: &v1alpha1.ClusterConfig{
+					ClusterID:     "test-cluster-id",
+					ClusterSecret: "test-cluster-secret",
+				},
 			},
 		),
 	)
@@ -84,6 +88,8 @@ func (suite *ConfigSuite) TestReconcileDisabled() {
 		spec := res.TypedSpec()
 
 		asrt.False(spec.Enabled)
+		asrt.Equal("test-cluster-id", spec.ClusterID)
+		asrt.Equal("test-cluster-secret", spec.SharedSecret)
 	})
 }
 
@@ -93,7 +99,7 @@ func (suite *ConfigSuite) TestReconcileMultiDoc() {
 	kubeSpanCfg.ConfigMTU = new(uint32(1380))
 	kubeSpanCfg.ConfigFilters = &network.KubeSpanFiltersConfig{
 		ConfigEndpoints:                 []string{"0.0.0.0/0", "::/0"},
-		ConfigExcludeAdvertisedNetworks: []network.Prefix{{Prefix: netip.MustParsePrefix("10.0.0.0/8")}},
+		ConfigExcludeAdvertisedNetworks: []meta.Prefix{{Prefix: netip.MustParsePrefix("10.0.0.0/8")}},
 	}
 
 	ctr, err := container.New(
@@ -124,6 +130,30 @@ func (suite *ConfigSuite) TestReconcileMultiDoc() {
 			asrt.Equal([]netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, spec.ExcludeAdvertisedNetworks)
 		},
 	)
+}
+
+func (suite *ConfigSuite) TestReconcileNoDiscoveryIdentityConfig() {
+	cfg := config.NewMachineConfig(
+		container.NewV1Alpha1(
+			&v1alpha1.Config{
+				ConfigVersion: "v1alpha1",
+				MachineConfig: &v1alpha1.MachineConfig{
+					MachineNetwork: &v1alpha1.NetworkConfig{ //nolint:staticcheck // legacy config
+						NetworkKubeSpan: &v1alpha1.NetworkKubeSpan{ //nolint:staticcheck // legacy config
+							KubeSpanEnabled: new(true),
+						},
+					},
+				},
+				ClusterConfig: &v1alpha1.ClusterConfig{
+					ClusterID:     "",
+					ClusterSecret: "",
+				},
+			},
+		),
+	)
+	suite.Create(cfg)
+
+	ctest.AssertNoResource[*kubespan.Config](suite, kubespan.ConfigID)
 }
 
 func TestConfigSuite(t *testing.T) {

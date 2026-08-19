@@ -29,6 +29,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/cel/celenv"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/network"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
 	networkres "github.com/siderolabs/talos/pkg/machinery/resources/network"
@@ -145,8 +146,8 @@ func (suite *NetworkConfigSuite) TestDummyLinkConfig() {
 	}
 	dummy.LinkRoutes = []network.RouteConfig{
 		{
-			RouteDestination: network.Prefix{Prefix: netip.MustParsePrefix("fd13:1235::/64")},
-			RouteGateway:     network.Addr{Addr: netip.MustParseAddr("fd13:1234::ffff")},
+			RouteDestination: meta.Prefix{Prefix: netip.MustParsePrefix("fd13:1235::/64")},
+			RouteGateway:     meta.Addr{Addr: netip.MustParseAddr("fd13:1234::ffff")},
 			RouteTable:       nethelpers.Table101,
 		},
 	}
@@ -396,8 +397,8 @@ func (suite *NetworkConfigSuite) TestVLANConfig() {
 	}
 	vlan.LinkRoutes = []network.RouteConfig{
 		{
-			RouteDestination: network.Prefix{Prefix: netip.MustParsePrefix("fd13:1235::/64")},
-			RouteGateway:     network.Addr{Addr: netip.MustParseAddr("fd13:1234::ffff")},
+			RouteDestination: meta.Prefix{Prefix: netip.MustParsePrefix("fd13:1235::/64")},
+			RouteGateway:     meta.Addr{Addr: netip.MustParseAddr("fd13:1234::ffff")},
 		},
 	}
 
@@ -493,8 +494,8 @@ func (suite *NetworkConfigSuite) TestBondConfig() {
 	}
 	bond.LinkRoutes = []network.RouteConfig{
 		{
-			RouteDestination: network.Prefix{Prefix: netip.MustParsePrefix("fd13:1236::/64")},
-			RouteGateway:     network.Addr{Addr: netip.MustParseAddr("fd13:1235::ffff")},
+			RouteDestination: meta.Prefix{Prefix: netip.MustParsePrefix("fd13:1236::/64")},
+			RouteGateway:     meta.Addr{Addr: netip.MustParseAddr("fd13:1235::ffff")},
 		},
 	}
 
@@ -663,6 +664,106 @@ func (suite *NetworkConfigSuite) TestVRFConfig() {
 	rtestutils.AssertNoResource[*networkres.LinkStatus](nodeCtx, suite.T(), suite.Client.COSI, vrfName)
 }
 
+// TestVethConfig tests veth creation, rename, VRF composition, and cleanup.
+func (suite *NetworkConfigSuite) TestVethConfig() {
+	if suite.Cluster == nil {
+		suite.T().Skip("skipping if cluster is not qemu/docker")
+	}
+
+	node := suite.RandomDiscoveredNodeInternalIP(machine.TypeWorker)
+	nodeCtx := client.WithNode(suite.ctx, node)
+
+	suite.T().Logf("testing on node %q", node)
+
+	suffix := rand.IntN(10000)
+	name := fmt.Sprintf("veth%d", suffix)
+	oldPeerName := fmt.Sprintf("vold%d", suffix)
+	newPeerName := fmt.Sprintf("vnew%d", suffix)
+	vrfName := fmt.Sprintf("vrf.%d", suffix)
+
+	veth := network.NewVethConfigV1Alpha1(name, oldPeerName)
+	veth.LinkMTU = 1400
+	veth.LinkAddresses = []network.AddressConfig{{AddressAddress: netip.MustParsePrefix("192.0.2.1/32")}}
+	veth.VethPeer.LinkMTU = 1300
+	veth.VethPeer.LinkAddresses = []network.AddressConfig{{AddressAddress: netip.MustParsePrefix("192.0.2.2/32")}}
+
+	suite.PatchMachineConfig(nodeCtx, veth)
+
+	assertVethLink := func(linkName, peerName string, mtu uint32) {
+		rtestutils.AssertResource(
+			nodeCtx, suite.T(), suite.Client.COSI, linkName,
+			func(link *networkres.LinkStatus, asrt *assert.Assertions) {
+				asrt.Equal(networkres.LinkKindVeth, link.TypedSpec().Kind)
+				asrt.EqualValues(mtu, link.TypedSpec().MTU)
+				asrt.Equal(peerName, link.TypedSpec().Veth.PeerName)
+			},
+		)
+	}
+
+	assertVethLink(name, oldPeerName, 1400)
+	assertVethLink(oldPeerName, name, 1300)
+
+	nameAddressID := name + "/192.0.2.1/32"
+	oldPeerAddressID := oldPeerName + "/192.0.2.2/32"
+
+	rtestutils.AssertResources(
+		nodeCtx, suite.T(), suite.Client.COSI,
+		[]resource.ID{nameAddressID, oldPeerAddressID},
+		func(address *networkres.AddressStatus, asrt *assert.Assertions) {
+			asrt.Contains([]string{name, oldPeerName}, address.TypedSpec().LinkName)
+		},
+	)
+
+	veth.VethPeer.VethPeerName = newPeerName
+	veth.VethPeer.LinkMTU = 1200
+	suite.PatchMachineConfig(nodeCtx, veth)
+
+	rtestutils.AssertNoResource[*networkres.LinkStatus](nodeCtx, suite.T(), suite.Client.COSI, oldPeerName)
+	rtestutils.AssertNoResource[*networkres.AddressStatus](nodeCtx, suite.T(), suite.Client.COSI, oldPeerAddressID)
+
+	assertVethLink(name, newPeerName, 1400)
+	assertVethLink(newPeerName, name, 1200)
+
+	newPeerAddressID := newPeerName + "/192.0.2.2/32"
+	rtestutils.AssertResources(
+		nodeCtx, suite.T(), suite.Client.COSI,
+		[]resource.ID{nameAddressID, newPeerAddressID},
+		func(address *networkres.AddressStatus, asrt *assert.Assertions) {
+			asrt.Contains([]string{name, newPeerName}, address.TypedSpec().LinkName)
+		},
+	)
+
+	vrf := network.NewVRFConfigV1Alpha1(vrfName)
+	vrf.VRFLinks = []string{newPeerName}
+	vrf.VRFTable = nethelpers.Table123
+	suite.PatchMachineConfig(nodeCtx, vrf)
+
+	rtestutils.AssertResource(
+		nodeCtx, suite.T(), suite.Client.COSI, newPeerName,
+		func(link *networkres.LinkStatus, asrt *assert.Assertions) {
+			asrt.Equal(networkres.LinkKindVeth, link.TypedSpec().Kind)
+			asrt.NotZero(link.TypedSpec().MasterIndex)
+			asrt.Equal("vrf", link.TypedSpec().SlaveKind)
+		},
+	)
+	rtestutils.AssertResource(
+		nodeCtx, suite.T(), suite.Client.COSI, vrfName,
+		func(link *networkres.LinkStatus, asrt *assert.Assertions) {
+			asrt.Equal("vrf", link.TypedSpec().Kind)
+			asrt.Equal(vrf.VRFTable, link.TypedSpec().VRFMaster.Table)
+		},
+	)
+
+	suite.RemoveMachineConfigDocumentsByName(nodeCtx, network.VRFKind, vrfName)
+	suite.RemoveMachineConfigDocumentsByName(nodeCtx, network.VethKind, name)
+
+	rtestutils.AssertNoResource[*networkres.AddressStatus](nodeCtx, suite.T(), suite.Client.COSI, nameAddressID)
+	rtestutils.AssertNoResource[*networkres.AddressStatus](nodeCtx, suite.T(), suite.Client.COSI, newPeerAddressID)
+	rtestutils.AssertNoResource[*networkres.LinkStatus](nodeCtx, suite.T(), suite.Client.COSI, name)
+	rtestutils.AssertNoResource[*networkres.LinkStatus](nodeCtx, suite.T(), suite.Client.COSI, newPeerName)
+	rtestutils.AssertNoResource[*networkres.LinkStatus](nodeCtx, suite.T(), suite.Client.COSI, vrfName)
+}
+
 // TestWireguardConfig tests creation of Wireguard interfaces.
 func (suite *NetworkConfigSuite) TestWireguardConfig() {
 	if suite.Cluster == nil {
@@ -688,7 +789,7 @@ func (suite *NetworkConfigSuite) TestWireguardConfig() {
 	wg.WireguardPeers = []network.WireguardPeer{
 		{
 			WireguardPublicKey: peerKey.PublicKey().String(),
-			WireguardAllowedIPs: []network.Prefix{
+			WireguardAllowedIPs: []meta.Prefix{
 				{
 					Prefix: netip.MustParsePrefix("192.168.2.0/24"),
 				},
@@ -816,15 +917,16 @@ func (suite *NetworkConfigSuite) TestRoutingRuleBasic() {
 
 	suite.assertKernelDefaultRoutingRulesPresent(nodeCtx)
 
-	const rulePriority uint32 = 1000
+	// Avoid priority 1000, which Linux uses for the persistent global l3mdev rule once a VRF has been created.
+	const rulePriority uint32 = 2000
 
 	cfg := network.NewRoutingRuleConfigV1Alpha1(rulePriority)
-	cfg.RuleSrc = network.Prefix{Prefix: netip.MustParsePrefix("10.99.0.0/16")}
+	cfg.RuleSrc = meta.Prefix{Prefix: netip.MustParsePrefix("10.99.0.0/16")}
 	cfg.RuleTable = nethelpers.RoutingTable(100)
 
 	suite.PatchMachineConfig(nodeCtx, cfg)
 
-	const ruleStatusID = "inet4/01000"
+	const ruleStatusID = "inet4/02000"
 
 	rtestutils.AssertResource(
 		nodeCtx, suite.T(), suite.Client.COSI, ruleStatusID,
@@ -832,7 +934,7 @@ func (suite *NetworkConfigSuite) TestRoutingRuleBasic() {
 			asrt.Equal(nethelpers.FamilyInet4, rule.TypedSpec().Family)
 			asrt.Equal(netip.MustParsePrefix("10.99.0.0/16"), rule.TypedSpec().Src)
 			asrt.Equal(nethelpers.RoutingTable(100), rule.TypedSpec().Table)
-			asrt.Equal(uint32(1000), rule.TypedSpec().Priority)
+			asrt.Equal(rulePriority, rule.TypedSpec().Priority)
 		},
 	)
 
@@ -862,7 +964,7 @@ func (suite *NetworkConfigSuite) TestRoutingRuleIPv6() {
 	const rulePriority uint32 = 3000
 
 	cfg := network.NewRoutingRuleConfigV1Alpha1(rulePriority)
-	cfg.RuleSrc = network.Prefix{Prefix: netip.MustParsePrefix("fd99:1234::/48")}
+	cfg.RuleSrc = meta.Prefix{Prefix: netip.MustParsePrefix("fd99:1234::/48")}
 	cfg.RuleTable = nethelpers.RoutingTable(100)
 
 	suite.PatchMachineConfig(nodeCtx, cfg)
@@ -903,8 +1005,8 @@ func (suite *NetworkConfigSuite) TestRoutingRuleSrcAndDst() {
 	const rulePriority uint32 = 4000
 
 	cfg := network.NewRoutingRuleConfigV1Alpha1(rulePriority)
-	cfg.RuleSrc = network.Prefix{Prefix: netip.MustParsePrefix("10.96.0.0/16")}
-	cfg.RuleDst = network.Prefix{Prefix: netip.MustParsePrefix("192.168.99.0/24")}
+	cfg.RuleSrc = meta.Prefix{Prefix: netip.MustParsePrefix("10.96.0.0/16")}
+	cfg.RuleDst = meta.Prefix{Prefix: netip.MustParsePrefix("192.168.99.0/24")}
 	cfg.RuleTable = nethelpers.RoutingTable(100)
 
 	suite.PatchMachineConfig(nodeCtx, cfg)
@@ -946,7 +1048,7 @@ func (suite *NetworkConfigSuite) TestRoutingRuleBlackholeAction() {
 	const rulePriority uint32 = 5000
 
 	cfg := network.NewRoutingRuleConfigV1Alpha1(rulePriority)
-	cfg.RuleSrc = network.Prefix{Prefix: netip.MustParsePrefix("10.95.0.0/16")}
+	cfg.RuleSrc = meta.Prefix{Prefix: netip.MustParsePrefix("10.95.0.0/16")}
 	cfg.RuleTable = nethelpers.RoutingTable(100)
 	cfg.RuleAction = nethelpers.RoutingRuleActionBlackhole
 
@@ -987,7 +1089,7 @@ func (suite *NetworkConfigSuite) TestRoutingRuleFwMark() {
 	const rulePriority uint32 = 6000
 
 	cfg := network.NewRoutingRuleConfigV1Alpha1(rulePriority)
-	cfg.RuleSrc = network.Prefix{Prefix: netip.MustParsePrefix("10.94.0.0/16")}
+	cfg.RuleSrc = meta.Prefix{Prefix: netip.MustParsePrefix("10.94.0.0/16")}
 	cfg.RuleTable = nethelpers.RoutingTable(100)
 	cfg.RuleFwMark = 0x100
 	cfg.RuleFwMask = 0xff00

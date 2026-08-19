@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"slices"
 
+	"github.com/siderolabs/gen/optional"
 	"github.com/siderolabs/gen/value"
 	"github.com/siderolabs/gen/xslices"
 	"github.com/siderolabs/go-pointer"
@@ -88,11 +89,11 @@ type NameserverConfig struct {
 	//     The IP address of the nameserver.
 	//   examples:
 	//    - value: >
-	//       Addr{netip.MustParseAddr("10.0.0.1")}
+	//       meta.Addr{netip.MustParseAddr("10.0.0.1")}
 	//   schema:
 	//     type: string
 	//     pattern: ^[0-9a-f.:]+$
-	Address Addr `yaml:"address"`
+	Address meta.Addr `yaml:"address"`
 	//   description: |
 	//     A DNS protocol to use.
 	//
@@ -135,7 +136,9 @@ type SearchDomainsConfig struct {
 	//     For example, if "example.com" is a search domain and a user tries to resolve
 	//     "host", the system will attempt to resolve "host.example.com".
 	//
-	//     This overrides any search domains obtained via DHCP or platform configuration.
+	//     If set, this overrides any search domains obtained via DHCP or platform configuration.
+	//     An empty list (`domains: []`) clears search domains obtained from DHCP or platform,
+	//     while leaving this field unset inherits them.
 	//     The default configuration derives the search domain from the hostname FQDN.
 	SearchDomains []string `yaml:"domains,omitempty"`
 	//   description: |
@@ -182,10 +185,10 @@ func exampleResolverConfigV1Alpha1() *ResolverConfigV1Alpha1 {
 	cfg := NewResolverConfigV1Alpha1()
 	cfg.ResolverNameservers = []NameserverConfig{
 		{
-			Address: Addr{netip.MustParseAddr("1.1.1.1")},
+			Address: meta.Addr{Addr: netip.MustParseAddr("1.1.1.1")},
 		},
 		{
-			Address: Addr{netip.MustParseAddr("ff08::1")},
+			Address: meta.Addr{Addr: netip.MustParseAddr("ff08::1")},
 		},
 	}
 	cfg.ResolverSearchDomains = SearchDomainsConfig{
@@ -219,12 +222,12 @@ func exampleResolverConfigV1Alpha4() *ResolverConfigV1Alpha1 {
 	cfg := NewResolverConfigV1Alpha1()
 	cfg.ResolverNameservers = []NameserverConfig{
 		{
-			Address:       Addr{netip.MustParseAddr("9.9.9.9")},
+			Address:       meta.Addr{Addr: netip.MustParseAddr("9.9.9.9")},
 			Protocol:      nethelpers.DNSProtocolDNSOverTLS,
 			TLSServerName: "dns.quad9.net",
 		},
 		{
-			Address:       Addr{netip.MustParseAddr("2620:fe::fe")},
+			Address:       meta.Addr{Addr: netip.MustParseAddr("2620:fe::fe")},
 			Protocol:      nethelpers.DNSProtocolDNSOverTLS,
 			TLSServerName: "dns.quad9.net",
 		},
@@ -237,12 +240,12 @@ func exampleResolverConfigV1Alpha5() *ResolverConfigV1Alpha1 {
 	cfg := NewResolverConfigV1Alpha1()
 	cfg.ResolverNameservers = []NameserverConfig{
 		{
-			Address:       Addr{netip.MustParseAddr("1.1.1.1")},
+			Address:       meta.Addr{Addr: netip.MustParseAddr("1.1.1.1")},
 			Protocol:      nethelpers.DNSProtocolDNSOverHTTP,
 			TLSServerName: "cloudflare-dns.com",
 		},
 		{
-			Address:       Addr{netip.MustParseAddr("2606:4700:4700::1111")},
+			Address:       meta.Addr{Addr: netip.MustParseAddr("2606:4700:4700::1111")},
 			Protocol:      nethelpers.DNSProtocolDNSOverHTTP,
 			TLSServerName: "cloudflare-dns.com",
 		},
@@ -258,7 +261,7 @@ func (s *ResolverConfigV1Alpha1) Clone() config.Document {
 
 // V1Alpha1ConflictValidate implements container.V1Alpha1ConflictValidator interface.
 func (s *ResolverConfigV1Alpha1) V1Alpha1ConflictValidate(v1alpha1Cfg *v1alpha1.Config) error {
-	if v1alpha1Cfg.SearchDomains() != nil {
+	if v1alpha1Cfg.SearchDomains().IsPresent() {
 		return errors.New(".machine.network.searchDomains is already set in v1alpha1 config")
 	}
 
@@ -355,8 +358,12 @@ func (s *ResolverConfigV1Alpha1) Resolvers() []config.NetworkResolver {
 }
 
 // SearchDomains implements NetworkResolverConfig interface.
-func (s *ResolverConfigV1Alpha1) SearchDomains() []string {
-	return slices.Clone(s.ResolverSearchDomains.SearchDomains)
+func (s *ResolverConfigV1Alpha1) SearchDomains() optional.Optional[[]string] {
+	if s.ResolverSearchDomains.SearchDomains == nil {
+		return optional.None[[]string]()
+	}
+
+	return optional.Some(slices.Clone(s.ResolverSearchDomains.SearchDomains))
 }
 
 // DisableSearchDomain implements NetworkResolverConfig interface.

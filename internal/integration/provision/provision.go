@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -31,6 +32,7 @@ import (
 	"github.com/siderolabs/go-procfs/procfs"
 	"github.com/siderolabs/go-retry/retry"
 	sideronet "github.com/siderolabs/net"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"go.yaml.in/yaml/v4"
 	"google.golang.org/grpc"
@@ -49,6 +51,7 @@ import (
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
+	"github.com/siderolabs/talos/pkg/machinery/client/multiplex"
 	"github.com/siderolabs/talos/pkg/machinery/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/bundle"
 	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
@@ -96,8 +99,6 @@ type Settings struct {
 	TargetInstallImageRegistry string
 	// Current version of the cluster (built in the CI pass)
 	CurrentVersion string
-	// Custom CNI URL to use.
-	CustomCNIURL string
 	// CNI bundle for QEMU provisioner.
 	CNIBundleURL string
 }
@@ -261,29 +262,27 @@ func (suite *BaseSuite) untaint(name string) {
 
 func (suite *BaseSuite) assertSameVersionCluster(client *talosclient.Client, expectedVersion string) {
 	nodes := xslices.Map(suite.Cluster.Info().Nodes, func(node provision.NodeInfo) string { return node.IPs[0].String() })
-	ctx := talosclient.WithNodes(suite.ctx, nodes...)
 
-	var v *machineapi.VersionResponse
+	suite.Assert().EventuallyWithT(
+		func(collect *assert.CollectT) {
+			asrt := assert.New(collect)
 
-	err := retry.Constant(
-		time.Minute,
-	).Retry(
-		func() error {
-			var e error
+			respCh := multiplex.Unary(
+				suite.ctx, nodes,
+				func(ctx context.Context) (*machineapi.VersionResponse, error) {
+					return client.Version(ctx)
+				},
+			)
 
-			v, e = client.Version(ctx)
-
-			return retry.ExpectedError(e)
+			for resp := range respCh {
+				if asrt.NoError(resp.Err, "error getting version from node %s: %v", resp.Node, resp.Err) {
+					asrt.Equal(expectedVersion, resp.Payload.Messages[0].Version.Tag, "unexpected version from node %s", resp.Node)
+				}
+			}
 		},
+		time.Minute,
+		time.Second,
 	)
-
-	suite.Require().NoError(err)
-
-	suite.Require().Len(v.Messages, len(nodes))
-
-	for _, version := range v.Messages {
-		suite.Assert().Equal(expectedVersion, version.Version.Tag)
-	}
 }
 
 func (suite *BaseSuite) assertCmdlineContains(client *talosclient.Client, node string, expectedCmdlineContains string) {
@@ -319,6 +318,11 @@ type upgradeOptions struct {
 	// Use the legacy MachineService.Upgrade path instead.
 	UpgradeStage  bool
 	TargetVersion string
+	// Use in-memory containerd: in general we should prefer to use CRI containerd,
+	// but we should use in-memory for 'enforcing' mode due to SELinux restrictions.
+	//
+	// Ignored for legacy upgrade paths (before 1.13).
+	UpgradeUseInmemoryContainerd bool
 }
 
 //nolint:gocyclo,cyclop
@@ -328,7 +332,7 @@ func (suite *BaseSuite) upgradeNode(client *talosclient.Client, node provision.N
 	ctx, cancel := context.WithCancel(suite.ctx)
 	defer cancel()
 
-	nodeCtx := talosclient.WithNodes(ctx, node.IPs[0].String())
+	nodeCtx := talosclient.WithNode(ctx, node.IPs[0].String())
 
 	// Staged upgrades are not supported by the new LifecycleService API,
 	// so skip straight to the legacy path.
@@ -367,8 +371,12 @@ func (suite *BaseSuite) tryUpgradeViaLifecycleService(
 	suite.T().Logf("pre-pulling installer image %q on node %s", options.TargetInstallerImage, node.IPs[0])
 
 	containerdInstance := &common.ContainerdInstance{
-		Driver:    common.ContainerDriver_CONTAINERD,
+		Driver:    common.ContainerDriver_CRI,
 		Namespace: common.ContainerdNamespace_NS_SYSTEM,
+	}
+
+	if options.UpgradeUseInmemoryContainerd {
+		containerdInstance.Driver = common.ContainerDriver_CONTAINERD
 	}
 
 	nodes := []string{node.IPs[0].String()}
@@ -737,6 +745,23 @@ func (suite *BaseSuite) upgradeKubernetes(fromVersion, toVersion string, skipKub
 	suite.Require().NoError(kubernetes.Upgrade(suite.ctx, suite.clusterAccess, options))
 }
 
+func (suite *BaseSuite) sendMonitorCommand(ctx context.Context, nodeName, command string) {
+	statePath, err := suite.Cluster.StatePath()
+	suite.Require().NoError(err)
+
+	socketPath := filepath.Join(statePath, nodeName+".monitor")
+
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+	suite.Require().NoError(err)
+
+	defer func() {
+		suite.Require().NoError(conn.Close())
+	}()
+
+	_, err = conn.Write([]byte(command + "\n"))
+	suite.Require().NoError(err)
+}
+
 type clusterOptions struct {
 	ClusterName string
 
@@ -753,12 +778,21 @@ type clusterOptions struct {
 	SourceVersion        string
 	SourceK8sVersion     string
 
+	// If set, sets the machine config version contract, otherwise
+	// version contract is derived from the SourceVersion.
+	VersionContract *config.VersionContract
+
 	WithEncryption          bool
 	WithTrustedBoot         bool
 	WithBios                bool
 	WithApplyConfig         bool
 	WithSkipInjectingConfig bool
 	WithSideroLink          bool
+
+	// ConfigPatchesControlPlane and ConfigPatchesWorker are applied on top of the generated config of
+	// the respective machine type.
+	ConfigPatchesControlPlane []configpatcher.Patch
+	ConfigPatchesWorker       []configpatcher.Patch
 }
 
 // setupCluster provisions source clusters and waits for health.
@@ -834,8 +868,12 @@ func (suite *BaseSuite) setupCluster(options clusterOptions) {
 
 	suite.controlPlaneEndpoint = suite.provisioner.GetExternalKubernetesControlPlaneEndpoint(request.Network, constants.DefaultControlPlanePort)
 
-	versionContract, err := config.ParseContractFromVersion(options.SourceVersion)
-	suite.Require().NoError(err)
+	versionContract := options.VersionContract
+
+	if versionContract == nil {
+		versionContract, err = config.ParseContractFromVersion(options.SourceVersion)
+		suite.Require().NoError(err)
+	}
 
 	genOptions, bundleOptions := suite.provisioner.GenOptions(request.Network, versionContract)
 
@@ -849,17 +887,6 @@ func (suite *BaseSuite) setupCluster(options clusterOptions) {
 	controlplaneEndpoints := make([]string, options.ControlplaneNodes)
 	for i := range controlplaneEndpoints {
 		controlplaneEndpoints[i] = ips[i].String()
-	}
-
-	if DefaultSettings.CustomCNIURL != "" {
-		genOptions = append(
-			genOptions, generate.WithClusterCNIConfig(
-				&v1alpha1.CNIConfig{
-					CNIName: constants.CustomCNI,
-					CNIUrls: []string{DefaultSettings.CustomCNIURL},
-				},
-			),
-		)
 	}
 
 	var extraPatches []configpatcher.Patch
@@ -996,6 +1023,8 @@ func (suite *BaseSuite) setupCluster(options clusterOptions) {
 					},
 				),
 				bundle.WithPatch(extraPatches),
+				bundle.WithPatchControlPlane(options.ConfigPatchesControlPlane),
+				bundle.WithPatchWorker(options.ConfigPatchesWorker),
 			},
 			bundleOptions...,
 		)...,

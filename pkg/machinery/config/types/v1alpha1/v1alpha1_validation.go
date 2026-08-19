@@ -26,7 +26,6 @@ import (
 	sideronet "github.com/siderolabs/net"
 
 	"github.com/siderolabs/talos/pkg/machinery/compatibility"
-	"github.com/siderolabs/talos/pkg/machinery/config/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/block/blockhelpers"
 	"github.com/siderolabs/talos/pkg/machinery/config/validation"
@@ -93,26 +92,32 @@ func (c *Config) Validate(mode validation.RuntimeMode, options ...validation.Opt
 		return nil, result.ErrorOrNil()
 	}
 
+	if len(c.MachineConfig.MachineFiles) > 0 { //nolint:staticcheck // warn about deprecated configuration
+		warnings = append(warnings, ".machine.files is deprecated; use dedicated configuration documents instead")
+	}
+
+	if len(c.MachineConfig.MachineBaseRuntimeSpecOverrides.Object) > 0 { //nolint:staticcheck // warn about deprecated configuration
+		warnings = append(warnings, ".machine.baseRuntimeSpecOverrides is deprecated; use a CRIBaseRuntimeSpecConfig document instead")
+	}
+
 	if err := c.ClusterConfig.Validate(c.Machine().Type().IsControlPlane()); err != nil {
 		result = multierror.Append(result, err)
 	}
 
-	if mode.RequiresInstall() {
-		if c.MachineConfig.MachineInstall == nil {
-			result = multierror.Append(result, fmt.Errorf("install instructions are required in %q mode", mode))
-		} else {
-			matcher, err := c.MachineConfig.MachineInstall.DiskMatchExpression()
-			if err != nil {
-				result = multierror.Append(result, fmt.Errorf("install disk selector is invalid: %w", err))
-			}
+	// .machine.install is deprecated in favor of the UnattendedInstallConfig multi-document config,
+	// so it is no longer required. When present, it is still validated for backwards compatibility.
+	if mode.RequiresInstall() && c.MachineConfig.MachineInstall != nil {
+		matcher, err := c.MachineConfig.MachineInstall.DiskMatchExpression()
+		if err != nil {
+			result = multierror.Append(result, fmt.Errorf("install disk selector is invalid: %w", err))
+		}
 
-			if c.MachineConfig.MachineInstall.InstallDisk == "" && matcher == nil {
-				result = multierror.Append(result, errors.New("either install disk or diskSelector should be defined"))
-			}
+		if c.MachineConfig.MachineInstall.InstallDisk == "" && matcher == nil {
+			result = multierror.Append(result, errors.New("either install disk or diskSelector should be defined"))
+		}
 
-			if len(c.MachineConfig.MachineInstall.InstallExtraKernelArgs) > 0 && c.MachineConfig.MachineInstall.GrubUseUKICmdline() {
-				result = multierror.Append(result, errors.New("install.extraKernelArgs and install.grubUseUKICmdline can't be used together"))
-			}
+		if len(c.MachineConfig.MachineInstall.InstallExtraKernelArgs) > 0 && c.MachineConfig.MachineInstall.GrubUseUKICmdline() {
+			result = multierror.Append(result, errors.New("install.extraKernelArgs and install.grubUseUKICmdline can't be used together"))
 		}
 	}
 
@@ -132,9 +137,11 @@ func (c *Config) Validate(mode validation.RuntimeMode, options ...validation.Opt
 
 	switch c.Machine().Type() {
 	case machine.TypeInit, machine.TypeControlPlane:
-		warn, err := ValidateCNI(c.Cluster().Network().CNI())
-		warnings = append(warnings, warn...)
-		result = multierror.Append(result, err)
+		if c.ClusterConfig != nil && c.ClusterConfig.ClusterNetwork != nil {
+			warn, err := ValidateCNI(c.ClusterConfig.CNI())
+			warnings = append(warnings, warn...)
+			result = multierror.Append(result, err)
+		}
 
 		if c.Machine().Security().IssuingCA() == nil {
 			result = multierror.Append(result, errors.New("issuing CA is required (.machine.ca)"))
@@ -164,7 +171,7 @@ func (c *Config) Validate(mode validation.RuntimeMode, options ...validation.Opt
 			}
 		}
 
-		if c.Cluster().IssuingCA() != nil && len(c.Cluster().IssuingCA().Key) > 0 {
+		if c.ClusterConfig != nil && c.ClusterConfig.ClusterCA != nil && len(c.ClusterConfig.ClusterCA.Key) > 0 {
 			result = multierror.Append(result, errors.New("issuing Kubernetes API CA key is not allowed on non-controlplane nodes (.cluster.ca)"))
 		}
 	case machine.TypeUnknown:
@@ -260,18 +267,6 @@ func (c *Config) Validate(mode validation.RuntimeMode, options ...validation.Opt
 	}
 
 	if kcfg := c.NetworkKubeSpanConfig(); kcfg != nil && kcfg.Enabled() {
-		if !c.Cluster().Discovery().Enabled() {
-			result = multierror.Append(result, errors.New(".cluster.discovery should be enabled when .machine.network.kubespan is enabled"))
-		}
-
-		if c.Cluster().ID() == "" {
-			result = multierror.Append(result, errors.New(".cluster.id should be set when .machine.network.kubespan is enabled"))
-		}
-
-		if c.Cluster().Secret() == "" {
-			result = multierror.Append(result, errors.New(".cluster.secret should be set when .machine.network.kubespan is enabled"))
-		}
-
 		for _, cidr := range kcfg.Filters().Endpoints() {
 			cidr = strings.TrimPrefix(cidr, "!")
 
@@ -323,12 +318,12 @@ func (c *Config) Validate(mode validation.RuntimeMode, options ...validation.Opt
 		result = multierror.Append(result, fmt.Errorf("invalid machine node taints: %w", err))
 	}
 
-	if c.Machine().Features().KubernetesTalosAPIAccess().Enabled() {
+	if apiAccessConfig := c.K8sTalosAPIAccessConfig(); apiAccessConfig != nil {
 		if !c.Machine().Type().IsControlPlane() {
 			result = multierror.Append(result, errors.New("feature Kubernetes Talos API Access can only be enabled on control plane machines"))
 		}
 
-		for _, r := range c.Machine().Features().KubernetesTalosAPIAccess().AllowedRoles() {
+		for _, r := range apiAccessConfig.AllowedRoles() {
 			if !role.All.Includes(role.Role(r)) {
 				result = multierror.Append(result, fmt.Errorf("invalid role %q in allowed roles for Kubernetes Talos API Access", r))
 			}
@@ -345,9 +340,9 @@ func (c *Config) Validate(mode validation.RuntimeMode, options ...validation.Opt
 		result = multierror.Append(result, errors.New(".persist should be enabled"))
 	}
 
-	if len(c.Machine().BaseRuntimeSpecOverrides()) > 0 {
+	if len(c.MachineConfig.MachineBaseRuntimeSpecOverrides.Object) > 0 { //nolint:staticcheck // validate deprecated compatibility field
 		// try to unmarshal the overrides to ensure they are valid
-		jsonSpec, err := json.Marshal(c.Machine().BaseRuntimeSpecOverrides())
+		jsonSpec, err := json.Marshal(c.MachineConfig.MachineBaseRuntimeSpecOverrides.Object) //nolint:staticcheck // validate deprecated compatibility field
 		if err != nil {
 			result = multierror.Append(result, fmt.Errorf("failed to marshal base runtime spec overrides: %w", err))
 		} else {
@@ -409,12 +404,14 @@ func (c *ClusterConfig) Validate(isControlPlane bool) error {
 		return errors.New("cluster instructions are required")
 	}
 
-	if c.ControlPlane == nil || c.ControlPlane.Endpoint == nil {
-		return errors.New("cluster controlplane endpoint is required")
-	}
+	if c.ControlPlane != nil {
+		if c.ControlPlane.Endpoint == nil {
+			return errors.New("cluster controlplane endpoint is required")
+		}
 
-	if err := sideronet.ValidateEndpointURI(c.ControlPlane.Endpoint.URL.String()); err != nil {
-		result = multierror.Append(result, fmt.Errorf("invalid controlplane endpoint: %w", err))
+		if err := sideronet.ValidateEndpointURI(c.ControlPlane.Endpoint.URL.String()); err != nil {
+			result = multierror.Append(result, fmt.Errorf("invalid controlplane endpoint: %w", err))
+		}
 	}
 
 	if c.ClusterNetwork != nil && c.ClusterNetwork.DNSDomain != "" && !isValidDNSName(c.ClusterNetwork.DNSDomain) {
@@ -452,7 +449,7 @@ func (c *ClusterConfig) Validate(isControlPlane bool) error {
 // ValidateCNI validates CNI config.
 //
 //nolint:gocyclo
-func ValidateCNI(cni config.CNI) ([]string, error) {
+func ValidateCNI(cni *CNIConfig) ([]string, error) {
 	var (
 		warnings []string
 		result   *multierror.Error
@@ -558,8 +555,8 @@ func (c *ClusterDiscoveryConfig) Validate(clusterCfg *ClusterConfig) error {
 		return nil
 	}
 
-	if c.Registries().Service().Enabled() {
-		url, err := url.ParseRequestURI(c.Registries().Service().Endpoint())
+	if c.DiscoveryRegistries.Service().Enabled() {
+		url, err := url.ParseRequestURI(c.DiscoveryRegistries.Service().Endpoint())
 		if err != nil {
 			result = multierror.Append(result, fmt.Errorf("cluster discovery service registry endpoint is invalid: %w", err))
 		} else if url.Path != "" && url.Path != "/" {
@@ -971,8 +968,8 @@ func (e *EtcdConfig) Validate() error {
 func (c *Config) ValidateKubernetesVersions() error {
 	var result *multierror.Error
 
-	if c.MachineConfig != nil {
-		if err := compatibility.ValidateKubernetesImageTag(c.Machine().Kubelet().Image()); err != nil {
+	if c.MachineConfig != nil && c.MachineConfig.MachineKubelet != nil {
+		if err := compatibility.ValidateKubernetesImageTag(c.MachineConfig.MachineKubelet.Image()); err != nil {
 			result = multierror.Append(result, fmt.Errorf("kubelet image is not valid: %w", err))
 		}
 	}
@@ -985,11 +982,11 @@ func (c *Config) ValidateKubernetesVersions() error {
 			}{
 				{
 					name:     "kube-apiserver",
-					imageRef: c.Cluster().APIServer().Image(),
+					imageRef: c.ClusterConfig.APIServer().Image(),
 				},
 				{
 					name:     "kube-controller-manager",
-					imageRef: c.Cluster().ControllerManager().Image(),
+					imageRef: c.ClusterConfig.ControllerManager().Image(),
 				},
 				{
 					name:     "kube-scheduler",

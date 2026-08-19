@@ -39,11 +39,16 @@ var (
 	selinuxEnforcing    bool
 	extensionsQEMU      bool
 	extensionsNvidia    bool
+	bgpEnabled          bool
+	bgpCLOSEnabled      bool
+	ciliumBGPEnabled    bool
 	verifyUKIBooted     bool
 	airgapped           bool
 	virtiofsd           bool
 	race                bool
 	skipEphemeralPolicy bool
+
+	dedicatedSystemVolumes bool
 
 	talosConfig       string
 	endpoint          string
@@ -55,6 +60,7 @@ var (
 	helmPath          string
 	kubeStrPath       string
 	provisionerName   string
+	remoteEndpoint    string
 	clusterName       string
 	stateDir          string
 	talosImage        string
@@ -76,11 +82,23 @@ func TestIntegration(t *testing.T) {
 		err         error
 	)
 
-	if provisionerName != "" {
+	// When a remote-provision endpoint is set, reflect cluster state from the remote server instead
+	// of local provisioner state (basic remote-cluster support); otherwise use the named provisioner.
+	factoryName := provisionerName
+
+	var factoryOpts []providers.FactoryOption
+
+	if remoteEndpoint != "" {
+		factoryName = providers.RemoteProviderName
+
+		factoryOpts = append(factoryOpts, providers.WithRemoteEndpoint(remoteEndpoint))
+	}
+
+	if factoryName != "" {
 		// use provisioned cluster state as discovery source
 		ctx := t.Context()
 
-		provisioner, err = providers.Factory(ctx, provisionerName)
+		provisioner, err = providers.Factory(ctx, factoryName, factoryOpts...)
 		if err != nil {
 			t.Error("error initializing provisioner", err)
 		}
@@ -99,31 +117,38 @@ func TestIntegration(t *testing.T) {
 
 	provision_test.DefaultSettings.CurrentVersion = expectedVersion
 
+	httpProbeProvisioner, _ := provisioner.(provision.HTTPProbeProvisioner)
+
 	for _, s := range allSuites {
 		if configuredSuite, ok := s.(base.ConfiguredSuite); ok {
 			configuredSuite.SetConfig(base.TalosSuite{
-				Endpoint:            endpoint,
-				K8sEndpoint:         k8sEndpoint,
-				Cluster:             cluster,
-				TalosConfig:         talosConfig,
-				Version:             expectedVersion,
-				GoVersion:           expectedGoVersion,
-				TalosctlPath:        talosctlPath,
-				KubectlPath:         kubectlPath,
-				HelmPath:            helmPath,
-				KubeStrPath:         kubeStrPath,
-				ExtensionsQEMU:      extensionsQEMU,
-				ExtensionsNvidia:    extensionsNvidia,
-				TrustedBoot:         trustedBoot,
-				SelinuxEnforcing:    selinuxEnforcing,
-				VerifyUKIBooted:     verifyUKIBooted,
-				TalosImage:          talosImage,
-				CSITestName:         csiTestName,
-				CSITestTimeout:      csiTestTimeout,
-				Airgapped:           airgapped,
-				Virtiofsd:           virtiofsd,
-				Race:                race,
-				SkipEphemeralPolicy: skipEphemeralPolicy,
+				Endpoint:               endpoint,
+				K8sEndpoint:            k8sEndpoint,
+				Cluster:                cluster,
+				HTTPProbeProvisioner:   httpProbeProvisioner,
+				TalosConfig:            talosConfig,
+				Version:                expectedVersion,
+				GoVersion:              expectedGoVersion,
+				TalosctlPath:           talosctlPath,
+				KubectlPath:            kubectlPath,
+				HelmPath:               helmPath,
+				KubeStrPath:            kubeStrPath,
+				ExtensionsQEMU:         extensionsQEMU,
+				ExtensionsNvidia:       extensionsNvidia,
+				BGPEnabled:             bgpEnabled,
+				BGPCLOSEnabled:         bgpCLOSEnabled,
+				CiliumBGPEnabled:       ciliumBGPEnabled,
+				TrustedBoot:            trustedBoot,
+				SelinuxEnforcing:       selinuxEnforcing,
+				VerifyUKIBooted:        verifyUKIBooted,
+				TalosImage:             talosImage,
+				CSITestName:            csiTestName,
+				CSITestTimeout:         csiTestTimeout,
+				Airgapped:              airgapped,
+				Virtiofsd:              virtiofsd,
+				Race:                   race,
+				SkipEphemeralPolicy:    skipEphemeralPolicy,
+				DedicatedSystemVolumes: dedicatedSystemVolumes,
 			})
 		}
 
@@ -133,7 +158,7 @@ func TestIntegration(t *testing.T) {
 		}
 
 		t.Run(suiteName, func(tt *testing.T) {
-			suite.Run(tt, s) //nolint:scopelint
+			suite.Run(tt, s)
 		})
 
 		if failFast && t.Failed() {
@@ -157,6 +182,9 @@ func init() {
 	flag.BoolVar(&selinuxEnforcing, "talos.enforcing", false, "enable tests for SELinux enforcing mode")
 	flag.BoolVar(&extensionsQEMU, "talos.extensions.qemu", false, "enable tests for qemu extensions")
 	flag.BoolVar(&extensionsNvidia, "talos.extensions.nvidia", false, "enable tests for nvidia extensions")
+	flag.BoolVar(&bgpEnabled, "talos.bgp", false, "enable tests for native BGP (requires a cluster created with --with-bgp)")
+	flag.BoolVar(&bgpCLOSEnabled, "talos.bgp.clos", false, "enable the full-CLOS BGP test (requires a cluster created with --with-bgp-clos)")
+	flag.BoolVar(&ciliumBGPEnabled, "talos.bgp.cilium", false, "enable the Cilium BGP-to-fabric test (requires Cilium CNI with BGP Control Plane and --with-bgp-clos)")
 	flag.BoolVar(&race, "talos.race", false, "skip tests that are incompatible with race detector")
 	flag.BoolVar(&verifyUKIBooted, "talos.verifyukibooted", true, "enable tests for verifying that Talos was booted using a UKI")
 
@@ -174,6 +202,7 @@ func init() {
 	flag.StringVar(&endpoint, "talos.endpoint", "", "endpoint to use (overrides config)")
 	flag.StringVar(&k8sEndpoint, "talos.k8sendpoint", "", "Kubernetes endpoint to use (overrides kubeconfig)")
 	flag.StringVar(&provisionerName, "talos.provisioner", "", "cluster provisioner to use, if not set cluster state is disabled")
+	flag.StringVar(&remoteEndpoint, "talos.remote-endpoint", "", "host:port of a remote-provision server to reflect cluster state from (for remote clusters); overrides talos.provisioner")
 	flag.StringVar(&stateDir, "talos.state", defaultStateDir, "directory path to store cluster state")
 	flag.StringVar(&clusterName, "talos.name", "talos-default", "the name of the cluster")
 	flag.StringVar(&expectedVersion, "talos.version", version.Tag, "expected Talos version")
@@ -188,7 +217,10 @@ func init() {
 	flag.BoolVar(&airgapped, "talos.airgapped", false, "Marker to skip tests that should not be run on airgapped talos cluster")
 	flag.BoolVar(&virtiofsd, "talos.virtiofsd", false, "Marker to skip tests that should not be run without virtiofsd")
 	flag.BoolVar(&skipEphemeralPolicy, "talos.skip-ephemeral-policy", false,
-		"Skip MountsSuite assertions for /var (EPHEMERAL); set when the cluster was deployed with VolumeConfig EPHEMERAL mount.secure=false")
+		"Skip MountsSuite assertions for EPHEMERAL-backed fixture mounts")
+	flag.BoolVar(&dedicatedSystemVolumes, "talos.dedicated-system-volumes", false,
+		"Set when the cluster was deployed with the hack/test/patches/dedicated-system-volumes-{controlplane,worker}.yaml config patches, "+
+			"i.e. the promotable system volumes are placed on dedicated partitions instead of directories under EPHEMERAL")
 
 	flag.StringVar(&provision_test.DefaultSettings.CIDR, "talos.provision.cidr", provision_test.DefaultSettings.CIDR, "CIDR to use to provision clusters (provision tests only)")
 	flag.Var(&provision_test.DefaultSettings.RegistryMirrors, "talos.provision.registry-mirror", "registry mirrors to use (provision tests only)")
@@ -200,7 +232,6 @@ func init() {
 	flag.IntVar(&provision_test.DefaultSettings.WorkerNodes, "talos.provision.workers", provision_test.DefaultSettings.WorkerNodes, "worker node count (provision tests only)")
 	flag.StringVar(&provision_test.DefaultSettings.TargetInstallImageRegistry, "talos.provision.target-installer-registry",
 		provision_test.DefaultSettings.TargetInstallImageRegistry, "image registry for target installer image (provision tests only)")
-	flag.StringVar(&provision_test.DefaultSettings.CustomCNIURL, "talos.provision.custom-cni-url", provision_test.DefaultSettings.CustomCNIURL, "custom CNI URL for the cluster (provision tests only)")
 	flag.StringVar(&provision_test.DefaultSettings.CNIBundleURL, "talos.provision.cni-bundle-url", provision_test.DefaultSettings.CNIBundleURL, "URL to download CNI bundle from")
 
 	allSuites = slices.Concat(api.GetAllSuites(), cli.GetAllSuites(), k8s.GetAllSuites(), provision_test.GetAllSuites())

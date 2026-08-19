@@ -1,4 +1,4 @@
-# syntax = docker/dockerfile-upstream:1.23.0-labs
+# syntax = docker/dockerfile-upstream:1.26.0-labs
 
 # Meta args applied to stage base names.
 
@@ -13,6 +13,7 @@ ARG GENERATE_VEX_PREFIX=scratch
 ARG GENERATE_VEX=scratch
 
 ARG PKG_APPARMOR=scratch
+ARG PKG_BTRFSPROGS=scratch
 ARG PKG_CA_CERTIFICATES=scratch
 ARG PKG_CNI=scratch
 ARG PKG_CONTAINERD=scratch
@@ -45,9 +46,11 @@ ARG PKG_LIBNFTNL=scratch
 ARG PKG_LIBPOPT=scratch
 ARG PKG_LIBSELINUX=scratch
 ARG PKG_LIBSEPOL=scratch
+ARG PKG_LIBUCONTEXT=scratch
 ARG PKG_LIBURCU=scratch
 ARG PKG_LINUX_FIRMWARE=scratch
 ARG PKG_LVM2=scratch
+ARG PKG_MDADM=scratch
 ARG PKG_MTOOLS=scratch
 ARG PKG_MUSL=scratch
 ARG PKG_NFTABLES=scratch
@@ -74,6 +77,9 @@ ARG EMBED_TARGET=embed
 
 FROM ${PKG_FHS} AS pkg-fhs
 FROM ${PKG_CA_CERTIFICATES} AS pkg-ca-certificates
+
+ # used only for the unit-tests environment
+FROM ${PKG_BTRFSPROGS} AS pkg-btrfsprogs
 
 FROM --platform=amd64 ${PKG_APPARMOR} AS pkg-apparmor-amd64
 FROM --platform=arm64 ${PKG_APPARMOR} AS pkg-apparmor-arm64
@@ -137,6 +143,9 @@ FROM --platform=arm64 ${PKG_LIBPOPT} AS pkg-libpopt-arm64
 FROM --platform=amd64 ${PKG_LIBURCU} AS pkg-liburcu-amd64
 FROM --platform=arm64 ${PKG_LIBURCU} AS pkg-liburcu-arm64
 
+FROM --platform=amd64 ${PKG_LIBUCONTEXT} AS pkg-libucontext-amd64
+FROM --platform=arm64 ${PKG_LIBUCONTEXT} AS pkg-libucontext-arm64
+
 FROM --platform=amd64 ${PKG_LIBSEPOL} AS pkg-libsepol-amd64
 FROM --platform=arm64 ${PKG_LIBSEPOL} AS pkg-libsepol-arm64
 
@@ -157,6 +166,9 @@ FROM --platform=arm64 ${PKG_LVM2} AS pkg-lvm2-arm64
 
 FROM --platform=amd64 ${PKG_LIBAIO} AS pkg-libaio-amd64
 FROM --platform=arm64 ${PKG_LIBAIO} AS pkg-libaio-arm64
+
+FROM --platform=amd64 ${PKG_MDADM} AS pkg-mdadm-amd64
+FROM --platform=arm64 ${PKG_MDADM} AS pkg-mdadm-arm64
 
 FROM --platform=amd64 ${PKG_NFTABLES} AS pkg-nftables-amd64
 FROM --platform=arm64 ${PKG_NFTABLES} AS pkg-nftables-arm64
@@ -191,9 +203,14 @@ FROM ${PKG_PIGZ} AS pkg-pigz
 FROM --platform=arm64 ${PKG_PIGZ} AS pkg-pigz-arm64
 
 FROM ${PKG_ZLIB} AS pkg-zlib
+FROM --platform=amd64 ${PKG_ZLIB} AS pkg-zlib-amd64
 FROM --platform=arm64 ${PKG_ZLIB} AS pkg-zlib-arm64
 
 FROM --platform=amd64 ${PKG_IGZIP} AS pkg-igzip-amd64
+
+FROM ${PKG_ZSTD} AS pkg-zstd
+FROM --platform=amd64 ${PKG_ZSTD} AS pkg-zstd-amd64
+FROM --platform=arm64 ${PKG_ZSTD} AS pkg-zstd-arm64
 
 FROM ${PKG_CPIO} AS pkg-cpio
 FROM ${PKG_DOSFSTOOLS} AS pkg-dosfstools
@@ -218,7 +235,6 @@ FROM ${PKG_SQUASHFS_TOOLS} AS pkg-squashfs-tools
 FROM ${PKG_TAR} AS pkg-tar
 FROM ${PKG_XFSPROGS} AS pkg-xfsprogs
 FROM ${PKG_XZ} AS pkg-xz
-FROM ${PKG_ZSTD} AS pkg-zstd
 
 FROM --platform=amd64 ${TOOLS_PREFIX}:${TOOLS} AS tools-amd64
 FROM --platform=arm64 ${TOOLS_PREFIX}:${TOOLS} AS tools-arm64
@@ -270,7 +286,7 @@ WORKDIR /src
 # The build-go target creates a container to build Go code with Go modules downloaded and verified.
 
 FROM build AS build-go
-COPY ./go.mod ./go.sum ./go.work ./
+COPY ./go.mod ./go.sum ./go.work ./.custom-gcl.yml ./
 COPY ./pkg/machinery/go.mod ./pkg/machinery/go.sum ./pkg/machinery/
 COPY ./tools ./tools
 WORKDIR /src
@@ -334,9 +350,15 @@ FROM build-go AS proto-format-build
 WORKDIR /src/api
 COPY api .
 RUN --mount=type=cache,target=/.cache,id=talos/.cache go tool github.com/bufbuild/buf/cmd/buf format
+# pkg/provision/api hosts the remote-provision tooling proto, kept out
+# of api/ so it isn't confused with the stable Talos node APIs.
+WORKDIR /src/pkg/provision/api
+COPY pkg/provision/api .
+RUN --mount=type=cache,target=/.cache,id=talos/.cache go tool github.com/bufbuild/buf/cmd/buf format
 
 FROM --platform=${BUILDPLATFORM} scratch AS fmt-protobuf
 COPY --link --from=proto-format-build /src/api/ /api/
+COPY --link --from=proto-format-build /src/pkg/provision/api/ /pkg/provision/api/
 
 # run docgen for machinery config
 FROM build-go AS go-generate
@@ -359,16 +381,23 @@ RUN --mount=type=cache,target=/.cache,id=talos/.cache go tool github.com/siderol
 # compile protobuf service definitions
 FROM build-go AS generate-build
 COPY --link --from=proto-format-build /src/api /src/api/
+COPY --link --from=proto-format-build /src/pkg/provision/api /src/pkg/provision/api/
 COPY --link --from=gen-proto-go /api/resource/definitions/ /src/api/resource/definitions/
 WORKDIR /src/api
 RUN --mount=type=cache,target=/.cache,id=talos/.cache go tool github.com/bufbuild/buf/cmd/buf build
 RUN --mount=type=cache,target=/.cache,id=talos/.cache,sharing=locked go tool github.com/bufbuild/buf/cmd/buf generate
+# pkg/provision/api is its own buf module (see plugin out: . in its
+# buf.gen.yaml); generated stubs land beside the proto.
+WORKDIR /src/pkg/provision/api
+RUN --mount=type=cache,target=/.cache,id=talos/.cache go tool github.com/bufbuild/buf/cmd/buf build
+RUN --mount=type=cache,target=/.cache,id=talos/.cache,sharing=locked go tool github.com/bufbuild/buf/cmd/buf generate
 # Goimports and gofumpt generated files to adjust import order
-RUN --mount=type=cache,target=/.cache,id=talos/.cache go tool golang.org/x/tools/cmd/goimports -w -local github.com/siderolabs/talos /src/api/machinery/
-RUN --mount=type=cache,target=/.cache,id=talos/.cache go tool mvdan.cc/gofumpt -w /src/api/machinery/
+RUN --mount=type=cache,target=/.cache,id=talos/.cache go tool golang.org/x/tools/cmd/goimports -w -local github.com/siderolabs/talos /src/api/machinery/ /src/pkg/provision/api/
+RUN --mount=type=cache,target=/.cache,id=talos/.cache go tool mvdan.cc/gofumpt -w /src/api/machinery/ /src/pkg/provision/api/
 
 FROM scratch AS generate-build-clean
 COPY --link --from=generate-build /src/api /api/
+COPY --link --from=generate-build /src/pkg/provision/api /pkg/provision/api/
 
 FROM tools AS selinux
 RUN --mount=type=bind,source=internal/pkg/selinux/policy/selinux,target=/selinux \
@@ -392,11 +421,35 @@ FROM scratch AS microsoft-db-keys
 COPY --link --from=microsoft-secureboot-database /DB/Certificates/MicCor*.der /db/
 COPY --link --from=microsoft-secureboot-database /DB/Certificates/microsoft*.der /db/
 
+# The base target provides a container that can be used to build all Talos
+# assets.
+
+FROM build-go AS base
+COPY ./cmd ./cmd
+COPY ./pkg ./pkg
+COPY ./internal ./internal
+COPY --link --from=embed / ./
+RUN --mount=type=cache,target=/.cache,id=talos/.cache go list all >/dev/null
+WORKDIR /src/pkg/machinery
+RUN --mount=type=cache,target=/.cache,id=talos/.cache go list all >/dev/null
+RUN --mount=type=cache,target=/.cache,id=talos/.cache go generate -v ./version
+WORKDIR /src
+
+FROM base AS go-mod-tidy
+RUN --mount=type=cache,target=/.cache,id=talos/.cache go mod tidy
+WORKDIR /src/pkg/machinery
+RUN --mount=type=cache,target=/.cache,id=talos/.cache go mod tidy
+WORKDIR /src
+
 FROM --platform=${BUILDPLATFORM} scratch AS generate
+COPY --link --from=go-mod-tidy /src/go.mod /src/go.sum /
+COPY --link --from=go-mod-tidy /src/pkg/machinery/go.mod /src/pkg/machinery/go.sum /pkg/machinery/
 COPY --link --from=proto-format-build /src/api /api/
+COPY --link --from=proto-format-build /src/pkg/provision/api /pkg/provision/api/
 COPY --link --from=generate-build-clean /api/resource/definitions/ /api/resource/definitions/
 COPY --link --from=generate-build-clean /api/machinery /pkg/machinery/
-COPY --link --from=generate-build-clean /api/docs/api.md /website/content/v1.14/reference/api.md
+COPY --link --from=generate-build-clean /api/docs/api.md /website/content/v1.15/reference/api.md
+COPY --link --from=generate-build-clean /pkg/provision/api /pkg/provision/api/
 COPY --link --from=go-generate /src/pkg/imager/profile/ /pkg/imager/profile/
 COPY --link --from=go-generate /src/pkg/machinery/resources/ /pkg/machinery/resources/
 COPY --link --from=go-generate /src/pkg/machinery/config/schemas/ /pkg/machinery/config/schemas/
@@ -412,19 +465,6 @@ COPY --link --from=pkg-ca-certificates /etc/ssl/certs/ca-certificates /internal/
 COPY --link --from=microsoft-key-keys / /internal/pkg/secureboot/database/certs/
 COPY --link --from=microsoft-db-keys / /internal/pkg/secureboot/database/certs/
 
-# The base target provides a container that can be used to build all Talos
-# assets.
-
-FROM build-go AS base
-COPY ./cmd ./cmd
-COPY ./pkg ./pkg
-COPY ./internal ./internal
-COPY --link --from=embed / ./
-RUN --mount=type=cache,target=/.cache,id=talos/.cache go list all >/dev/null
-WORKDIR /src/pkg/machinery
-RUN --mount=type=cache,target=/.cache,id=talos/.cache go list all >/dev/null
-RUN --mount=type=cache,target=/.cache,id=talos/.cache go generate -v ./version
-WORKDIR /src
 
 # The vulncheck target runs the vulnerability check tool.
 
@@ -631,6 +671,7 @@ COPY --link --from=talosctl-windows-arm64 / /
 
 FROM scratch AS talosctl
 ARG TARGETARCH
+COPY --link --from=pkg-ca-certificates /etc/ssl/certs/ca-certificates /etc/ssl/certs/ca-certificates
 COPY --link --from=talosctl-all /talosctl-linux-${TARGETARCH} /talosctl
 ARG TAG
 ENV VERSION=${TAG}
@@ -731,15 +772,21 @@ COPY --link --from=pkg-libjson-c-amd64 / /rootfs
 COPY --link --from=pkg-libmnl-amd64 / /rootfs
 COPY --link --from=pkg-libnftnl-amd64 / /rootfs
 COPY --link --from=pkg-libpopt-amd64 / /rootfs
+COPY --link --from=pkg-libucontext-amd64 / /rootfs
 COPY --link --from=pkg-liburcu-amd64 / /rootfs
 COPY --link --from=pkg-libsepol-amd64 / /rootfs
 COPY --link --from=pkg-libselinux-amd64 / /rootfs
+COPY --link --from=pkg-zstd-amd64 /usr/share/spdx /rootfs/usr/share/spdx
+COPY --link --from=pkg-zstd-amd64 /usr/lib /rootfs/usr/lib
+COPY --link --from=pkg-zlib-amd64 /usr/share/spdx /rootfs/usr/share/spdx
+COPY --link --from=pkg-zlib-amd64 /usr/lib /rootfs/usr/lib
 # NOTE: amd64 ships igzip, but arm64 ships pigz (see https://github.com/siderolabs/extensions/discussions/931)
 COPY --link --exclude=usr/lib/pkgconfig --exclude=usr/include --from=pkg-igzip-amd64 / /rootfs
 COPY --link --from=pkg-pcre2-amd64 / /rootfs
 COPY --link --from=pkg-openssl-amd64 / /rootfs
 COPY --link --from=pkg-lvm2-amd64 / /rootfs
 COPY --link --from=pkg-libaio-amd64 / /rootfs
+COPY --link --from=pkg-mdadm-amd64 / /rootfs
 COPY --link --from=pkg-musl-amd64 / /rootfs
 COPY --link --from=pkg-nftables-amd64 / /rootfs
 COPY --link --from=pkg-runc-amd64 / /rootfs
@@ -756,20 +803,21 @@ COPY --link --from=machined-build-amd64 /machined /rootfs/usr/bin/init
 
 RUN <<END
     # the orderly_poweroff call by the kernel will call '/sbin/poweroff'
-    ln /rootfs/usr/bin/init /rootfs/usr/bin/poweroff
-    chmod +x /rootfs/usr/bin/poweroff
+    ln -s init /rootfs/usr/bin/poweroff
     # some extensions like qemu-guest agent will call '/sbin/shutdown'
-    ln /rootfs/usr/bin/init /rootfs/usr/bin/shutdown
-    chmod +x /rootfs/usr/bin/shutdown
-    ln /rootfs/usr/bin/init /rootfs/usr/bin/dashboard
-    chmod +x /rootfs/usr/bin/dashboard
+    ln -s init /rootfs/usr/bin/shutdown
+    # the orderly_reboot call by the kernel (e.g. hyper-v restart request) will call '/sbin/reboot'
+    ln -s init /rootfs/usr/bin/reboot
+    ln -s init /rootfs/usr/bin/dashboard
+    # sandboxd is PID 1 of the sandbox PID+mount namespace, re-exec'd by machined
+    ln -s init /rootfs/usr/bin/sandboxd
 END
 # NB: We run the cleanup step before creating extra directories, files, and
 # symlinks to avoid accidentally cleaning them up.
 RUN --mount=type=bind,source=hack/cleanup.sh,target=/usr/bin/cleanup.sh <<END
     cleanup.sh /rootfs
-    mkdir -pv /rootfs/{boot/EFI,etc/{iscsi,nvme,cri/conf.d/hosts},usr/lib/firmware,usr/etc,usr/local/share,usr/share/zoneinfo/Etc,mnt,system,opt,.extra}
-    mkdir -pv /rootfs/{etc/kubernetes/manifests,etc/cni/net.d,etc/ssl/certs,usr/libexec/kubernetes,/usr/local/lib/kubelet/credentialproviders,etc/selinux/targeted/contexts/files}
+    mkdir -pv /rootfs/{boot/EFI,/etc/cri/conf.d/hosts,usr/lib/firmware,usr/etc,usr/local/share,usr/share/zoneinfo/Etc,mnt,system,opt,.extra}
+    mkdir -pv /rootfs/{etc/kubernetes/manifests,etc/cni/net.ds,etc/ssl/certs,/usr/local/lib/kubelet/credentialproviders,etc/selinux/targeted/contexts/files}
     mkdir -pv /rootfs/opt/{containerd/bin,containerd/lib}
     # Go standard library is shipped with Talos, thus it must be tracked in SBOM
     install -D /usr/share/spdx/golang.spdx.json /rootfs/usr/share/spdx/golang.spdx.json
@@ -780,12 +828,12 @@ COPY --chmod=0644 hack/containerd.toml /rootfs/etc/containerd/config.toml
 COPY --chmod=0644 hack/cri-containerd.toml /rootfs/etc/cri/containerd.toml
 COPY --chmod=0644 hack/cri-plugin.part /rootfs/etc/cri/conf.d/00-base.part
 COPY --chmod=0644 hack/udevd/99-default.link /rootfs/usr/lib/systemd/network/
-COPY --chmod=0644 hack/udevd/40-vm-hotadd.rules hack/udevd/90-selinux.rules /rootfs/usr/lib/udev/rules.d/
+COPY --chmod=0644 hack/udevd/40-vm-hotadd.rules hack/udevd/90-md-raid-arrays.rules hack/udevd/90-md-raid-assembly.rules hack/udevd/90-selinux.rules hack/udevd/99-talos.rules /rootfs/usr/lib/udev/rules.d/
 COPY --chmod=0644 hack/lvm.conf /rootfs/etc/lvm/lvm.conf
 COPY --link --chmod=0644 --from=base /src/pkg/machinery/version/os-release /rootfs/etc/os-release
 RUN <<END
     ln -s /usr/share/zoneinfo/Etc/UTC /rootfs/etc/localtime
-    touch /rootfs/etc/{extensions.yaml,resolv.conf,hosts,machine-id,cri/conf.d/cri.toml,cri/conf.d/01-registries.part,cri/conf.d/20-customization.part,cri/conf.d/base-spec.json,ssl/certs/ca-certificates.crt,selinux/targeted/contexts/files/file_contexts,iscsi/initiatorname.iscsi,nvme/{hostid,hostnqn}}
+    touch /rootfs/etc/{extensions.yaml,selinux/targeted/contexts/files/file_contexts}
     ln -s ca-certificates.crt /rootfs/etc/ssl/certs/ca-certificates
     ln -s /etc/ssl /rootfs/etc/pki
     ln -s /etc/ssl /rootfs/usr/share/ca-certificates
@@ -816,6 +864,7 @@ COPY --link --from=pkg-libjson-c-arm64 / /rootfs
 COPY --link --from=pkg-libmnl-arm64 / /rootfs
 COPY --link --from=pkg-libnftnl-arm64 / /rootfs
 COPY --link --from=pkg-libpopt-arm64 / /rootfs
+COPY --link --from=pkg-libucontext-arm64 / /rootfs
 COPY --link --from=pkg-liburcu-arm64 / /rootfs
 COPY --link --from=pkg-libsepol-arm64 / /rootfs
 COPY --link --from=pkg-libselinux-arm64 / /rootfs
@@ -823,12 +872,16 @@ COPY --link --from=pkg-pcre2-arm64 / /rootfs
 COPY --link --from=pkg-openssl-arm64 / /rootfs
 COPY --link --from=pkg-lvm2-arm64 / /rootfs
 COPY --link --from=pkg-libaio-arm64 / /rootfs
+COPY --link --from=pkg-mdadm-arm64 / /rootfs
 COPY --link --from=pkg-musl-arm64 / /rootfs
 COPY --link --from=pkg-nftables-arm64 / /rootfs
 COPY --link --from=pkg-runc-arm64 / /rootfs
 COPY --link --from=pkg-xfsprogs-arm64 / /rootfs
+COPY --link --from=pkg-zstd-arm64 /usr/share/spdx /rootfs/usr/share/spdx
+COPY --link --from=pkg-zstd-arm64 /usr/lib /rootfs/usr/lib
+COPY --link --from=pkg-zlib-arm64 /usr/share/spdx /rootfs/usr/share/spdx
+COPY --link --from=pkg-zlib-arm64 /usr/lib /rootfs/usr/lib
 # NOTE: amd64 ships igzip, but arm64 ships pigz (see https://github.com/siderolabs/extensions/discussions/931)
-COPY --link --from=pkg-zlib-arm64 / /rootfs
 COPY --link --from=pkg-pigz-arm64 / /rootfs
 COPY --link --from=pkg-util-linux-arm64 /usr/lib/libblkid.* /rootfs/usr/lib/
 COPY --link --from=pkg-util-linux-arm64 /usr/lib/libuuid.* /rootfs/usr/lib/
@@ -842,20 +895,21 @@ COPY --link --from=machined-build-arm64 /machined /rootfs/usr/bin/init
 
 RUN <<END
     # the orderly_poweroff call by the kernel will call '/sbin/poweroff'
-    ln /rootfs/usr/bin/init /rootfs/usr/bin/poweroff
-    chmod +x /rootfs/usr/bin/poweroff
+    ln -s init /rootfs/usr/bin/poweroff
     # some extensions like qemu-guest agent will call '/sbin/shutdown'
-    ln /rootfs/usr/bin/init /rootfs/usr/bin/shutdown
-    chmod +x /rootfs/usr/bin/shutdown
-    ln /rootfs/usr/bin/init /rootfs/usr/bin/dashboard
-    chmod +x /rootfs/usr/bin/dashboard
+    ln -s init /rootfs/usr/bin/shutdown
+    # the orderly_reboot call by the kernel (e.g. hyper-v restart request) will call '/sbin/reboot'
+    ln -s init /rootfs/usr/bin/reboot
+    ln -s init /rootfs/usr/bin/dashboard
+    # sandboxd is PID 1 of the sandbox PID+mount namespace, re-exec'd by machined
+    ln -s init /rootfs/usr/bin/sandboxd
 END
 # NB: We run the cleanup step before creating extra directories, files, and
 # symlinks to avoid accidentally cleaning them up.
 RUN --mount=type=bind,source=hack/cleanup.sh,target=/usr/bin/cleanup.sh <<END
     cleanup.sh /rootfs
-    mkdir -pv /rootfs/{boot/EFI,etc/{iscsi,nvme,cri/conf.d/hosts},usr/lib/firmware,usr/etc,usr/local/share,usr/share/zoneinfo/Etc,mnt,system,opt,.extra}
-    mkdir -pv /rootfs/{etc/kubernetes/manifests,etc/cni/net.d,etc/ssl/certs,usr/libexec/kubernetes,/usr/local/lib/kubelet/credentialproviders,etc/selinux/targeted/contexts/files}
+    mkdir -pv /rootfs/{boot/EFI,/etc/cri/conf.d/hosts,usr/lib/firmware,usr/etc,usr/local/share,usr/share/zoneinfo/Etc,mnt,system,opt,.extra}
+    mkdir -pv /rootfs/{etc/kubernetes/manifests,etc/cni/net.d,etc/ssl/certs,/usr/local/lib/kubelet/credentialproviders,etc/selinux/targeted/contexts/files}
     mkdir -pv /rootfs/opt/{containerd/bin,containerd/lib}
     # Go standard library is shipped with Talos, thus it must be tracked in SBOM
     install -D /usr/share/spdx/golang.spdx.json /rootfs/usr/share/spdx/golang.spdx.json
@@ -866,12 +920,12 @@ COPY --chmod=0644 hack/containerd.toml /rootfs/etc/containerd/config.toml
 COPY --chmod=0644 hack/cri-containerd.toml /rootfs/etc/cri/containerd.toml
 COPY --chmod=0644 hack/cri-plugin.part /rootfs/etc/cri/conf.d/00-base.part
 COPY --chmod=0644 hack/udevd/99-default.link /rootfs/usr/lib/systemd/network/
-COPY --chmod=0644 hack/udevd/40-vm-hotadd.rules hack/udevd/90-selinux.rules /rootfs/usr/lib/udev/rules.d/
+COPY --chmod=0644 hack/udevd/40-vm-hotadd.rules hack/udevd/90-md-raid-arrays.rules hack/udevd/90-md-raid-assembly.rules hack/udevd/90-selinux.rules hack/udevd/99-talos.rules /rootfs/usr/lib/udev/rules.d/
 COPY --chmod=0644 hack/lvm.conf /rootfs/etc/lvm/lvm.conf
 COPY --link --chmod=0644 --from=base /src/pkg/machinery/version/os-release /rootfs/etc/os-release
 RUN <<END
     ln -s /usr/share/zoneinfo/Etc/UTC /rootfs/etc/localtime
-    touch /rootfs/etc/{extensions.yaml,resolv.conf,hosts,machine-id,cri/conf.d/cri.toml,cri/conf.d/01-registries.part,cri/conf.d/20-customization.part,cri/conf.d/base-spec.json,ssl/certs/ca-certificates.crt,selinux/targeted/contexts/files/file_contexts,iscsi/initiatorname.iscsi,nvme/{hostid,hostnqn}}
+    touch /rootfs/etc/{extensions.yaml,selinux/targeted/contexts/files/file_contexts}
     ln -s ca-certificates.crt /rootfs/etc/ssl/certs/ca-certificates
     ln -s /etc/ssl /rootfs/etc/pki
     ln -s /etc/ssl /rootfs/usr/share/ca-certificates
@@ -881,20 +935,23 @@ END
 
 FROM build-go AS build-sbom
 ARG SOURCE_DATE_EPOCH
-ENV SYFT_FORMAT_SPDX_JSON_CREATED_TIME=${SOURCE_DATE_EPOCH}
 ARG NAME
 ARG TAG
 
 FROM build-sbom AS sbom-container-arm64-generate
 RUN --mount=type=tmpfs,target=/tmp/sbom-src \
     --mount=type=bind,from=rootfs-base-arm64,source=/rootfs/usr/share/spdx,target=/mnt/spdx \
-    --mount=type=bind,source=hack/sbom.sh,target=/usr/bin/sbom.sh \
     --mount=type=cache,target=/.cache,id=talos/.cache <<EOF
 set -euo pipefail
 mkdir -p /rootfs/usr/share/spdx
 cp -r /mnt/spdx/. /tmp/sbom-src/
 cp go.mod go.sum /tmp/sbom-src/
-sbom.sh /tmp/sbom-src/ talos-container-arm64.spdx.json
+go tool github.com/siderolabs/talos/tools/sbom-builder \
+    --source-dir /tmp/sbom-src/ \
+    --source-name "$NAME" \
+    --source-version "$TAG" \
+    --source-date-epoch "${SOURCE_DATE_EPOCH:-0}" \
+    --output /rootfs/usr/share/spdx/talos-container-arm64.spdx.json
 EOF
 
 FROM scratch AS sbom-container-arm64
@@ -903,13 +960,17 @@ COPY --link --from=sbom-container-arm64-generate /rootfs/usr/share/spdx/talos-co
 FROM build-sbom AS sbom-container-amd64-generate
 RUN --mount=type=tmpfs,target=/tmp/sbom-src \
     --mount=type=bind,from=rootfs-base-amd64,source=/rootfs/usr/share/spdx,target=/mnt/spdx \
-    --mount=type=bind,source=hack/sbom.sh,target=/usr/bin/sbom.sh \
     --mount=type=cache,target=/.cache,id=talos/.cache <<EOF
 set -euo pipefail
 mkdir -p /rootfs/usr/share/spdx
 cp -r /mnt/spdx/. /tmp/sbom-src/
 cp go.mod go.sum /tmp/sbom-src/
-sbom.sh /tmp/sbom-src/ talos-container-amd64.spdx.json
+go tool github.com/siderolabs/talos/tools/sbom-builder \
+    --source-dir /tmp/sbom-src/ \
+    --source-name "$NAME" \
+    --source-version "$TAG" \
+    --source-date-epoch "${SOURCE_DATE_EPOCH:-0}" \
+    --output /rootfs/usr/share/spdx/talos-container-amd64.spdx.json
 EOF
 
 FROM scratch AS sbom-container-amd64
@@ -919,14 +980,18 @@ FROM build-sbom AS sbom-arm64-generate
 RUN --mount=type=tmpfs,target=/tmp/sbom-src \
     --mount=type=bind,from=rootfs-base-arm64,source=/rootfs/usr/share/spdx,target=/mnt/spdx \
     --mount=type=bind,from=pkg-kernel-arm64,source=/usr/share/spdx/kernel.spdx.json,target=/mnt/kernel.spdx.json \
-    --mount=type=bind,source=hack/sbom.sh,target=/usr/bin/sbom.sh \
     --mount=type=cache,target=/.cache,id=talos/.cache <<EOF
 set -euo pipefail
 mkdir -p /rootfs/usr/share/spdx
 cp -r /mnt/spdx/. /tmp/sbom-src/
 cp /mnt/kernel.spdx.json /tmp/sbom-src/
 cp go.mod go.sum /tmp/sbom-src/
-sbom.sh /tmp/sbom-src/ talos-arm64.spdx.json
+go tool github.com/siderolabs/talos/tools/sbom-builder \
+    --source-dir /tmp/sbom-src/ \
+    --source-name "$NAME" \
+    --source-version "$TAG" \
+    --source-date-epoch "${SOURCE_DATE_EPOCH:-0}" \
+    --output /rootfs/usr/share/spdx/talos-arm64.spdx.json
 EOF
 
 FROM scratch AS sbom-arm64
@@ -936,14 +1001,18 @@ FROM build-sbom AS sbom-amd64-generate
 RUN --mount=type=tmpfs,target=/tmp/sbom-src \
     --mount=type=bind,from=rootfs-base-amd64,source=/rootfs/usr/share/spdx,target=/mnt/spdx \
     --mount=type=bind,from=pkg-kernel-amd64,source=/usr/share/spdx/kernel.spdx.json,target=/mnt/kernel.spdx.json \
-    --mount=type=bind,source=hack/sbom.sh,target=/usr/bin/sbom.sh \
     --mount=type=cache,target=/.cache,id=talos/.cache <<EOF
 set -euo pipefail
 mkdir -p /rootfs/usr/share/spdx
 cp -r /mnt/spdx/. /tmp/sbom-src/
 cp /mnt/kernel.spdx.json /tmp/sbom-src/
 cp go.mod go.sum /tmp/sbom-src/
-sbom.sh /tmp/sbom-src/ talos-amd64.spdx.json
+go tool github.com/siderolabs/talos/tools/sbom-builder \
+    --source-dir /tmp/sbom-src/ \
+    --source-name "$NAME" \
+    --source-version "$TAG" \
+    --source-date-epoch "${SOURCE_DATE_EPOCH:-0}" \
+    --output /rootfs/usr/share/spdx/talos-amd64.spdx.json
 EOF
 
 FROM scratch AS sbom-amd64
@@ -990,17 +1059,20 @@ RUN --mount=type=cache,target=/.cache,id=talos/.cache go tool \
     --vex /talos.vex.json -vv --fail-on negligible --config /talos.grype.yaml
 
 FROM rootfs-base-${TARGETARCH} AS rootfs-base
-ARG SOURCE_DATE_EPOCH
 RUN rm -rf /rootfs/usr/share/spdx/*
 COPY --link --from=sbom-container-target / /rootfs/usr/share/spdx/
 RUN echo "true" > /rootfs/usr/etc/in-container
 RUN rm -rf /rootfs/usr/lib/modules/*
+ARG SOURCE_DATE_EPOCH
 RUN find /rootfs -print0 \
     | xargs -0r touch --no-dereference --date="@${SOURCE_DATE_EPOCH}"
 
 FROM rootfs-base-arm64 AS rootfs-squashfs-arm64
 RUN rm -rf /rootfs/usr/share/spdx/*
 COPY --link --from=sbom-arm64 / /rootfs/usr/share/spdx/
+ARG SOURCE_DATE_EPOCH
+RUN find /rootfs -print0 \
+    | xargs -0r touch --no-dereference --date="@${SOURCE_DATE_EPOCH}"
 ARG ZSTD_COMPRESSION_LEVEL
 COPY --link --from=selinux-generate /policy/file_contexts /file_contexts
 RUN --mount=from=labeled-squashfs-build,source=/labeled-squashfs,target=/usr/local/bin/labeled-squashfs \
@@ -1009,6 +1081,9 @@ RUN --mount=from=labeled-squashfs-build,source=/labeled-squashfs,target=/usr/loc
 FROM rootfs-base-amd64 AS rootfs-squashfs-amd64
 RUN rm -rf /rootfs/usr/share/spdx/*
 COPY --link --from=sbom-amd64 / /rootfs/usr/share/spdx/
+ARG SOURCE_DATE_EPOCH
+RUN find /rootfs -print0 \
+    | xargs -0r touch --no-dereference --date="@${SOURCE_DATE_EPOCH}"
 ARG ZSTD_COMPRESSION_LEVEL
 COPY --link --from=selinux-generate /policy/file_contexts /file_contexts
 RUN --mount=from=labeled-squashfs-build,source=/labeled-squashfs,target=/usr/local/bin/labeled-squashfs \
@@ -1206,6 +1281,7 @@ FROM --platform=${BUILDPLATFORM} iso-${TARGETARCH} AS iso
 FROM base AS unit-tests-runner
 COPY --link --from=rootfs / /
 COPY --link --from=pkg-ca-certificates / /
+COPY --link --from=pkg-btrfsprogs / /
 ARG TESTPKGS
 ENV PLATFORM=container
 ARG GO_LDFLAGS
@@ -1220,6 +1296,7 @@ COPY --link --from=unit-tests-runner /src/coverage.txt /coverage.txt
 FROM base AS unit-tests-race
 COPY --link --from=rootfs / /
 COPY --link --from=pkg-ca-certificates / /
+COPY --link --from=pkg-btrfsprogs / /
 ARG TESTPKGS
 ENV PLATFORM=container
 ENV CGO_ENABLED=1
@@ -1232,6 +1309,7 @@ RUN --security=insecure --mount=type=cache,id=testspace,target=/tmp --mount=type
 FROM base AS unit-tests-fips
 COPY --link --from=rootfs / /
 COPY --link --from=pkg-ca-certificates / /
+COPY --link --from=pkg-btrfsprogs / /
 ARG TESTPKGS
 ENV PLATFORM=container
 ENV GOFIPS140=latest
@@ -1298,31 +1376,52 @@ COPY --link --from=integration-test-provision-linux-build /src/integration.test 
 # All depend on lint-go-config (gating) by bind-mounting /verified from it.
 # Cache mounts: Go cache shared (concurrency-safe), lint cache locked (golangci-lint corruption protection).
 
+FROM base AS golangci-lint-plugin-builder
+RUN --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared \
+    go build -o /usr/local/bin/golangci-lint github.com/golangci/golangci-lint/v2/cmd/golangci-lint
+
+FROM golangci-lint-plugin-builder AS lint-golangci-lint-custom
+RUN --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared \
+    golangci-lint custom
+
+FROM golangci-lint-plugin-builder AS golangci-lint-custom-target
+ARG TARGETOS
+ARG TARGETARCH
+RUN --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared \
+    GOOS=${TARGETOS} GOARCH=${TARGETARCH} golangci-lint custom
+
+FROM scratch AS golangci-lint-custom
+COPY --link --from=golangci-lint-custom-target /src/custom-gcl /custom-gcl
+
 FROM base AS lint-go-config
+COPY --link --from=lint-golangci-lint-custom /src/custom-gcl /usr/local/bin/custom-gcl
 RUN --mount=type=bind,source=.golangci.yml,target=/src/.golangci.yml \
     --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared \
     --mount=type=cache,target=/.cache/lint,id=talos/.cache/lint,sharing=locked \
-    GOGC=50 GOLANGCI_LINT_CACHE=/.cache/lint go tool github.com/golangci/golangci-lint/v2/cmd/golangci-lint config verify --config .golangci.yml \
+    GOGC=50 GOLANGCI_LINT_CACHE=/.cache/lint custom-gcl config verify --config .golangci.yml \
     && touch /verified
 
 FROM base AS lint-go-talos
+COPY --link --from=lint-golangci-lint-custom /src/custom-gcl /usr/local/bin/custom-gcl
 RUN --mount=type=bind,from=lint-go-config,source=/verified,target=/tmp/.config-verified \
     --mount=type=bind,source=.golangci.yml,target=/src/.golangci.yml \
     --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared \
     --mount=type=cache,target=/.cache/lint,id=talos/.cache/lint,sharing=locked \
-    GOGC=50 GOLANGCI_LINT_CACHE=/.cache/lint go tool github.com/golangci/golangci-lint/v2/cmd/golangci-lint run --config .golangci.yml \
+    GOGC=50 GOLANGCI_LINT_CACHE=/.cache/lint custom-gcl run --config .golangci.yml \
     && touch /verified
 
 FROM base AS lint-go-machinery
+COPY --link --from=lint-golangci-lint-custom /src/custom-gcl /usr/local/bin/custom-gcl
 WORKDIR /src/pkg/machinery
 RUN --mount=type=bind,from=lint-go-config,source=/verified,target=/tmp/.config-verified \
     --mount=type=bind,source=.golangci.yml,target=/src/.golangci.yml \
     --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared \
     --mount=type=cache,target=/.cache/lint,id=talos/.cache/lint,sharing=locked \
-    GOGC=50 GOLANGCI_LINT_CACHE=/.cache/lint go tool github.com/golangci/golangci-lint/v2/cmd/golangci-lint run --config ../../.golangci.yml \
+    GOGC=50 GOLANGCI_LINT_CACHE=/.cache/lint custom-gcl run --config ../../.golangci.yml \
     && touch /verified
 
 FROM base AS lint-go-tools
+COPY --link --from=lint-golangci-lint-custom /src/custom-gcl /usr/local/bin/custom-gcl
 RUN --mount=type=bind,from=lint-go-config,source=/verified,target=/tmp/.config-verified \
     --mount=type=bind,source=.golangci.yml,target=/src/.golangci.yml \
     --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared \
@@ -1332,7 +1431,7 @@ for d in /src/tools/*/; do
     [ -f "$d/go.mod" ] || continue
     echo "::: linting $d"
     cd "$d"
-    GOGC=50 GOLANGCI_LINT_CACHE=/.cache/lint go tool github.com/golangci/golangci-lint/v2/cmd/golangci-lint run --config /src/.golangci.yml
+    GOGC=50 GOLANGCI_LINT_CACHE=/.cache/lint custom-gcl run --config /src/.golangci.yml
 done
 touch /verified
 EOF
@@ -1351,22 +1450,23 @@ COPY --link --from=lint-go-importvet /verified /lint-go-importvet
 
 # The lint-golangci-lint-fmt target runs the golangci-lint formatter and fixes issues automatically.
 FROM base AS lint-golangci-lint-fmt-run
+COPY --link --from=lint-golangci-lint-custom /src/custom-gcl /usr/local/bin/custom-gcl
 COPY .golangci.yml .
 ENV GOGC=50
 ENV GOLANGCI_LINT_CACHE=/.cache/lint
-RUN --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared --mount=type=cache,target=/.cache/lint,id=talos/.cache/lint,sharing=locked go tool github.com/golangci/golangci-lint/v2/cmd/golangci-lint fmt --config .golangci.yml
-RUN --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared --mount=type=cache,target=/.cache/lint,id=talos/.cache/lint,sharing=locked go tool github.com/golangci/golangci-lint/v2/cmd/golangci-lint run --fix --issues-exit-code 0 --config .golangci.yml
+RUN --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared --mount=type=cache,target=/.cache/lint,id=talos/.cache/lint,sharing=locked custom-gcl fmt --config .golangci.yml
+RUN --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared --mount=type=cache,target=/.cache/lint,id=talos/.cache/lint,sharing=locked custom-gcl run --fix --issues-exit-code 0 --config .golangci.yml
 WORKDIR /src/pkg/machinery
-RUN --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared --mount=type=cache,target=/.cache/lint,id=talos/.cache/lint,sharing=locked go tool github.com/golangci/golangci-lint/v2/cmd/golangci-lint fmt --config ../../.golangci.yml
-RUN --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared --mount=type=cache,target=/.cache/lint,id=talos/.cache/lint,sharing=locked go tool github.com/golangci/golangci-lint/v2/cmd/golangci-lint run --fix --issues-exit-code 0 --config ../../.golangci.yml
+RUN --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared --mount=type=cache,target=/.cache/lint,id=talos/.cache/lint,sharing=locked custom-gcl fmt --config ../../.golangci.yml
+RUN --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared --mount=type=cache,target=/.cache/lint,id=talos/.cache/lint,sharing=locked custom-gcl run --fix --issues-exit-code 0 --config ../../.golangci.yml
 RUN --mount=type=cache,target=/.cache,id=talos/.cache,sharing=shared \
     --mount=type=cache,target=/.cache/lint,id=talos/.cache/lint,sharing=locked <<EOF
 set -euo pipefail
 for d in /src/tools/*/; do
     [ -f "$d/go.mod" ] || continue
     cd "$d"
-    go tool github.com/golangci/golangci-lint/v2/cmd/golangci-lint fmt --config /src/.golangci.yml
-    go tool github.com/golangci/golangci-lint/v2/cmd/golangci-lint run --fix --issues-exit-code 0 --config /src/.golangci.yml
+    custom-gcl fmt --config /src/.golangci.yml
+    custom-gcl run --fix --issues-exit-code 0 --config /src/.golangci.yml
 done
 EOF
 WORKDIR /src
@@ -1387,6 +1487,8 @@ COPY --link --from=api-descriptors /api/lock.binpb /tmp/current.lock.binpb
 WORKDIR /src/api
 RUN --mount=type=bind,source=api,target=/src/api --mount=type=cache,target=/.cache,id=talos/.cache go tool github.com/bufbuild/buf/cmd/buf lint
 RUN --mount=type=bind,source=api,target=/src/api --mount=type=cache,target=/.cache,id=talos/.cache go tool github.com/bufbuild/buf/cmd/buf breaking /tmp/current.lock.binpb --against lock.binpb
+WORKDIR /src/pkg/provision/api
+RUN --mount=type=bind,source=pkg/provision/api,target=/src/pkg/provision/api --mount=type=cache,target=/.cache,id=talos/.cache go tool github.com/bufbuild/buf/cmd/buf lint
 
 # The markdownlint target performs linting on Markdown files.
 
@@ -1419,9 +1521,9 @@ RUN --mount=type=bind,from=talosctl-targetarch,source=/talosctl-${TARGETOS}-${TA
 COPY ./pkg/machinery/config/schemas/*.schema.json /tmp/schemas/
 
 FROM scratch AS docs
-COPY --link --from=docs-build /tmp/configuration/ /website/content/v1.14/reference/configuration/
-COPY --link --from=docs-build /tmp/cli.md /website/content/v1.14/reference/
-COPY --link --from=docs-build /tmp/schemas /website/content/v1.14/schemas/
+COPY --link --from=docs-build /tmp/configuration/ /website/content/v1.15/reference/configuration/
+COPY --link --from=docs-build /tmp/cli.md /website/content/v1.15/reference/
+COPY --link --from=docs-build /tmp/schemas /website/content/v1.15/schemas/
 
 # The talosctl-cni-bundle builds the CNI bundle for talosctl.
 
