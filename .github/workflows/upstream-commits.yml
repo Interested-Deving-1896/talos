@@ -1,18 +1,8 @@
 name: Upstream Direct Commits from OSP + OOC
 
-# Detects commits pushed directly to OSP/OOC default branches (without a PR)
-# that are not present in Interested-Deving-1896 and opens PRs upstream so
-# they can be reviewed and merged back into the source of truth.
-#
-# Complements upstream-prs.yml (which handles open PRs) by catching direct
-# pushes that bypass the PR workflow entirely.
-#
-# Schedule: runs at :47 each hour — after mirror-to-osp (:00), reconcile (:30),
-# and upstream-prs (:30), so reconcile noise has settled before we scan.
-
 on:
   schedule:
-    - cron: "47 */6 * * *"  # Every 6h — matches upstream-prs (*/6 :33) cadence
+    - cron: "47 */6 * * *"
   workflow_dispatch:
     inputs:
       repo_filter:
@@ -39,12 +29,6 @@ permissions:
   pull-requests: write
   id-token: write
 
-# ── Rate limits ──────────────────────────────────────────────────────────────
-# GitHub REST API (SYNC_TOKEN): 5 000 req/hr primary limit.
-#   upstream-commits.sh retries HTTP 403/429 up to 3 times with reset-aware
-#   sleep. Runs hourly at :47 — offset from mirror-to-osp (:00) and
-#   reconcile-org-refs (:30) to spread API usage across the hour.
-
 concurrency:
   group: upstream-commits-${{ github.ref }}
   cancel-in-progress: true
@@ -59,7 +43,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
 
       - name: Quota pre-flight
         id: quota
@@ -79,6 +62,7 @@ jobs:
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
+
       - name: Upstream direct commits from OSP and OOC
         if: steps.quota.outputs.skip == 'false'
         env:
