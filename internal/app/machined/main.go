@@ -22,6 +22,7 @@ import (
 	"github.com/siderolabs/go-cmd/pkg/cmd/proc"
 	"github.com/siderolabs/go-cmd/pkg/cmd/proc/reaper"
 	debug "github.com/siderolabs/go-debug"
+	"github.com/siderolabs/go-kmsg"
 	"github.com/siderolabs/go-procfs/procfs"
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
@@ -31,11 +32,13 @@ import (
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime/emergency"
 	v1alpha1runtime "github.com/siderolabs/talos/internal/app/machined/pkg/runtime/v1alpha1"
+	"github.com/siderolabs/talos/internal/app/machined/pkg/sandboxd"
 	startuptasks "github.com/siderolabs/talos/internal/app/machined/pkg/startup"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/system"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/system/services"
 	"github.com/siderolabs/talos/internal/app/poweroff"
 	"github.com/siderolabs/talos/internal/app/trustd"
+	"github.com/siderolabs/talos/internal/pkg/containermode"
 	"github.com/siderolabs/talos/internal/pkg/mount/v3"
 	"github.com/siderolabs/talos/pkg/httpdefaults"
 	"github.com/siderolabs/talos/pkg/machinery/api/common"
@@ -331,12 +334,28 @@ func main() {
 		apid.Main()
 
 		return
+	case "sandboxd":
+		// PID 1 of the sandbox PID+mount namespace: forks the container-plane
+		// services (cri, kubelet, pods) and walls them off from machined.
+		sandboxd.Main()
+
+		return
 	case "trustd":
 		trustd.Main()
 
 		return
 	// Azure uses the hv_utils kernel module to shutdown the node in hyper-v by calling perform_shutdown which will call orderly_poweroff which will call /sbin/poweroff.
-	case "poweroff", "shutdown":
+	// Hyper-V restart requests call orderly_reboot which will call /sbin/reboot.
+	case "poweroff", "shutdown", "reboot":
+		// These are invoked by the kernel usermode helper (and machined is the static
+		// usermode helper), which has no console, so set up kmsg logging to make the
+		// invocation and its result visible in `talosctl dmesg`.
+		if !containermode.InContainer() {
+			kmsg.SetupLogger(nil, filepath.Base(os.Args[0]), nil) //nolint:errcheck // best effort logging to kmsg
+		}
+
+		log.Printf("usermode helper invoked as %q (args %v)", os.Args[0], os.Args[1:])
+
 		poweroff.Main(os.Args)
 
 		return
@@ -344,7 +363,17 @@ func main() {
 		dashboard.Main()
 
 		return
+	case "init", "machined":
+		// fall through to the main machined entrypoint
 	default:
+		// unknown name
+		if !containermode.InContainer() {
+			kmsg.SetupLogger(nil, "machined", nil) //nolint:errcheck // best effort logging to kmsg
+		}
+
+		log.Printf("unknown executable name %q (args %v)", os.Args[0], os.Args[1:])
+
+		os.Exit(1) //nolint:gocritic // we don't care about defering context cancellation in this case
 	}
 
 	// Setup panic handler.

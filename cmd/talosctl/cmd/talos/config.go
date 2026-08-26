@@ -6,7 +6,6 @@ package talos
 
 import (
 	"bytes"
-	"context"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -29,7 +28,6 @@ import (
 
 	"github.com/siderolabs/talos/cmd/talosctl/pkg/talos/helpers"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
-	"github.com/siderolabs/talos/pkg/machinery/client"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/role"
@@ -127,6 +125,44 @@ var configNodeCmd = &cobra.Command{
 	},
 }
 
+// configProxyURLCmd represents the `config proxy-url` command.
+var configProxyURLCmd = &cobra.Command{
+	Use:   "proxy-url [url]",
+	Short: "Set the proxy URL for the current context",
+	Long: `Set the proxy URL for the current context.
+
+Supported schemes: socks5, http, https.
+Use "direct" to explicitly bypass any proxy, including environment variable proxies.
+Pass an empty string to clear the proxy URL.
+Omit the argument to display the current proxy URL.`,
+	Args: cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		c, err := openConfigAndContext("")
+		if err != nil {
+			return err
+		}
+
+		ctxData, err := getContextData(c)
+		if err != nil {
+			return err
+		}
+
+		if len(args) == 0 {
+			cmd.Println(ctxData.ProxyURL)
+
+			return nil
+		}
+
+		ctxData.ProxyURL = strings.TrimSpace(args[0])
+
+		if err := c.Save(GlobalArgs.Talosconfig); err != nil {
+			return fmt.Errorf("error writing config: %w", err)
+		}
+
+		return nil
+	},
+}
+
 // configContextCmd represents the `config context` command.
 var configContextCmd = &cobra.Command{
 	Use:     "context <context>",
@@ -150,7 +186,7 @@ var configContextCmd = &cobra.Command{
 
 		return nil
 	},
-	ValidArgsFunction: CompleteConfigContext,
+	ValidArgsFunction: completeConfigContext,
 }
 
 // configAddCmdFlags represents the `config add` command flags.
@@ -280,7 +316,7 @@ var configRemoveCmd = &cobra.Command{
 
 		return nil
 	},
-	ValidArgsFunction: CompleteConfigContext,
+	ValidArgsFunction: completeConfigContext,
 }
 
 func sortInPlace(slc []string) []string {
@@ -414,42 +450,50 @@ var configNewCmd = &cobra.Command{
 
 		path := args[0]
 
-		return WithClient(cmd.Context(), func(ctx context.Context, c *client.Client) error {
-			if err := helpers.FailIfMultiNodes(ctx, "talosconfig"); err != nil {
-				return err
-			}
+		ctx := cmd.Context()
 
-			roles, unknownRoles := role.Parse(configNewCmdFlags.roles)
-			if len(unknownRoles) != 0 {
-				return fmt.Errorf("unknown roles: %s", strings.Join(unknownRoles, ", "))
-			}
+		clientFactory, err := NewClientFactory(ctx, &configNewCmdFlags)
+		if err != nil {
+			return err
+		}
 
-			if _, err := os.Stat(path); err == nil {
-				return fmt.Errorf("talosconfig file already exists: %q", path)
-			}
+		defer clientFactory.Close() //nolint:errcheck
 
-			resp, err := c.GenerateClientConfiguration(ctx, &machineapi.GenerateClientConfigurationRequest{
-				Roles:  roles.Strings(),
-				CrtTtl: durationpb.New(configNewCmdFlags.crtTTL),
-			})
-			if err != nil {
-				return err
-			}
+		ctx, c, _, err := clientFactory.BuildClientEnforceSingleNode(ctx, "config new")
+		if err != nil {
+			return err
+		}
 
-			if l := len(resp.Messages); l != 1 {
-				panic(fmt.Sprintf("expected 1 message, got %d", l))
-			}
+		roles, unknownRoles := role.Parse(configNewCmdFlags.roles)
+		if len(unknownRoles) != 0 {
+			return fmt.Errorf("unknown roles: %s", strings.Join(unknownRoles, ", "))
+		}
 
-			config, err := clientconfig.FromBytes(resp.Messages[0].Talosconfig)
-			if err != nil {
-				return err
-			}
+		if _, err := os.Stat(path); err == nil {
+			return fmt.Errorf("talosconfig file already exists: %q", path)
+		}
 
-			// make the new config immediately useful
-			config.Contexts[config.Context].Endpoints = c.GetEndpoints()
-
-			return config.Save(path)
+		resp, err := c.GenerateClientConfiguration(ctx, &machineapi.GenerateClientConfigurationRequest{
+			Roles:  roles.Strings(),
+			CrtTtl: durationpb.New(configNewCmdFlags.crtTTL),
 		})
+		if err != nil {
+			return err
+		}
+
+		if l := len(resp.Messages); l != 1 {
+			panic(fmt.Sprintf("expected 1 message, got %d", l))
+		}
+
+		config, err := clientconfig.FromBytes(resp.Messages[0].Talosconfig)
+		if err != nil {
+			return err
+		}
+
+		// make the new config immediately useful
+		config.Contexts[config.Context].Endpoints = c.GetEndpoints()
+
+		return config.Save(path)
 	},
 }
 
@@ -586,11 +630,13 @@ var configInfoCmd = &cobra.Command{
 	},
 }
 
-// CompleteConfigContext represents tab completion for `--context`
+// completeConfigContext represents tab completion for `--context`
 // argument and `config [context|remove]` command.
-func CompleteConfigContext(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
+func completeConfigContext(*cobra.Command, []string, string) ([]string, cobra.ShellCompDirective) {
 	c, err := clientconfig.Open(GlobalArgs.Talosconfig)
 	if err != nil {
+		cobra.CompError(fmt.Sprintf("error reading config: %v", err))
+
 		return nil, cobra.ShellCompDirectiveError
 	}
 
@@ -604,6 +650,7 @@ func init() {
 	configCmd.AddCommand(
 		configEndpointCmd,
 		configNodeCmd,
+		configProxyURLCmd,
 		configContextCmd,
 		configAddCmd,
 		configRemoveCmd,

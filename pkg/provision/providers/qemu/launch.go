@@ -26,6 +26,18 @@ import (
 	"github.com/siderolabs/talos/pkg/provision/providers/vm"
 )
 
+const (
+	// qemuStartAttempts bounds how many times QEMU is launched before giving up on the VM.
+	qemuStartAttempts = 5
+
+	// qemuStartBackoff is the delay before the first relaunch, doubled on every further attempt.
+	qemuStartBackoff = 500 * time.Millisecond
+
+	// qemuStartupGracePeriod separates "QEMU never came up" from "the VM ran and then died": a
+	// process which exits with an error this soon after being started never got to run the VM.
+	qemuStartupGracePeriod = 5 * time.Second
+)
+
 // LaunchConfig is passed in to the Launch function over stdin.
 type LaunchConfig struct {
 	StatePath string
@@ -46,6 +58,7 @@ type LaunchConfig struct {
 	UKIPath                   string
 	ExtraISOPath              string
 	PFlashImages              []string
+	PFlashSpec                []PFlash
 	KernelArgs                string
 	SDStubKernelArgs          string
 	MonitorPath               string
@@ -69,6 +82,9 @@ type LaunchConfig struct {
 	// API
 	APIBindAddress *net.TCPAddr
 
+	// ExtraQEMUArgs is appended verbatim to the QEMU command line.
+	ExtraQEMUArgs []string
+
 	// sd-stub
 	sdStubExtraCmdline       string
 	sdStubExtraCmdlineConfig string
@@ -78,11 +94,30 @@ type LaunchConfig struct {
 
 	VMMac string
 
+	// FabricUplinks describes additional L2-only BGP test NICs backed by a CNI bridge in the root
+	// namespace and tc-redirect-tap in the node namespace.
+	FabricUplinks []FabricUplink
+
+	// CLOSNoNet0 means this node has no management net0 (no CNI bridge) — only the fabric uplinks. The
+	// netns is still created; the net0 netdev, net0 CNI, and IPAM dump are skipped.
+	CLOSNoNet0 bool
+
 	// signals
 	c chan os.Signal
 
 	// controller
 	controller *Controller
+}
+
+// FabricUplink is an additional L2-only BGP test NIC connected via tc-redirect-tap to the node netns.
+type FabricUplink struct {
+	BridgeName  string // host bridge name (root ns); the host fabric peer is reachable here
+	CNIConfList string // CNI conflist (bridge + tc-redirect-tap), with no IPAM
+	IfName      string // CNI runtimeConf IfName, unique within the node netns
+
+	// filled by withNetworkContext at launch time
+	mac     string
+	tapName string
 }
 
 type networkConfigBase struct {
@@ -123,8 +158,6 @@ func launchVM(config *LaunchConfig) error {
 		"-smp", fmt.Sprintf("cpus=%d", config.VCPUCount),
 		"-cpu", cpuArg,
 		"-nographic",
-		"-netdev", getNetdevParams(config.Network, "net0"),
-		"-device", fmt.Sprintf("virtio-net-pci,netdev=net0,mac=%s,host_mtu=%d", config.VMMac, config.Network.MTU),
 		// TODO: uncomment the following line to get another eth interface not connected to anything
 		// "-nic", "tap,model=e1000,script=no,downscript=no",
 		"-device", "virtio-rng-pci",
@@ -140,10 +173,37 @@ func launchVM(config *LaunchConfig) error {
 		"-watchdog-action", "pause",
 	}
 
+	// management net0 (skipped for authentic full-CLOS nodes, which have only fabric uplinks).
+	if !config.CLOSNoNet0 {
+		args = append(args,
+			"-netdev", getNetdevParams(config.Network, "net0"),
+			"-device", fmt.Sprintf("virtio-net-pci,netdev=net0,mac=%s,host_mtu=%d", config.VMMac, config.Network.MTU),
+		)
+	}
+
+	// dedicated BGP fabric uplinks: each is a NIC on its own per-uplink CNI bridge. tapName is filled by
+	// withNetworkContext (Linux); on platforms without fabric provisioning it stays empty and the uplink
+	// is skipped.
+	for i, link := range config.FabricUplinks {
+		if link.tapName == "" {
+			continue
+		}
+
+		args = append(args,
+			"-netdev", fmt.Sprintf("tap,id=fabric%d,ifname=%s,script=no,downscript=no", i, link.tapName),
+			"-device", fabricDevice(config, i, link),
+		)
+	}
+
 	var (
 		scsiAttached, ahciAttached, nvmeAttached, megaraidAttached, virtiofsAttached bool
 		ahciBus                                                                      int
 	)
+
+	blockDeviceIOOptions := "aio=threads,cache=none"
+	if runtime.GOOS == "linux" {
+		blockDeviceIOOptions = "aio=native,cache=none"
+	}
 
 	for i, disk := range config.DiskPaths {
 		driver := config.DiskDrivers[i]
@@ -192,7 +252,7 @@ func launchVM(config *LaunchConfig) error {
 
 			args = append(
 				args,
-				"-drive", fmt.Sprintf("id=scsi%d,format=raw,if=none,file=%s,discard=unmap,aio=native,cache=none", i, disk),
+				"-drive", fmt.Sprintf("id=scsi%d,format=raw,if=none,file=%s,discard=unmap,%s", i, disk, blockDeviceIOOptions),
 				"-device", fmt.Sprintf("scsi-hd,drive=scsi%d,bus=scsi0.0,logical_block_size=%d,physical_block_size=%d", i, blockSize, blockSize),
 			)
 
@@ -208,7 +268,7 @@ func launchVM(config *LaunchConfig) error {
 
 			args = append(
 				args,
-				"-drive", fmt.Sprintf("id=nvme%d,format=raw,if=none,file=%s,discard=unmap,aio=native,cache=none", i, disk),
+				"-drive", fmt.Sprintf("id=nvme%d,format=raw,if=none,file=%s,discard=unmap,%s", i, disk, blockDeviceIOOptions),
 				"-device", fmt.Sprintf("nvme-ns,drive=nvme%d,logical_block_size=%d,physical_block_size=%d", i, blockSize, blockSize),
 			)
 
@@ -222,7 +282,7 @@ func launchVM(config *LaunchConfig) error {
 
 			args = append(
 				args,
-				"-drive", fmt.Sprintf("id=scsi%d,format=raw,if=none,file=%s,discard=unmap,aio=native,cache=none", i, disk),
+				"-drive", fmt.Sprintf("id=scsi%d,format=raw,if=none,file=%s,discard=unmap,%s", i, disk, blockDeviceIOOptions),
 				"-device", fmt.Sprintf("scsi-hd,drive=scsi%d,bus=scsi1.0,channel=0,scsi-id=%d,lun=0,logical_block_size=%d,physical_block_size=%d", i, i, blockSize, blockSize),
 			)
 
@@ -276,6 +336,24 @@ func launchVM(config *LaunchConfig) error {
 		return err
 	}
 
+	if !diskBootable && config.TPMConfig.NodeName == "" {
+		// When the guest disk has been wiped externally we will re-attach
+		// boot media (ISO/USB/UKI/kernel) below - but UEFI keeps the
+		// previous Talos install's Boot#### entries in the variable store
+		// (flash1.img), and they point at the now-erased ESP. Without a
+		// reset, UEFI tries those entries first, fails, and never falls
+		// through to the freshly-attached boot media. Convention: pflash
+		// index 1 is the variable store, index 0 is the firmware code.
+		//
+		// Skip wiping if TPM is enabled - vars contain SecureBoot state,
+		// so we can't wipe them without losing SecureBoot state.
+		if len(config.PFlashSpec) >= 2 && len(config.PFlashImages) >= 2 {
+			if err := writePFlashImage(config.PFlashImages[1], config.PFlashSpec[1]); err != nil {
+				return fmt.Errorf("reset UEFI variable store: %w", err)
+			}
+		}
+	}
+
 	if config.TPMConfig.NodeName != "" {
 		tpm2SocketPath := filepath.Join(config.TPMConfig.StateDir, "swtpm.sock")
 
@@ -324,6 +402,12 @@ func launchVM(config *LaunchConfig) error {
 		)
 	}
 
+	// sdStubExtraCmdline is computed per-launch: the base value lives on the
+	// shared *LaunchConfig, but the per-boot config URL must NOT be appended
+	// back onto it, otherwise every relaunch (the for{} loop around launchVM)
+	// accumulates another " talos.config=..." into the persistent field.
+	sdStubExtraCmdline := config.sdStubExtraCmdline
+
 	if !diskBootable || !config.BootloaderEnabled {
 		// if the disk is bootable, and we were forced to disable disk bootloader,
 		// we need to skip ISO/USB boot, as it will fall back to boot from disk
@@ -349,7 +433,6 @@ func launchVM(config *LaunchConfig) error {
 				"-kernel", config.UKIPath,
 				"-append", config.KernelArgs,
 			)
-			config.sdStubExtraCmdline += config.sdStubExtraCmdlineConfig
 		case config.KernelImagePath != "":
 			args = append(
 				args,
@@ -357,14 +440,22 @@ func launchVM(config *LaunchConfig) error {
 				"-initrd", config.InitrdPath,
 				"-append", config.KernelArgs,
 			)
-			config.sdStubExtraCmdline += config.sdStubExtraCmdlineConfig
 		}
+	}
+
+	if (config.UKIPath != "" || config.KernelImagePath != "") && config.USBPath == "" && config.ISOPath == "" {
+		// inject talos.config= into the boot, even if the disk is bootable,
+		// as the tests might wipe just STATE partition relying on Talos being able to
+		// re-download the config on boot
+		//
+		// but, don't activate this on USB/ISO boot options
+		sdStubExtraCmdline += config.sdStubExtraCmdlineConfig
 	}
 
 	if !config.SkipInjectingExtraCmdline {
 		args = append(
 			args,
-			"-smbios", fmt.Sprintf("type=11,value=%s=%s", constants.SDStubCmdlineExtraOEMVar, config.sdStubExtraCmdline),
+			"-smbios", fmt.Sprintf("type=11,value=%s=%s", constants.SDStubCmdlineExtraOEMVar, sdStubExtraCmdline),
 		)
 	}
 
@@ -376,6 +467,49 @@ func launchVM(config *LaunchConfig) error {
 		)
 	}
 
+	// Extra caller-supplied QEMU arguments (e.g. an emulated BMC device set),
+	// appended last so they can reference devices declared above.
+	args = append(args, config.ExtraQEMUArgs...)
+
+	// QEMU runs with `-no-reboot`, so every reboot of the VM is a relaunch, and a relaunch can lose
+	// a race against the host services backing the VM's devices. The known case is virtiofsd: it
+	// exits whenever its vhost-user client disconnects and its supervisor restarts it, so for a
+	// moment after the VM goes down its socket is stale and QEMU gives up with
+	// `Failed to connect to '...': Connection refused` instead of retrying the chardev itself.
+	// Without a retry here the node stays down for the rest of the cluster's lifetime.
+	var launchErr error
+
+	for attempt := range qemuStartAttempts {
+		launchErr = runQemu(config, args)
+
+		if !errors.Is(launchErr, errQemuStartFailed) || attempt == qemuStartAttempts-1 {
+			break
+		}
+
+		backoff := qemuStartBackoff << attempt
+
+		fmt.Fprintf(os.Stderr, "%s, retrying in %s (attempt %d of %d)\n", launchErr, backoff, attempt+1, qemuStartAttempts)
+
+		select {
+		case <-time.After(backoff):
+		case sig := <-config.c:
+			fmt.Fprintf(os.Stderr, "exiting VM as signal %s was received\n", sig)
+
+			return errors.New("process stopped")
+		}
+	}
+
+	return launchErr
+}
+
+// errQemuStartFailed marks a QEMU process which never got past its own startup, as opposed to a VM
+// which ran for a while and then died: only the former is worth relaunching.
+var errQemuStartFailed = errors.New("QEMU failed to start")
+
+// runQemu starts QEMU with the given args and supervises it until the VM exits or is stopped.
+//
+//nolint:gocyclo
+func runQemu(config *LaunchConfig, args []string) error {
 	fmt.Fprintf(os.Stderr, "starting %s with args:\n%s\n", config.ArchitectureData.QemuExecutable(), strings.Join(args, " "))
 	cmd := exec.Command( //nolint:noctx // runs in background
 		config.ArchitectureData.QemuExecutable(),
@@ -386,8 +520,10 @@ func launchVM(config *LaunchConfig) error {
 	cmd.Stderr = os.Stderr
 
 	if err := startQemuCmd(config, cmd); err != nil {
-		return err
+		return fmt.Errorf("%w: %w", errQemuStartFailed, err)
 	}
+
+	startedAt := time.Now()
 
 	done := make(chan error)
 
@@ -409,6 +545,10 @@ func launchVM(config *LaunchConfig) error {
 			return errors.New("process stopped")
 		case err := <-done:
 			if err != nil {
+				if time.Since(startedAt) < qemuStartupGracePeriod {
+					return fmt.Errorf("%w: %w", errQemuStartFailed, err)
+				}
+
 				return fmt.Errorf("process exited with error %s", err)
 			}
 
@@ -447,6 +587,24 @@ func launchVM(config *LaunchConfig) error {
 			}
 		}
 	}
+}
+
+func fabricDevice(config *LaunchConfig, index int, link FabricUplink) string {
+	// With net0 present (Phase 1), e1000 avoids colliding with the net0 alias selector
+	// (link.driver == "virtio_net"). A full-CLOS node has no net0, so the fabric NICs are virtio.
+	if !config.CLOSNoNet0 {
+		return fmt.Sprintf("e1000,netdev=fabric%d,mac=%s", index, link.mac)
+	}
+
+	// Pin to a known PCI slot so the guest kernel interface name is deterministic. Advertise the host
+	// fabric MTU as well; otherwise virtio defaults to 1500 even when the CNI bridge uses a lower MTU.
+	return fmt.Sprintf(
+		"virtio-net-pci,netdev=fabric%d,mac=%s,addr=0x%x,host_mtu=%d",
+		index,
+		link.mac,
+		vm.CLOSFabricPCIBase+index,
+		config.Network.MTU,
+	)
 }
 
 func sendMonitorCommand(monitorPath, command string) error {
@@ -511,9 +669,11 @@ func Launch() error {
 	}
 
 	return withNetworkContext(ctx, &config, func(config *LaunchConfig) error {
-		err = dumpIpam(*config)
-		if err != nil {
-			return err
+		// full-CLOS nodes have no net0 and no DHCP, so there are no IPAM records to dump.
+		if !config.CLOSNoNet0 {
+			if err = dumpIpam(*config); err != nil {
+				return err
+			}
 		}
 
 		for {

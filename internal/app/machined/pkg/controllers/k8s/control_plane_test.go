@@ -5,6 +5,7 @@
 package k8s_test
 
 import (
+	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
 	k8sctrl "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/k8s"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
+	k8scfg "github.com/siderolabs/talos/pkg/machinery/config/types/k8s"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
@@ -49,23 +51,32 @@ func (suite *K8sControlPlaneSuite) TestReconcileDefaults() {
 	u, err := url.Parse("https://foo:6443")
 	suite.Require().NoError(err)
 
-	cfg := config.NewMachineConfig(
-		container.NewV1Alpha1(
-			&v1alpha1.Config{
-				ConfigVersion: "v1alpha1",
-				MachineConfig: &v1alpha1.MachineConfig{
-					MachineType: "controlplane",
-				},
-				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
-						Endpoint: &v1alpha1.Endpoint{
-							URL: u,
-						},
-					},
+	v1alpha1Cfg := &v1alpha1.Config{
+		ConfigVersion: "v1alpha1",
+		MachineConfig: &v1alpha1.MachineConfig{
+			MachineType: "controlplane",
+		},
+		ClusterConfig: &v1alpha1.ClusterConfig{
+			ControlPlane: &v1alpha1.ControlPlaneConfig{
+				Endpoint: &v1alpha1.Endpoint{
+					URL: u,
 				},
 			},
-		),
-	)
+		},
+	}
+
+	cn := k8scfg.NewKubeNetworkConfigV1Alpha1()
+	cn.NetworkPodSubnets = []meta.Prefix{
+		{Prefix: netip.MustParsePrefix(constants.DefaultIPv4PodCIDR)},
+	}
+	cn.NetworkServiceSubnets = []meta.Prefix{
+		{Prefix: netip.MustParsePrefix(constants.DefaultIPv4ServiceCIDR)},
+	}
+
+	ctr, err := container.New(v1alpha1Cfg, cn)
+	suite.Require().NoError(err)
+
+	cfg := config.NewMachineConfig(ctr)
 
 	suite.setupMachine(cfg)
 
@@ -101,41 +112,6 @@ func (suite *K8sControlPlaneSuite) TestReconcileDefaults() {
 	)
 }
 
-func (suite *K8sControlPlaneSuite) TestReconcileEmptyAuthorizationConfigForK8sLessThanv128() {
-	u, err := url.Parse("https://foo:6443")
-	suite.Require().NoError(err)
-
-	cfg := config.NewMachineConfig(
-		container.NewV1Alpha1(
-			&v1alpha1.Config{
-				ConfigVersion: "v1alpha1",
-				MachineConfig: &v1alpha1.MachineConfig{
-					MachineType: "controlplane",
-				},
-				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
-						Endpoint: &v1alpha1.Endpoint{
-							URL: u,
-						},
-					},
-					APIServerConfig: &v1alpha1.APIServerConfig{
-						ContainerImage:            "k8s.gcr.io/kube-apiserver:v1.28.0",
-						AuthorizationConfigConfig: []*v1alpha1.AuthorizationConfigAuthorizerConfig{},
-					},
-				},
-			},
-		),
-	)
-
-	suite.setupMachine(cfg)
-
-	rtestutils.AssertResource[*k8s.AuthorizationConfig](suite.Ctx(), suite.T(), suite.State(), k8s.AuthorizationConfigID, func(authorizationConfig *k8s.AuthorizationConfig, assert *assert.Assertions) {
-		assert.Equal(&k8s.AuthorizationConfigSpec{
-			Image: "k8s.gcr.io/kube-apiserver:v1.28.0",
-		}, authorizationConfig.TypedSpec())
-	})
-}
-
 func (suite *K8sControlPlaneSuite) TestReconcileEmptyAuthorizationConfigAuthorizers() {
 	u, err := url.Parse("https://foo:6443")
 	suite.Require().NoError(err)
@@ -148,6 +124,7 @@ func (suite *K8sControlPlaneSuite) TestReconcileEmptyAuthorizationConfigAuthoriz
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{},
 					ControlPlane: &v1alpha1.ControlPlaneConfig{
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
@@ -183,6 +160,7 @@ func (suite *K8sControlPlaneSuite) TestReconcileAdditionalAuthorizationConfigAut
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{},
 					ControlPlane: &v1alpha1.ControlPlaneConfig{
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
@@ -250,6 +228,7 @@ func (suite *K8sControlPlaneSuite) TestReconcileAdditionalAuthorizationConfigAut
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{},
 					ControlPlane: &v1alpha1.ControlPlaneConfig{
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
@@ -333,6 +312,7 @@ func (suite *K8sControlPlaneSuite) TestReconcileAdditionalAuthorizationConfigAut
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{},
 					ControlPlane: &v1alpha1.ControlPlaneConfig{
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
@@ -412,6 +392,7 @@ func (suite *K8sControlPlaneSuite) TestReconcileTransitionWorker() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{},
 					ControlPlane: &v1alpha1.ControlPlaneConfig{
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
@@ -455,8 +436,8 @@ func (suite *K8sControlPlaneSuite) TestReconcileIPv6() {
 						},
 					},
 					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{
-						PodSubnet:     []string{constants.DefaultIPv6PodNet},
-						ServiceSubnet: []string{constants.DefaultIPv6ServiceNet},
+						PodSubnet:     []string{constants.DefaultIPv6PodCIDR},
+						ServiceSubnet: []string{constants.DefaultIPv6ServiceCIDR},
 					},
 				},
 			},
@@ -492,8 +473,8 @@ func (suite *K8sControlPlaneSuite) TestReconcileDualStack() {
 						},
 					},
 					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{
-						PodSubnet:     []string{constants.DefaultIPv4PodNet, constants.DefaultIPv6PodNet},
-						ServiceSubnet: []string{constants.DefaultIPv4ServiceNet, constants.DefaultIPv6ServiceNet},
+						PodSubnet:     []string{constants.DefaultIPv4PodCIDR, constants.DefaultIPv6PodCIDR},
+						ServiceSubnet: []string{constants.DefaultIPv4ServiceCIDR, constants.DefaultIPv6ServiceCIDR},
 					},
 				},
 			},
@@ -523,6 +504,7 @@ func (suite *K8sControlPlaneSuite) TestReconcileExtraVolumes() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{},
 					ControlPlane: &v1alpha1.ControlPlaneConfig{
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
@@ -584,6 +566,7 @@ func (suite *K8sControlPlaneSuite) TestReconcileEnvironment() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{},
 					ControlPlane: &v1alpha1.ControlPlaneConfig{
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
@@ -627,6 +610,7 @@ func (suite *K8sControlPlaneSuite) TestReconcileResources() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{},
 					ControlPlane: &v1alpha1.ControlPlaneConfig{
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
@@ -648,7 +632,7 @@ func (suite *K8sControlPlaneSuite) TestReconcileResources() {
 							},
 						},
 					},
-					ControllerManagerConfig: &v1alpha1.ControllerManagerConfig{
+					ControllerManagerConfig: &v1alpha1.ControllerManagerConfig{ //nolint:staticcheck // legacy config
 						ResourcesConfig: &v1alpha1.ResourcesConfig{
 							Requests: meta.Unstructured{
 								Object: map[string]any{
@@ -664,7 +648,7 @@ func (suite *K8sControlPlaneSuite) TestReconcileResources() {
 							},
 						},
 					},
-					SchedulerConfig: &v1alpha1.SchedulerConfig{
+					SchedulerConfig: &v1alpha1.SchedulerConfig{ //nolint:staticcheck // legacy config
 						ResourcesConfig: &v1alpha1.ResourcesConfig{
 							Requests: meta.Unstructured{
 								Object: map[string]any{
@@ -760,6 +744,7 @@ func (suite *K8sControlPlaneSuite) TestReconcileExternalCloudProvider() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{},
 					ControlPlane: &v1alpha1.ControlPlaneConfig{
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
@@ -830,12 +815,13 @@ func (suite *K8sControlPlaneSuite) TestReconcileInlineManifests() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{},
 					ControlPlane: &v1alpha1.ControlPlaneConfig{
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
 					},
-					ClusterInlineManifests: v1alpha1.ClusterInlineManifests{
+					ClusterInlineManifests: v1alpha1.ClusterInlineManifests{ //nolint:staticcheck // legacy config
 						{
 							InlineManifestName: "namespace-ci",
 							InlineManifestContents: strings.TrimSpace(
@@ -886,6 +872,7 @@ func (suite *K8sControlPlaneSuite) TestReconcileKubeProxyMode() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{},
 					ControlPlane: &v1alpha1.ControlPlaneConfig{
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
@@ -909,39 +896,57 @@ func (suite *K8sControlPlaneSuite) TestReconcileKubeProxyMode() {
 	)
 }
 
-func (suite *K8sControlPlaneSuite) TestReconcileKubeProxyModeLegacy() {
+// TestReconcileKubeProxyDisabled verifies that a KubeProxyConfig document with kube-proxy disabled
+// (and, as validation allows in that case, no image set) is handled without a panic.
+func (suite *K8sControlPlaneSuite) TestReconcileKubeProxyDisabled() {
 	u, err := url.Parse("https://foo:6443")
 	suite.Require().NoError(err)
 
-	cfg := config.NewMachineConfig(
-		container.NewV1Alpha1(
-			&v1alpha1.Config{
-				ConfigVersion: "v1alpha1",
-				MachineConfig: &v1alpha1.MachineConfig{
-					MachineType: "controlplane",
-				},
-				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
-						Endpoint: &v1alpha1.Endpoint{
-							URL: u,
-						},
-					},
-					ProxyConfig: &v1alpha1.ProxyConfig{
-						ContainerImage: constants.KubeProxyImage + ":v1.30.0",
-					},
-				},
-			},
-		),
-	)
+	clusterCfg := k8scfg.NewKubeClusterConfigV1Alpha1()
+	clusterCfg.ClusterNameConfig = "test"
+	clusterCfg.ClusterEndpointConfig = meta.URL{URL: u}
 
-	suite.setupMachine(cfg)
+	networkCfg := k8scfg.NewKubeNetworkConfigV1Alpha1()
+	networkCfg.NetworkPodSubnets = []meta.Prefix{
+		{Prefix: netip.MustParsePrefix(constants.DefaultIPv4PodCIDR)},
+	}
+	networkCfg.NetworkServiceSubnets = []meta.Prefix{
+		{Prefix: netip.MustParsePrefix(constants.DefaultIPv4ServiceCIDR)},
+	}
+
+	// kube-proxy is disabled, so no image is set: this is a valid config,
+	// see TestKubeProxyConfigValidate/disabled
+	proxyCfg := k8scfg.NewKubeProxyConfigV1Alpha1()
+	proxyCfg.ProxyEnabled = new(false)
+
+	ctr, err := container.New(
+		&v1alpha1.Config{
+			ConfigVersion: "v1alpha1",
+			MachineConfig: &v1alpha1.MachineConfig{
+				MachineType: "controlplane",
+			},
+			ClusterConfig: &v1alpha1.ClusterConfig{},
+		},
+		clusterCfg,
+		networkCfg,
+		proxyCfg,
+		k8scfg.NewKubeFlannelCNIConfigV1Alpha1(),
+	)
+	suite.Require().NoError(err)
+
+	suite.setupMachine(config.NewMachineConfig(ctr))
 
 	rtestutils.AssertResources(
 		suite.Ctx(), suite.T(), suite.State(), []resource.ID{k8s.BootstrapManifestsConfigID},
 		func(cfg *k8s.BootstrapManifestsConfig, assert *assert.Assertions) {
-			assert.Contains(
-				cfg.TypedSpec().ProxyArgs,
-				"--proxy-mode=iptables",
+			assert.False(cfg.TypedSpec().ProxyEnabled)
+			assert.Empty(cfg.TypedSpec().ProxyImage)
+
+			// non-configurable images are always rendered
+			assert.Equal("ghcr.io/siderolabs/flannel:"+constants.FlannelVersion, cfg.TypedSpec().FlannelImage)
+			assert.Equal(
+				"registry.k8s.io/networking/kube-network-policies:"+constants.KubeNetworkPoliciesVersion,
+				cfg.TypedSpec().FlannelKubeNetworkPoliciesImage,
 			)
 		},
 	)

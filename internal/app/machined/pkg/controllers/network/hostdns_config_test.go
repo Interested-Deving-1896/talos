@@ -31,6 +31,39 @@ type HostDNSConfigSuite struct {
 
 func (suite *HostDNSConfigSuite) TestNoConfig() {
 	ctest.AssertResource(suite, network.HostDNSConfigID, func(r *network.HostDNSConfig, asrt *assert.Assertions) {
+		asrt.True(r.TypedSpec().Enabled)
+		asrt.Equal(
+			[]netip.AddrPort{netip.MustParseAddrPort("127.0.0.53:53")},
+			r.TypedSpec().ListenAddresses,
+		)
+		asrt.Equal(netip.Addr{}, r.TypedSpec().ServiceHostDNSAddress)
+		asrt.False(r.TypedSpec().ResolveMemberNames)
+	})
+}
+
+func (suite *HostDNSConfigSuite) TestConfigDisabled() {
+	ctest.AssertResource(suite, network.HostDNSConfigID, func(r *network.HostDNSConfig, asrt *assert.Assertions) {
+		asrt.True(r.TypedSpec().Enabled)
+	})
+
+	cfg := config.NewMachineConfig(
+		container.NewV1Alpha1(
+			&v1alpha1.Config{
+				ConfigVersion: "v1alpha1",
+				MachineConfig: &v1alpha1.MachineConfig{
+					MachineFeatures: &v1alpha1.FeaturesConfig{
+						HostDNSSupport: &v1alpha1.HostDNSConfig{ //nolint:staticcheck // testing legacy config
+							HostDNSConfigEnabled: new(false),
+						},
+					},
+				},
+			},
+		),
+	)
+
+	suite.Create(cfg)
+
+	ctest.AssertResource(suite, network.HostDNSConfigID, func(r *network.HostDNSConfig, asrt *assert.Assertions) {
 		asrt.False(r.TypedSpec().Enabled)
 		asrt.Equal(
 			[]netip.AddrPort{netip.MustParseAddrPort("127.0.0.53:53")},
@@ -62,7 +95,7 @@ func (suite *HostDNSConfigSuite) TestLegacyConfigEnabled() {
 						Endpoint: &v1alpha1.Endpoint{URL: u},
 					},
 					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{
-						PodSubnet: []string{constants.DefaultIPv4PodNet},
+						PodSubnet: []string{constants.DefaultIPv4PodCIDR},
 					},
 				},
 			},
@@ -109,7 +142,7 @@ func (suite *HostDNSConfigSuite) TestLegacyConfigForwardKubeDNSIPv4() {
 						Endpoint: &v1alpha1.Endpoint{URL: u},
 					},
 					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{
-						PodSubnet: []string{constants.DefaultIPv4PodNet, constants.DefaultIPv6PodNet},
+						PodSubnet: []string{constants.DefaultIPv4PodCIDR, constants.DefaultIPv6PodCIDR},
 					},
 				},
 			},
@@ -184,7 +217,7 @@ func (suite *HostDNSConfigSuite) TestLegacyConfigForwardKubeDNSIPv6Only() {
 						Endpoint: &v1alpha1.Endpoint{URL: u},
 					},
 					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{
-						PodSubnet: []string{constants.DefaultIPv6PodNet},
+						PodSubnet: []string{constants.DefaultIPv6PodCIDR},
 					},
 				},
 			},
@@ -226,7 +259,7 @@ func (suite *HostDNSConfigSuite) TestResolverConfigDocument() {
 		MachineConfig: &v1alpha1.MachineConfig{},
 		ClusterConfig: &v1alpha1.ClusterConfig{
 			ClusterNetwork: &v1alpha1.ClusterNetworkConfig{
-				PodSubnet: []string{constants.DefaultIPv4PodNet},
+				PodSubnet: []string{constants.DefaultIPv4PodCIDR},
 			},
 		},
 	}

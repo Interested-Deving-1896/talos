@@ -18,6 +18,7 @@ import (
 	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
 	netctrl "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/network"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
 	networkcfg "github.com/siderolabs/talos/pkg/machinery/config/types/network"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
@@ -222,10 +223,10 @@ func (suite *ResolverConfigSuite) TestMachineConfigurationNewStyle() {
 	rc := networkcfg.NewResolverConfigV1Alpha1()
 	rc.ResolverNameservers = []networkcfg.NameserverConfig{
 		{
-			Address: networkcfg.Addr{Addr: netip.MustParseAddr("2.2.2.2")},
+			Address: meta.Addr{Addr: netip.MustParseAddr("2.2.2.2")},
 		},
 		{
-			Address: networkcfg.Addr{Addr: netip.MustParseAddr("3.3.3.3")},
+			Address: meta.Addr{Addr: netip.MustParseAddr("3.3.3.3")},
 		},
 	}
 	rc.ResolverSearchDomains = networkcfg.SearchDomainsConfig{
@@ -263,18 +264,46 @@ func (suite *ResolverConfigSuite) TestMachineConfigurationNewStyle() {
 	ctest.AssertNoResource[*network.ResolverSpec](suite, "configuration/resolvers", rtestutils.WithNamespace(network.ConfigNamespaceName))
 }
 
+func (suite *ResolverConfigSuite) TestMachineConfigurationEmptySearchDomains() {
+	suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.ResolverConfigController{}))
+
+	rc := networkcfg.NewResolverConfigV1Alpha1()
+	// explicit empty search domains (domains: []): no nameservers, override to clear
+	rc.ResolverSearchDomains = networkcfg.SearchDomainsConfig{
+		SearchDomains: []string{},
+	}
+
+	ctr, err := container.New(rc)
+	suite.Require().NoError(err)
+
+	cfg := config.NewMachineConfig(ctr)
+	suite.Create(cfg)
+
+	ctest.AssertResources(
+		suite,
+		[]string{
+			"configuration/resolvers",
+		}, func(r *network.ResolverSpec, asrt *assert.Assertions) {
+			asrt.True(r.TypedSpec().SearchDomainsOverridden)
+			asrt.Empty(r.TypedSpec().NameServers)
+			asrt.Empty(r.TypedSpec().SearchDomains)
+		},
+		rtestutils.WithNamespace(network.ConfigNamespaceName),
+	)
+}
+
 func (suite *ResolverConfigSuite) TestMachineConfigurationDNSOverTLS() {
 	suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.ResolverConfigController{}))
 
 	rc := networkcfg.NewResolverConfigV1Alpha1()
 	rc.ResolverNameservers = []networkcfg.NameserverConfig{
 		{
-			Address:       networkcfg.Addr{Addr: netip.MustParseAddr("9.9.9.9")},
+			Address:       meta.Addr{Addr: netip.MustParseAddr("9.9.9.9")},
 			Protocol:      nethelpers.DNSProtocolDNSOverTLS,
 			TLSServerName: "dns.quad9.net",
 		},
 		{
-			Address: networkcfg.Addr{Addr: netip.MustParseAddr("8.8.8.8")},
+			Address: meta.Addr{Addr: netip.MustParseAddr("8.8.8.8")},
 		},
 	}
 

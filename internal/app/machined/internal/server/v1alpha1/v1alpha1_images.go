@@ -30,6 +30,8 @@ func containerdNamespaceHelper(ctx context.Context, ns common.ContainerdNamespac
 		namespaceName = constants.K8sContainerdNamespace
 	case common.ContainerdNamespace_NS_SYSTEM:
 		namespaceName = constants.SystemContainerdNamespace
+	case common.ContainerdNamespace_NS_TALOSCONTAINERS:
+		namespaceName = constants.TalosContainersContainerdNamespace
 	case common.ContainerdNamespace_NS_UNKNOWN:
 		fallthrough
 	default:
@@ -102,7 +104,6 @@ func (s *Server) ImagePull(ctx context.Context, req *machine.ImagePullRequest) (
 		s.Controller.Runtime().State().V1Alpha2().Resources(),
 		client, req.Reference,
 		image.WithSkipIfAlreadyPulled(),
-		image.WithMaxNotFoundRetries(0), // return an error immediately if the image is not found
 	)
 	if err != nil {
 		if errdefs.IsNotFound(err) {

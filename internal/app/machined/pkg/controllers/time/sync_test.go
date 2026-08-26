@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cosi-project/runtime/pkg/resource"
+	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"go.uber.org/zap"
@@ -18,6 +20,7 @@ import (
 	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
 	timectrl "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/time"
 	v1alpha1runtime "github.com/siderolabs/talos/internal/app/machined/pkg/runtime"
+	"github.com/siderolabs/talos/internal/pkg/ntp"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
@@ -38,6 +41,19 @@ func (suite *SyncSuite) assertTimeStatus(spec timeresource.StatusSpec) {
 	ctest.AssertResource(suite, timeresource.StatusID, func(r *timeresource.Status, asrt *assert.Assertions) {
 		asrt.Equal(spec, *r.TypedSpec())
 	})
+}
+
+func (suite *SyncSuite) assertNTPStatus(spec timeresource.NTPStatusSpec) {
+	ctest.AssertResource(suite, timeresource.NTPStatusID, func(r *timeresource.NTPStatus, asrt *assert.Assertions) {
+		asrt.Equal(spec, *r.TypedSpec())
+	})
+}
+
+func (suite *SyncSuite) timeStatusVersion() resource.Version {
+	status, err := safe.StateGetByID[*timeresource.Status](suite.Ctx(), suite.State(), timeresource.StatusID)
+	suite.Require().NoError(err)
+
+	return status.Metadata().Version()
 }
 
 func (suite *SyncSuite) registerSyncController(mode v1alpha1runtime.Mode) {
@@ -186,6 +202,34 @@ func (suite *SyncSuite) TestReconcileSyncChangeConfig() {
 		SyncDisabled: false,
 	})
 
+	// spike filter state is reported via NTPStatus, and it should never touch TimeStatus:
+	// TimeStatus is an input of the certificate generating controllers, so any version bump
+	// there rotates the control plane certificates (see issue 14062).
+	versionBeforeSpike := suite.timeStatusVersion()
+
+	mockSyncer.reportSpikeStatus(ntp.SpikeStatus{Detected: true, Consecutive: 3})
+
+	suite.assertNTPStatus(timeresource.NTPStatusSpec{
+		SpikeDetected:     true,
+		ConsecutiveSpikes: 3,
+	})
+
+	mockSyncer.reportSpikeStatus(ntp.SpikeStatus{})
+
+	suite.assertNTPStatus(timeresource.NTPStatusSpec{})
+
+	// bump the epoch to get a synchronization point: TimeStatus is guaranteed to be updated,
+	// so exactly one new version means the spike transitions above produced none of their own
+	mockSyncer.epochCh <- struct{}{}
+
+	suite.assertTimeStatus(timeresource.StatusSpec{
+		Synced:       true,
+		Epoch:        2,
+		SyncDisabled: false,
+	})
+
+	suite.Assert().Equal(versionBeforeSpike.Next(), suite.timeStatusVersion(), "TimeStatus should not be updated by spike filter transitions")
+
 	ctest.UpdateWithConflicts(suite, cfg, func(r *config.MachineConfig) error {
 		r.Container().RawV1Alpha1().MachineConfig.MachineTime = &v1alpha1.TimeConfig{ //nolint:staticcheck
 			TimeDisabled: new(true),
@@ -196,7 +240,7 @@ func (suite *SyncSuite) TestReconcileSyncChangeConfig() {
 
 	suite.assertTimeStatus(timeresource.StatusSpec{
 		Synced:       true,
-		Epoch:        1,
+		Epoch:        2,
 		SyncDisabled: true,
 	})
 }
@@ -314,6 +358,8 @@ type mockSyncer struct {
 	useNTS      bool
 	syncedCh    chan struct{}
 	epochCh     chan struct{}
+	spikeCh     chan struct{}
+	spikeStatus ntp.SpikeStatus
 }
 
 func (mock *mockSyncer) Run(ctx context.Context) {
@@ -326,6 +372,25 @@ func (mock *mockSyncer) Synced() <-chan struct{} {
 
 func (mock *mockSyncer) EpochChange() <-chan struct{} {
 	return mock.epochCh
+}
+
+func (mock *mockSyncer) SpikeStatusChange() <-chan struct{} {
+	return mock.spikeCh
+}
+
+func (mock *mockSyncer) SpikeStatus() ntp.SpikeStatus {
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+
+	return mock.spikeStatus
+}
+
+func (mock *mockSyncer) reportSpikeStatus(status ntp.SpikeStatus) {
+	mock.mu.Lock()
+	mock.spikeStatus = status
+	mock.mu.Unlock()
+
+	mock.spikeCh <- struct{}{}
 }
 
 func (mock *mockSyncer) getTimeServers() (servers []string) {
@@ -355,5 +420,6 @@ func newMockSyncer(_ *zap.Logger, servers []string, useNTS bool) *mockSyncer {
 		useNTS:      useNTS,
 		syncedCh:    make(chan struct{}, 1),
 		epochCh:     make(chan struct{}, 1),
+		spikeCh:     make(chan struct{}, 1),
 	}
 }

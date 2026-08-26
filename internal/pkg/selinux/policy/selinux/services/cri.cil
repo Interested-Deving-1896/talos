@@ -20,6 +20,13 @@
 (typetransition pod_containerd_t run_t chr_file pod_containerd_run_t)
 (typetransition pod_containerd_t run_t blk_file pod_containerd_run_t)
 (typetransition pod_containerd_t run_t fifo_file pod_containerd_run_t)
+; /run/cilium and similar, managed by high-privilege pods
+(typetransition pod_p run_t file pod_containerd_run_t)
+(typetransition pod_p run_t dir pod_containerd_run_t)
+(typetransition pod_p run_t lnk_file pod_containerd_run_t)
+(typetransition pod_p run_t chr_file pod_containerd_run_t)
+(typetransition pod_p run_t blk_file pod_containerd_run_t)
+(typetransition pod_p run_t fifo_file pod_containerd_run_t)
 
 (allow pod_containerd_t pod_containerd_run_t (fs_classes (rw)))
 
@@ -44,8 +51,16 @@
 ; iptables used by CNI
 (allow pod_containerd_t bin_exec_t (file (execute_no_trans execute)))
 (allow pod_containerd_t bin_exec_t (fs_classes (ro)))
-; (allow pod_p cni_conf_t (fs_classes (rw)))
+; /etc/cni is a context=cni_conf_t writable tmpfs; the CRI containerd manages the CNI config
+; tree there (e.g. creating net.d), so pod_containerd_t needs rw on cni_conf_t. Without it,
+; under enforcing the CRI plugin's CNI init fails (avc: denied write pod_containerd_t->cni_conf_t
+; dir) and runtime.v1.RuntimeService is never registered. Pods get cni_conf_t rw via pod_p below.
+(allow pod_containerd_t cni_conf_t (fs_classes (rw)))
 (allow pod_containerd_t cni_state_t (fs_classes (rw)))
+
+; /etc/kubernetes is a context=k8s_conf_t tmpfs now (its superblock is k8s_conf_t), so runc
+; remounts it (read-only bind) when mounting kube config into containers.
+(allow pod_containerd_t k8s_conf_t (filesystem (remount)))
 
 ; Logs
 (allow pod_containerd_t pods_log_t (fs_classes (rw)))
@@ -74,6 +89,9 @@
 (type cni_conf_t)
 (call filesystem_f (cni_conf_t))
 (filecon "/etc/cni(/.*)?" any (system_u object_r cni_conf_t (systemLow systemLow)))
+; /etc/cni is a tmpfs mounted with context=cni_conf_t (its superblock is cni_conf_t too),
+; so cni_conf_t inodes must be allowed to associate with a cni_conf_t-labeled filesystem.
+(allow cni_conf_t cni_conf_t (filesystem (associate)))
 
 (type cni_plugin_t)
 (call filesystem_f (cni_plugin_t))
@@ -162,8 +180,8 @@
 (allow pod_containerd_t devpts_t (fs_classes (rw)))
 (allow pod_p devpts_t (fs_classes (rw)))
 
-; ; cilium
-; (allow pod_containerd_t pod_p (unix_stream_socket (connectto)))
+; cilium-cni (called by CRI) connecting to /run/cilium/cilium.sock (exposed by agent pod)
+(allow pod_containerd_t pod_p (unix_stream_socket (connectto)))
 
 ; pkg/flannel
 (allow pod_p cni_conf_t (fs_classes (rw)))

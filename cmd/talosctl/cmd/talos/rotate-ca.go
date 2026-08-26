@@ -49,10 +49,25 @@ PKI can be rotated by applying machine config changes to the controlplane nodes.
 			return err
 		}
 
-		return WithClient(cmd.Context(), rotateCA)
+		ctx := cmd.Context()
+
+		clientFactory, err := NewClientFactory(ctx, &rotateCACmdFlags)
+		if err != nil {
+			return err
+		}
+
+		defer clientFactory.Close() //nolint:errcheck
+
+		ctx, c, _, err := clientFactory.BuildClientEnforceSingleNode(ctx, "rotate-ca")
+		if err != nil {
+			return err
+		}
+
+		return rotateCA(ctx, c)
 	},
 }
 
+//nolint:gocyclo
 func rotateCA(ctx context.Context, c *client.Client) error {
 	commentsFlags := encoder.CommentsDisabled
 	if rotateCACmdFlags.withDocs {
@@ -65,7 +80,7 @@ func rotateCA(ctx context.Context, c *client.Client) error {
 
 	encoderOpt := encoder.WithComments(commentsFlags)
 
-	clusterInfo, err := buildClusterInfo(ctx, rotateCACmdFlags.clusterState)
+	clusterInfo, err := buildClusterInfo(ctx, c, rotateCACmdFlags.clusterState)
 	if err != nil {
 		return err
 	}
@@ -83,10 +98,12 @@ func rotateCA(ctx context.Context, c *client.Client) error {
 			return fmt.Errorf("error rotating Talos CA: %w", err)
 		}
 
-		// re-create client with new Talos PKI
-		c, err = client.New(ctx, client.WithConfig(newTalosconfig))
-		if err != nil {
-			return fmt.Errorf("failed to create new client with rotated Talos CA: %w", err)
+		if !rotateCACmdFlags.dryRun { // in dry-run mode we skip this step
+			// re-create client with new Talos PKI
+			c, err = client.New(ctx, client.WithConfig(newTalosconfig))
+			if err != nil {
+				return fmt.Errorf("failed to create new client with rotated Talos CA: %w", err)
+			}
 		}
 	}
 

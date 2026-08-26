@@ -8,7 +8,6 @@ package api
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -31,6 +30,7 @@ import (
 	"github.com/siderolabs/talos/cmd/talosctl/pkg/talos/helpers"
 	"github.com/siderolabs/talos/internal/integration/base"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
+	"github.com/siderolabs/talos/pkg/machinery/api/storage"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 	"github.com/siderolabs/talos/pkg/machinery/resources/block"
@@ -238,9 +238,19 @@ func (suite *ExtensionsSuiteQEMU) TestExtensionsCrun() {
 	suite.testRuntimeClass("crun", "crun")
 }
 
-// TestExtensionsKataContainers verifies gvisor runtime class is working.
+// TestExtensionsKataContainers verifies that Kata Containers Cloud Hypervisor runtime class is working.
 func (suite *ExtensionsSuiteQEMU) TestExtensionsKataContainers() {
 	suite.testRuntimeClass("kata", "kata")
+}
+
+// TestExtensionsKataContainersQEMU verifies that Kata Containers QEMU runtime class is working.
+func (suite *ExtensionsSuiteQEMU) TestExtensionsKataContainersQEMU() {
+	suite.testRuntimeClass("kata-qemu", "kata-qemu")
+}
+
+// TestExtensionsKataContainersSNP verifies that Kata Containers confidential VMs runtime class is working.
+func (suite *ExtensionsSuiteQEMU) TestExtensionsKataContainersSNP() {
+	suite.testRuntimeClass("kata-qemu-coco-dev", "kata-qemu-coco-dev")
 }
 
 // TestExtensionsYouki verifies youki runtime class is working.
@@ -312,96 +322,6 @@ func (suite *ExtensionsSuiteQEMU) TestExtensionsStargz() {
 	suite.Require().NoError(suite.WaitForPodToBeRunning(suite.ctx, 5*time.Minute, "default", "stargz-hello"))
 }
 
-// TestExtensionsMdADM verifies mdadm is working, udev rules work and the raid is mounted on reboot.
-func (suite *ExtensionsSuiteQEMU) TestExtensionsMdADM() {
-	node := suite.RandomDiscoveredNodeInternalIP(machine.TypeWorker)
-
-	k8sNode, err := suite.GetK8sNodeByInternalIP(suite.ctx, node)
-	suite.Require().NoError(err)
-
-	nodeName := k8sNode.Name
-
-	userDisks := suite.UserDisks(suite.ctx, node)
-
-	suite.Require().GreaterOrEqual(len(userDisks), 2, "expected at least two user disks to be available")
-
-	userDisksJoined := strings.Join(userDisks[:2], " ")
-
-	mdAdmCreatePodDef, err := suite.NewPrivilegedPod("mdadm-create")
-	suite.Require().NoError(err)
-
-	mdAdmCreatePodDef.WithNodeName(nodeName)
-
-	suite.Require().NoError(mdAdmCreatePodDef.Create(suite.ctx, 5*time.Minute))
-
-	defer mdAdmCreatePodDef.Delete(suite.ctx) //nolint:errcheck
-
-	stdout, _, err := mdAdmCreatePodDef.Exec(
-		suite.ctx,
-		fmt.Sprintf("nsenter --mount=/proc/1/ns/mnt -- mdadm --create /dev/md/testmd --raid-devices=2 --metadata=1.2 --level=1 %s", userDisksJoined),
-	)
-	suite.Require().NoError(err)
-
-	suite.Require().Contains(stdout, "mdadm: array /dev/md/testmd started.")
-
-	defer func() {
-		hostNameStatus, err := safe.StateGetByID[*network.HostnameStatus](client.WithNode(suite.ctx, node), suite.Client.COSI, "hostname")
-		suite.Require().NoError(err)
-
-		hostname := hostNameStatus.TypedSpec().Hostname
-
-		deletePodDef, err := suite.NewPrivilegedPod("mdadm-destroy")
-		suite.Require().NoError(err)
-
-		deletePodDef.WithNodeName(nodeName)
-
-		suite.Require().NoError(deletePodDef.Create(suite.ctx, 5*time.Minute))
-
-		defer deletePodDef.Delete(suite.ctx) //nolint:errcheck
-
-		if _, _, err := deletePodDef.Exec(
-			suite.ctx,
-			fmt.Sprintf("nsenter --mount=/proc/1/ns/mnt -- mdadm --wait --stop /dev/md/%s:testmd", hostname),
-		); err != nil {
-			suite.T().Logf("failed to stop mdadm array: %v", err)
-		}
-
-		if _, _, err := deletePodDef.Exec(
-			suite.ctx,
-			fmt.Sprintf("nsenter --mount=/proc/1/ns/mnt -- mdadm --zero-superblock %s", userDisksJoined),
-		); err != nil {
-			suite.T().Logf("failed to remove md array backed by volumes %s: %v", userDisksJoined, err)
-		}
-	}()
-
-	// now we want to reboot the node and make sure the array is still mounted
-	suite.AssertRebooted(
-		suite.ctx, node, func(nodeCtx context.Context) error {
-			return base.IgnoreGRPCUnavailable(suite.Client.Reboot(nodeCtx))
-		}, 5*time.Minute,
-		suite.CleanupFailedPods,
-	)
-
-	suite.Require().True(suite.mdADMArrayExists(), "expected mdadm array to be present")
-}
-
-func (suite *ExtensionsSuiteQEMU) mdADMArrayExists() bool {
-	node := suite.RandomDiscoveredNodeInternalIP(machine.TypeWorker)
-
-	ctx := client.WithNode(suite.ctx, node)
-
-	disks, err := safe.StateListAll[*block.Disk](ctx, suite.Client.COSI)
-	suite.Require().NoError(err)
-
-	for disk := range disks.All() {
-		if strings.HasPrefix(disk.TypedSpec().DevPath, "/dev/md") {
-			return true
-		}
-	}
-
-	return false
-}
-
 // TestExtensionsZFS verifies zfs is working, udev rules work and the pool is mounted on reboot.
 func (suite *ExtensionsSuiteQEMU) TestExtensionsZFS() {
 	node := suite.RandomDiscoveredNodeInternalIP(machine.TypeWorker)
@@ -411,60 +331,29 @@ func (suite *ExtensionsSuiteQEMU) TestExtensionsZFS() {
 
 	suite.Require().NotEmpty(userDisks, "expected at least one user disks to be available")
 
-	k8sNode, err := suite.GetK8sNodeByInternalIP(suite.ctx, node)
-	suite.Require().NoError(err)
-
-	nodeName := k8sNode.Name
-
-	zfsPodDef, err := suite.NewPrivilegedPod("zpool-create")
-	suite.Require().NoError(err)
-
-	zfsPodDef.WithNodeName(nodeName)
-
-	suite.Require().NoError(zfsPodDef.Create(suite.ctx, 5*time.Minute))
-
-	defer zfsPodDef.Delete(suite.ctx) //nolint:errcheck
-
-	stdout, stderr, err := zfsPodDef.Exec(
-		suite.ctx,
-		fmt.Sprintf("nsenter --mount=/proc/1/ns/mnt -- zpool create -m /var/tank tank %s", userDisks[0]),
+	stdout, exitCode := suite.RunDebugContainer(suite.ctx, node,
+		"zpool", "create", "-m", "/var/tank", "tank", userDisks[0],
 	)
-	suite.Require().NoError(err)
-
-	suite.Require().Equal("", stderr)
+	suite.Require().EqualValues(0, exitCode, "zpool create failed: %s", stdout)
 	suite.Require().Equal("", stdout)
 
-	stdout, stderr, err = zfsPodDef.Exec(
-		suite.ctx,
-		"nsenter --mount=/proc/1/ns/mnt -- zfs create -V 1gb tank/vol",
+	stdout, exitCode = suite.RunDebugContainer(suite.ctx, node,
+		"zfs", "create", "-V", "1gb", "tank/vol",
 	)
-	suite.Require().NoError(err)
-
-	suite.Require().Equal("", stderr)
+	suite.Require().EqualValues(0, exitCode, "zfs create failed: %s", stdout)
 	suite.Require().Equal("", stdout)
 
 	defer func() {
-		deletePodDef, err := suite.NewPrivilegedPod("zpool-destroy")
-		suite.Require().NoError(err)
+		suite.RunDebugContainer(suite.ctx, node, "zfs", "destroy", "tank/vol")
 
-		deletePodDef.WithNodeName(nodeName)
+		suite.RunDebugContainer(suite.ctx, node, "zpool", "destroy", "tank")
 
-		suite.Require().NoError(deletePodDef.Create(suite.ctx, 5*time.Minute))
-
-		defer deletePodDef.Delete(suite.ctx) //nolint:errcheck
-
-		if _, _, err := deletePodDef.Exec(
-			suite.ctx,
-			"nsenter --mount=/proc/1/ns/mnt -- zfs destroy tank/vol",
-		); err != nil {
-			suite.T().Logf("failed to remove zfs dataset tank/vol: %v", err)
-		}
-
-		if _, _, err := deletePodDef.Exec(
-			suite.ctx,
-			"nsenter --mount=/proc/1/ns/mnt -- zpool destroy tank",
-		); err != nil {
-			suite.T().Logf("failed to remove zpool tank: %v", err)
+		// Wipe the disk so no zfs label lingers (otherwise the pool is re-discovered
+		// as a volume after the test).
+		if err := suite.Client.BlockDeviceWipe(client.WithNode(suite.ctx, node), &storage.BlockDeviceWipeRequest{
+			Devices: []*storage.BlockDeviceWipeDescriptor{{Device: filepath.Base(userDisks[0])}},
+		}); err != nil {
+			suite.T().Logf("failed to wipe disk %s: %v", userDisks[0], err)
 		}
 	}()
 
@@ -477,7 +366,6 @@ func (suite *ExtensionsSuiteQEMU) TestExtensionsZFS() {
 		suite.ctx, node, func(nodeCtx context.Context) error {
 			return base.IgnoreGRPCUnavailable(suite.Client.Reboot(nodeCtx))
 		}, 5*time.Minute,
-		suite.CleanupFailedPods,
 	)
 
 	suite.EventuallyWithT(func(t *assert.CollectT) {
@@ -528,27 +416,10 @@ func (suite *ExtensionsSuiteQEMU) checkZFSPoolMounted(t *assert.CollectT, node s
 func (suite *ExtensionsSuiteQEMU) TestExtensionsUtilLinuxTools() {
 	node := suite.RandomDiscoveredNodeInternalIP(machine.TypeWorker)
 
-	k8sNode, err := suite.GetK8sNodeByInternalIP(suite.ctx, node)
-	suite.Require().NoError(err)
-
-	nodeName := k8sNode.Name
-
-	utilLinuxPodDef, err := suite.NewPrivilegedPod("util-linux-tools-test")
-	suite.Require().NoError(err)
-
-	utilLinuxPodDef.WithNodeName(nodeName)
-
-	suite.Require().NoError(utilLinuxPodDef.Create(suite.ctx, 5*time.Minute))
-
-	defer utilLinuxPodDef.Delete(suite.ctx) //nolint:errcheck
-
-	stdout, stderr, err := utilLinuxPodDef.Exec(
-		suite.ctx,
-		"nsenter --mount=/proc/1/ns/mnt -- /usr/local/sbin/fstrim --version",
+	stdout, exitCode := suite.RunDebugContainer(suite.ctx, node,
+		"/usr/local/sbin/fstrim", "--version",
 	)
-	suite.Require().NoError(err)
-
-	suite.Require().Equal("", stderr)
+	suite.Require().EqualValues(0, exitCode, "fstrim --version failed: %s", stdout)
 	suite.Require().Contains(stdout, "fstrim from util-linux")
 }
 
@@ -634,7 +505,7 @@ func (suite *ExtensionsSuiteQEMU) TestLoadedKernelModule() {
 			"virtio_pci_legacy_dev",
 			"virtio_pci_modern_dev",
 		},
-		func(res *runtime.LoadedKernelModule, asrt *assert.Assertions) {
+		func(res *runtime.LoadedKernelModule, asrt *assert.Assertions) { //nolint:staticcheck
 			asrt.NotEmpty(res.TypedSpec().Size, "kernel module size should not be empty")
 			asrt.NotEmpty(res.TypedSpec().Address, "kernel module address should not be empty")
 			asrt.GreaterOrEqual(res.TypedSpec().ReferenceCount, 0, "kernel module instances should be non-negative")

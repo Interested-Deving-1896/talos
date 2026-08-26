@@ -86,6 +86,9 @@ func TestLinkSpecMarshalYAML(t *testing.T) {
 				},
 			},
 		},
+		Veth: network.VethSpec{
+			PeerName: "eth2",
+		},
 		ConfigLayer: network.ConfigPlatform,
 	}
 
@@ -112,7 +115,7 @@ bondMaster:
     lacpRate: fast
     arpValidate: all
     arpAllTargets: any
-    primary: 3
+    primaryIndex: 3
     primaryReselect: better
     failOverMac: follow
     adSelect: count
@@ -145,6 +148,8 @@ wireguard:
           persistentKeepaliveInterval: 30s
           allowedIPs:
             - 192.83.93.94/31
+veth:
+    peerName: eth2
 layer: platform
 `,
 		string(marshaled))

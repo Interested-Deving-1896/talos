@@ -21,6 +21,7 @@ import (
 	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
 	netctrl "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/network"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
 	networkcfg "github.com/siderolabs/talos/pkg/machinery/config/types/network"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
@@ -487,6 +488,7 @@ func (suite *LinkConfigSuite) TestMachineConfigurationNewStyle() {
 	bc1.BondMode = new(nethelpers.BondModeActiveBackup)
 	bc1.BondLinks = []string{"dummy2", "dummy3"}
 	bc1.BondUpDelay = new(uint32(200))
+	bc1.BondPrimary = new("dummy2")
 
 	br1 := networkcfg.NewBridgeConfigV1Alpha1("br0")
 	br1.BridgeLinks = []string{"enp0s2", "eth1"}
@@ -561,6 +563,9 @@ func (suite *LinkConfigSuite) TestMachineConfigurationNewStyle() {
 				asrt.Equal(nethelpers.BondModeActiveBackup, r.TypedSpec().BondMaster.Mode)
 				asrt.EqualValues(200, r.TypedSpec().BondMaster.UpDelay)
 				asrt.Nil(r.TypedSpec().BondMaster.ADLACPActive)
+				asrt.Equal("dummy2", r.TypedSpec().BondMaster.Primary)
+				// the name is resolved to an index only when the settings are applied
+				asrt.Nil(r.TypedSpec().BondMaster.PrimaryIndex)
 			case "br0":
 				asrt.True(r.TypedSpec().Up)
 				asrt.True(r.TypedSpec().Logical)
@@ -568,6 +573,45 @@ func (suite *LinkConfigSuite) TestMachineConfigurationNewStyle() {
 				asrt.Equal(network.LinkKindBridge, r.TypedSpec().Kind)
 				asrt.True(r.TypedSpec().BridgeMaster.STP.Enabled)
 				asrt.True(r.TypedSpec().BridgeMaster.VLAN.FilteringEnabled)
+			}
+		},
+	)
+}
+
+// TestMachineConfigurationNewStyleBondPrimaryAlias checks that the bond primary is resolved through
+// link aliases, the same way the list of bonded links is.
+func (suite *LinkConfigSuite) TestMachineConfigurationNewStyleBondPrimaryAlias() {
+	suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.LinkConfigController{}))
+
+	bc := networkcfg.NewBondConfigV1Alpha1("bond0")
+	bc.BondMode = new(nethelpers.BondModeActiveBackup)
+	bc.BondLinks = []string{"uplink", "eth1"}
+	bc.BondPrimary = new("uplink")
+	bc.BondPrimaryReselect = new(nethelpers.PrimaryReselectAlways)
+
+	ctr, err := container.New(bc)
+	suite.Require().NoError(err)
+
+	suite.Create(config.NewMachineConfig(ctr))
+
+	status := network.NewLinkStatus(network.NamespaceName, "eth0")
+	status.TypedSpec().AltNames = []string{"uplink"}
+	suite.Create(status)
+
+	suite.assertLinks(
+		[]string{
+			"configuration/bond0",
+			"configuration/eth0",
+			"configuration/eth1",
+		}, func(r *network.LinkSpec, asrt *assert.Assertions) {
+			switch r.TypedSpec().Name {
+			case "bond0":
+				asrt.Equal(network.LinkKindBond, r.TypedSpec().Kind)
+				// "uplink" is an alias of eth0, so the primary is stored under the real link name
+				asrt.Equal("eth0", r.TypedSpec().BondMaster.Primary)
+				asrt.Equal(nethelpers.PrimaryReselectAlways, r.TypedSpec().BondMaster.PrimaryReselect)
+			case "eth0", "eth1":
+				asrt.Equal("bond0", r.TypedSpec().BondSlave.MasterName)
 			}
 		},
 	)
@@ -639,6 +683,88 @@ func (suite *LinkConfigSuite) TestMachineConfigurationNewStyleVRF() {
 	)
 }
 
+func (suite *LinkConfigSuite) TestMachineConfigurationNewStyleVethVRF() {
+	suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.LinkConfigController{}))
+
+	veth := networkcfg.NewVethConfigV1Alpha1("veth-metallb", "veth-router")
+	veth.LinkMTU = 1500
+	veth.VethPeer.LinkMTU = 1400
+
+	vrf := networkcfg.NewVRFConfigV1Alpha1("vrf-metallb")
+	vrf.VRFLinks = []string{"veth-router"}
+	vrf.VRFTable = nethelpers.RoutingTable(88)
+
+	ctr, err := container.New(veth, vrf)
+	suite.Require().NoError(err)
+
+	suite.Create(config.NewMachineConfig(ctr))
+
+	suite.assertLinks(
+		[]string{
+			"configuration/veth-metallb",
+			"configuration/veth-router",
+			"configuration/vrf-metallb",
+		}, func(r *network.LinkSpec, asrt *assert.Assertions) {
+			asrt.Equal(network.ConfigMachineConfiguration, r.TypedSpec().ConfigLayer)
+
+			switch r.TypedSpec().Name {
+			case "veth-metallb":
+				asrt.True(r.TypedSpec().Up)
+				asrt.True(r.TypedSpec().Logical)
+				asrt.EqualValues(1500, r.TypedSpec().MTU)
+				asrt.Equal(network.LinkKindVeth, r.TypedSpec().Kind)
+				asrt.Equal("veth-router", r.TypedSpec().Veth.PeerName)
+			case "veth-router":
+				asrt.True(r.TypedSpec().Up)
+				asrt.True(r.TypedSpec().Logical)
+				asrt.EqualValues(1400, r.TypedSpec().MTU)
+				asrt.Equal(network.LinkKindVeth, r.TypedSpec().Kind)
+				asrt.Equal("veth-metallb", r.TypedSpec().Veth.PeerName)
+				asrt.Equal("vrf-metallb", r.TypedSpec().VRFSlave.MasterName)
+			case "vrf-metallb":
+				asrt.True(r.TypedSpec().Up)
+				asrt.True(r.TypedSpec().Logical)
+				asrt.Equal(network.LinkKindVRF, r.TypedSpec().Kind)
+				asrt.Equal(nethelpers.RoutingTable(88), r.TypedSpec().VRFMaster.Table)
+			}
+		},
+	)
+}
+
+func (suite *LinkConfigSuite) TestMachineConfigurationNewStyleVethNamesAreLiteral() {
+	suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.LinkConfigController{}))
+
+	nameStatus := network.NewLinkStatus(network.NamespaceName, "eth0")
+	nameStatus.TypedSpec().Alias = "veth-host"
+	suite.Create(nameStatus)
+
+	peerStatus := network.NewLinkStatus(network.NamespaceName, "eth1")
+	peerStatus.TypedSpec().AltNames = []string{"veth-router"}
+	suite.Create(peerStatus)
+
+	veth := networkcfg.NewVethConfigV1Alpha1("veth-host", "veth-router")
+	ctr, err := container.New(veth)
+	suite.Require().NoError(err)
+
+	suite.Create(config.NewMachineConfig(ctr))
+
+	suite.assertLinks(
+		[]string{
+			"configuration/veth-host",
+			"configuration/veth-router",
+		}, func(r *network.LinkSpec, asrt *assert.Assertions) {
+			asrt.True(r.TypedSpec().Logical)
+			asrt.Equal(network.LinkKindVeth, r.TypedSpec().Kind)
+
+			if r.TypedSpec().Name == "veth-host" {
+				asrt.Equal("veth-router", r.TypedSpec().Veth.PeerName)
+			} else {
+				asrt.Equal("veth-host", r.TypedSpec().Veth.PeerName)
+			}
+		},
+	)
+}
+
 func (suite *LinkConfigSuite) TestMachineConfigurationNewStyleNotFIPS() {
 	suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.LinkConfigController{}))
 
@@ -669,7 +795,7 @@ func (suite *LinkConfigSuite) TestMachineConfigurationNewStyleNotFIPS() {
 		{
 			WireguardPublicKey:    peerKeyPub.String(),
 			WireguardPresharedKey: pskKey.String(),
-			WireguardAllowedIPs:   []networkcfg.Prefix{{Prefix: netip.MustParsePrefix("10.0.0.0/24")}},
+			WireguardAllowedIPs:   []meta.Prefix{{Prefix: netip.MustParsePrefix("10.0.0.0/24")}},
 		},
 	}
 

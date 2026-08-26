@@ -103,6 +103,29 @@ func TestValidate(t *testing.T) {
 			},
 		},
 		{
+			name: "MachineFilesDeprecated",
+			config: &v1alpha1.Config{
+				ConfigVersion: "v1alpha1",
+				MachineConfig: &v1alpha1.MachineConfig{
+					MachineType: "worker",
+					MachineCA: &x509.PEMEncodedCertificateAndKey{
+						Crt: []byte("foo"),
+					},
+					MachineFiles: []*v1alpha1.MachineFile{ //nolint:staticcheck // test deprecation warning
+						{FilePath: "/var/example", FileOp: "create"},
+					},
+				},
+				ClusterConfig: &v1alpha1.ClusterConfig{
+					ControlPlane: &v1alpha1.ControlPlaneConfig{
+						Endpoint: &v1alpha1.Endpoint{endpointURL},
+					},
+				},
+			},
+			expectedWarnings: []string{
+				`.machine.files is deprecated; use dedicated configuration documents instead`,
+			},
+		},
+		{
 			name: "NoMachineTypeStrict",
 			config: &v1alpha1.Config{
 				ConfigVersion: "v1alpha1",
@@ -204,7 +227,9 @@ func TestValidate(t *testing.T) {
 			},
 		},
 		{
-			name: "NoMachineInstallRequired",
+			// .machine.install is deprecated in favor of the UnattendedInstallConfig document and is no longer
+			// required, even in install mode.
+			name: "NoMachineInstallNotRequired",
 			config: &v1alpha1.Config{
 				ConfigVersion: "v1alpha1",
 				MachineConfig: &v1alpha1.MachineConfig{
@@ -222,7 +247,6 @@ func TestValidate(t *testing.T) {
 				},
 			},
 			requiresInstall: true,
-			expectedError:   "1 error occurred:\n\t* install instructions are required in \"runtimeMode(true)\" mode\n\n",
 		},
 		{
 			name: "MachineInstallDisk",
@@ -1185,34 +1209,6 @@ func TestValidate(t *testing.T) {
 				"\t* [networking.os.device.route[7]]: either network or gateway should be set\n\n",
 		},
 		{
-			name: "KubeSpanNoDiscovery",
-			config: &v1alpha1.Config{
-				ConfigVersion: "v1alpha1",
-				MachineConfig: &v1alpha1.MachineConfig{
-					MachineType: "controlplane",
-					MachineCA: &x509.PEMEncodedCertificateAndKey{
-						Crt: []byte("foo"),
-						Key: []byte("bar"),
-					},
-					MachineNetwork: &v1alpha1.NetworkConfig{
-						NetworkKubeSpan: &v1alpha1.NetworkKubeSpan{
-							KubeSpanEnabled: new(true),
-						},
-					},
-				},
-				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
-						Endpoint: &v1alpha1.Endpoint{
-							endpointURL,
-						},
-					},
-				},
-			},
-			expectedError: "3 errors occurred:\n\t* .cluster.discovery should be enabled when .machine.network.kubespan is enabled\n" +
-				"\t* .cluster.id should be set when .machine.network.kubespan is enabled\n" +
-				"\t* .cluster.secret should be set when .machine.network.kubespan is enabled\n\n",
-		},
-		{
 			name: "DiscoveryServiceEndpoint",
 			config: &v1alpha1.Config{
 				ConfigVersion: "v1alpha1",
@@ -1981,6 +1977,9 @@ func TestValidate(t *testing.T) {
 						},
 					},
 				},
+			},
+			expectedWarnings: []string{
+				`.machine.baseRuntimeSpecOverrides is deprecated; use a CRIBaseRuntimeSpecConfig document instead`,
 			},
 		},
 		{

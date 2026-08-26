@@ -33,11 +33,13 @@ import (
 )
 
 type mountContext struct {
-	point             *mount.Point
-	readOnly          bool
-	disableAccessTime bool
-	secure            bool
-	unmounter         func() error
+	point               *mount.Point
+	readOnly            bool
+	disableAccessTime   bool
+	secure              bool
+	noExec              bool
+	securityInitialized bool
+	unmounter           func() error
 }
 
 // MountController performs actual mount/unmount operations based on the MountRequests.
@@ -389,9 +391,11 @@ func (ctrl *MountController) handleBindMountOperation(
 			}
 		}
 
-		opts := []mount.ManagerOption{
-			mount.WithSelinuxLabel(volumeStatus.TypedSpec().MountSpec.SelinuxLabel),
-		}
+		opts := bindMountOptions(
+			volumeStatus.TypedSpec().MountSpec.SelinuxLabel,
+			mountRequest.TypedSpec().Secure,
+			mountRequest.TypedSpec().NoExec,
+		)
 
 		manager := mount.NewManager(slices.Concat(
 			[]mount.ManagerOption{
@@ -425,11 +429,22 @@ func (ctrl *MountController) handleBindMountOperation(
 		ctrl.activeMounts[mountRequest.Metadata().ID()] = &mountContext{
 			point:     mountpoint,
 			readOnly:  mountRequest.TypedSpec().ReadOnly,
+			secure:    mountRequest.TypedSpec().Secure,
+			noExec:    mountRequest.TypedSpec().NoExec,
 			unmounter: manager.Unmount,
 		}
 	}
 
-	return nil
+	mountCtx := ctrl.activeMounts[mountRequest.Metadata().ID()]
+
+	return updateMountSecurity(
+		logger,
+		mountRequest.Metadata().ID(),
+		volumeStatus.Metadata().ID(),
+		mountCtx,
+		mountRequest.TypedSpec().Secure,
+		mountRequest.TypedSpec().NoExec,
+	)
 }
 
 //nolint:gocyclo
@@ -579,6 +594,12 @@ func (ctrl *MountController) handleDiskMountOperation(
 			fsOpts []fsopen.Option
 		)
 
+		// Read-only volumes preserve their existing metadata, detached mounts have no target,
+		// and external volume metadata is owned by the host.
+		shouldUpdateTargetSettings := !mountRequest.TypedSpec().ReadOnly &&
+			!mountRequest.TypedSpec().Detached &&
+			volumeStatus.TypedSpec().Type != block.VolumeTypeExternal
+
 		fsOpts = append(
 			fsOpts,
 			fsopen.WithSource(mountSource),
@@ -616,10 +637,9 @@ func (ctrl *MountController) handleDiskMountOperation(
 			}
 		}
 
-		opts = append(
-			opts,
-			mount.WithSelinuxLabel(volumeStatus.TypedSpec().MountSpec.SelinuxLabel),
-		)
+		if shouldUpdateTargetSettings {
+			opts = append(opts, mount.WithSelinuxLabel(volumeStatus.TypedSpec().MountSpec.SelinuxLabel))
+		}
 
 		if mountRequest.TypedSpec().DisableAccessTime {
 			opts = append(opts, mount.WithDisableAccessTime())
@@ -627,6 +647,10 @@ func (ctrl *MountController) handleDiskMountOperation(
 
 		if mountRequest.TypedSpec().Secure {
 			opts = append(opts, mount.WithSecure())
+		}
+
+		if mountRequest.TypedSpec().NoExec {
+			opts = append(opts, mount.WithNoExec())
 		}
 
 		if mountRequest.TypedSpec().ReadOnly {
@@ -654,7 +678,7 @@ func (ctrl *MountController) handleDiskMountOperation(
 			return fmt.Errorf("failed to mount %q: %w", mountRequest.Metadata().ID(), err)
 		}
 
-		if !mountRequest.TypedSpec().ReadOnly && !mountRequest.TypedSpec().Detached {
+		if shouldUpdateTargetSettings {
 			if err = ctrl.updateTargetSettings(mountTarget, volumeStatus.TypedSpec().Filesystem, volumeStatus.TypedSpec().MountSpec); err != nil {
 				manager.Unmount() //nolint:errcheck
 
@@ -670,16 +694,19 @@ func (ctrl *MountController) handleDiskMountOperation(
 			zap.Stringer("filesystem", mountFilesystem),
 			zap.Bool("read_only", mountRequest.TypedSpec().ReadOnly),
 			zap.Bool("secure", mountRequest.TypedSpec().Secure),
+			zap.Bool("no_exec", mountRequest.TypedSpec().NoExec),
 			zap.Bool("disable_access_time", mountRequest.TypedSpec().DisableAccessTime),
 			zap.Bool("detached", mountRequest.TypedSpec().Detached),
 		)
 
 		mountCtx = &mountContext{
-			point:             mountpoint,
-			readOnly:          mountRequest.TypedSpec().ReadOnly,
-			disableAccessTime: mountRequest.TypedSpec().DisableAccessTime,
-			secure:            mountRequest.TypedSpec().Secure,
-			unmounter:         manager.Unmount,
+			point:               mountpoint,
+			readOnly:            mountRequest.TypedSpec().ReadOnly,
+			disableAccessTime:   mountRequest.TypedSpec().DisableAccessTime,
+			secure:              mountRequest.TypedSpec().Secure,
+			noExec:              mountRequest.TypedSpec().NoExec,
+			securityInitialized: true,
+			unmounter:           manager.Unmount,
 		}
 		ctrl.activeMounts[mountRequest.Metadata().ID()] = mountCtx
 	}
@@ -723,20 +750,76 @@ func (ctrl *MountController) handleDiskMountOperation(
 		mountCtx.disableAccessTime = mountRequest.TypedSpec().DisableAccessTime
 	}
 
-	//nolint:dupl
-	if mountCtx.secure != mountRequest.TypedSpec().Secure {
-		err := mountCtx.point.SetSecure(mountRequest.TypedSpec().Secure)
-		if err != nil {
-			return fmt.Errorf("failed to update secure for %q: %w", mountRequest.Metadata().ID(), err)
+	return updateMountSecurity(
+		logger,
+		mountRequest.Metadata().ID(),
+		volumeStatus.Metadata().ID(),
+		mountCtx,
+		mountRequest.TypedSpec().Secure,
+		mountRequest.TypedSpec().NoExec,
+	)
+}
+
+func bindMountOptions(selinuxLabel string, secure, noExec bool) []mount.ManagerOption {
+	opts := []mount.ManagerOption{
+		mount.WithSelinuxLabel(selinuxLabel),
+	}
+
+	if secure {
+		opts = append(opts, mount.WithSecure())
+	}
+
+	if noExec {
+		opts = append(opts, mount.WithNoExec())
+	}
+
+	return opts
+}
+
+func updateMountSecurity(logger *zap.Logger, mountID, volumeID string, mountCtx *mountContext, secure, noExec bool) error {
+	initialize := !mountCtx.securityInitialized
+
+	if initialize || mountCtx.secure != secure {
+		if err := mountCtx.point.SetSecure(secure); err != nil {
+			return fmt.Errorf("failed to update secure for %q: %w", mountID, err)
 		}
 
+		if !initialize {
+			logger.Info(
+				"volume mount attributes updated",
+				zap.String("volume", volumeID),
+				zap.String("secure", fmt.Sprintf("%v -> %v", mountCtx.secure, secure)),
+			)
+		}
+
+		mountCtx.secure = secure
+	}
+
+	if initialize || mountCtx.noExec != noExec {
+		if err := mountCtx.point.SetNoExec(noExec); err != nil {
+			return fmt.Errorf("failed to update noexec for %q: %w", mountID, err)
+		}
+
+		if !initialize {
+			logger.Info(
+				"volume mount attributes updated",
+				zap.String("volume", volumeID),
+				zap.String("no_exec", fmt.Sprintf("%v -> %v", mountCtx.noExec, noExec)),
+			)
+		}
+
+		mountCtx.noExec = noExec
+	}
+
+	if initialize {
 		logger.Info(
-			"volume mount attributes updated",
-			zap.String("volume", volumeStatus.Metadata().ID()),
-			zap.String("secure", fmt.Sprintf("%v -> %v", mountCtx.secure, mountRequest.TypedSpec().Secure)),
+			"volume mount attributes initialized",
+			zap.String("volume", volumeID),
+			zap.Bool("secure", secure),
+			zap.Bool("no_exec", noExec),
 		)
 
-		mountCtx.secure = mountRequest.TypedSpec().Secure
+		mountCtx.securityInitialized = true
 	}
 
 	return nil
@@ -762,6 +845,10 @@ func (ctrl *MountController) handleOverlayMountOperation(
 
 	if volumeStatus.TypedSpec().MountSpec.Secure {
 		overlayOpts = append(overlayOpts, mount.WithSecure())
+	}
+
+	if volumeStatus.TypedSpec().MountSpec.NoExec {
+		overlayOpts = append(overlayOpts, mount.WithNoExec())
 	}
 
 	manager := mount.NewVarOverlay(

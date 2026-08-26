@@ -39,7 +39,11 @@ type BondMasterSpec struct {
 	// ARPAllTargets specifies whether ARP probes should be sent to any or all targets.
 	ARPAllTargets nethelpers.ARPAllTargets `yaml:"arpAllTargets" protobuf:"5"`
 	// PrimaryIndex is a device index specifying which slave is the primary device.
-	PrimaryIndex *uint32 `yaml:"primary,omitempty" protobuf:"6"`
+	//
+	// This is the resolved form of Primary: it is what the kernel reports back, and it is filled in
+	// by the link spec controller right before applying the settings. Configuration layers should set
+	// Primary instead, as interface indexes are not stable.
+	PrimaryIndex *uint32 `yaml:"primaryIndex,omitempty" protobuf:"6"`
 	// PrimaryReselect specifies the policy under which the primary slave should be reselected.
 	PrimaryReselect nethelpers.PrimaryReselect `yaml:"primaryReselect" protobuf:"7"`
 	// FailOverMac whether active-backup mode should set all slaves to the same MAC address at enslavement, when enabled, or perform special handling.
@@ -89,9 +93,17 @@ type BondMasterSpec struct {
 	ADLACPActive *nethelpers.ADLACPActive `yaml:"adLacpActive,omitempty" protobuf:"27"`
 	// MissedMax is the number of arp_interval monitor checks that must fail in order for an interface to be marked down by the ARP monitor.
 	MissedMax uint8 `yaml:"missedMax,omitempty" protobuf:"28"`
+	// Primary is the name of the slave link which should be used as the primary device.
+	//
+	// Only meaningful for the active-backup, balance-tlb and balance-alb modes.
+	Primary string `yaml:"primary,omitempty" protobuf:"29"`
 }
 
 // Equal checks two BondMasterSpecs for equality.
+//
+// Primary is deliberately not compared: it is the unresolved (by name) form of PrimaryIndex, and the
+// kernel only ever reports back the index. Callers comparing a desired spec against the kernel state
+// must resolve Primary into PrimaryIndex first, otherwise the two would never compare equal.
 //
 //nolint:gocyclo,cyclop
 func (spec *BondMasterSpec) Equal(other *BondMasterSpec) bool {
@@ -115,6 +127,10 @@ func (spec *BondMasterSpec) Equal(other *BondMasterSpec) bool {
 		return false
 	}
 
+	// if either side doesn't have a primary, consider them equal: the kernel only reports a primary while
+	// the primary slave is actually enslaved, so it drops the attribute when e.g. the primary NIC is
+	// unplugged. Comparing those as unequal would tear the whole bond down and re-enslave every slave
+	// exactly when a failover is in flight.
 	if spec.PrimaryIndex != nil && other.PrimaryIndex != nil && *spec.PrimaryIndex != *other.PrimaryIndex {
 		return false
 	}
@@ -266,7 +282,8 @@ func (spec *BondMasterSpec) IsZero() bool {
 		len(spec.ARPIPTargets) == 0 &&
 		len(spec.NSIP6Targets) == 0 &&
 		spec.ADLACPActive == nil &&
-		spec.MissedMax == 0
+		spec.MissedMax == 0 &&
+		spec.Primary == ""
 }
 
 // BridgeMasterSpec describes bridge settings if Kind == "bridge".
@@ -303,7 +320,7 @@ type VRFMasterSpec struct {
 //gotagsrewrite:gen
 type WireguardSpec struct {
 	// PrivateKey is used to configure the link, present only in the LinkSpec.
-	PrivateKey string `yaml:"privateKey,omitempty" protobuf:"1"`
+	PrivateKey string `yaml:"privateKey,omitempty" protobuf:"1" redact:"replace"`
 	// PublicKey is only used in LinkStatus to show the link status.
 	PublicKey    string          `yaml:"publicKey,omitempty" protobuf:"2"`
 	ListenPort   int             `yaml:"listenPort" protobuf:"3"`
@@ -316,7 +333,7 @@ type WireguardSpec struct {
 //gotagsrewrite:gen
 type WireguardPeer struct {
 	PublicKey                   string         `yaml:"publicKey" protobuf:"1"`
-	PresharedKey                string         `yaml:"presharedKey" protobuf:"2"`
+	PresharedKey                string         `yaml:"presharedKey" protobuf:"2" redact:"replace"`
 	Endpoint                    string         `yaml:"endpoint" protobuf:"3"`
 	PersistentKeepaliveInterval time.Duration  `yaml:"persistentKeepaliveInterval" protobuf:"4"`
 	AllowedIPs                  []netip.Prefix `yaml:"allowedIPs" protobuf:"5"`

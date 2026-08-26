@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -31,6 +32,7 @@ import (
 	"github.com/siderolabs/go-procfs/procfs"
 	"github.com/siderolabs/go-retry/retry"
 	sideronet "github.com/siderolabs/net"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"go.yaml.in/yaml/v4"
 	"google.golang.org/grpc"
@@ -49,6 +51,7 @@ import (
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	talosclient "github.com/siderolabs/talos/pkg/machinery/client"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
+	"github.com/siderolabs/talos/pkg/machinery/client/multiplex"
 	"github.com/siderolabs/talos/pkg/machinery/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/bundle"
 	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
@@ -96,8 +99,6 @@ type Settings struct {
 	TargetInstallImageRegistry string
 	// Current version of the cluster (built in the CI pass)
 	CurrentVersion string
-	// Custom CNI URL to use.
-	CustomCNIURL string
 	// CNI bundle for QEMU provisioner.
 	CNIBundleURL string
 }
@@ -194,32 +195,17 @@ func (suite *BaseSuite) TearDownSuite() {
 
 // waitForClusterHealth asserts cluster health after any change.
 func (suite *BaseSuite) waitForClusterHealth() {
-	runs := 1
+	checkCtx, checkCtxCancel := context.WithTimeout(suite.ctx, 15*time.Minute)
+	defer checkCtxCancel()
 
-	singleNodeCluster := len(suite.Cluster.Info().Nodes) == 1
-	if singleNodeCluster {
-		// run health check several times for single node clusters,
-		// as self-hosted control plane is not stable after reboot
-		runs = 3
-	}
-
-	for run := range runs {
-		if run > 0 {
-			time.Sleep(15 * time.Second)
-		}
-
-		checkCtx, checkCtxCancel := context.WithTimeout(suite.ctx, 15*time.Minute)
-		defer checkCtxCancel()
-
-		suite.Require().NoError(
-			check.Wait(
-				checkCtx,
-				suite.clusterAccess,
-				check.DefaultClusterChecks(),
-				check.StderrReporter(),
-			),
-		)
-	}
+	suite.Require().NoError(
+		check.Wait(
+			checkCtx,
+			suite.clusterAccess,
+			check.DefaultClusterChecks(),
+			check.StderrReporter(),
+		),
+	)
 }
 
 func (suite *BaseSuite) untaint(name string) {
@@ -261,29 +247,27 @@ func (suite *BaseSuite) untaint(name string) {
 
 func (suite *BaseSuite) assertSameVersionCluster(client *talosclient.Client, expectedVersion string) {
 	nodes := xslices.Map(suite.Cluster.Info().Nodes, func(node provision.NodeInfo) string { return node.IPs[0].String() })
-	ctx := talosclient.WithNodes(suite.ctx, nodes...)
 
-	var v *machineapi.VersionResponse
+	suite.Assert().EventuallyWithT(
+		func(collect *assert.CollectT) {
+			asrt := assert.New(collect)
 
-	err := retry.Constant(
-		time.Minute,
-	).Retry(
-		func() error {
-			var e error
+			respCh := multiplex.Unary(
+				suite.ctx, nodes,
+				func(ctx context.Context) (*machineapi.VersionResponse, error) {
+					return client.Version(ctx)
+				},
+			)
 
-			v, e = client.Version(ctx)
-
-			return retry.ExpectedError(e)
+			for resp := range respCh {
+				if asrt.NoError(resp.Err, "error getting version from node %s: %v", resp.Node, resp.Err) {
+					asrt.Equal(expectedVersion, resp.Payload.Messages[0].Version.Tag, "unexpected version from node %s", resp.Node)
+				}
+			}
 		},
+		time.Minute,
+		time.Second,
 	)
-
-	suite.Require().NoError(err)
-
-	suite.Require().Len(v.Messages, len(nodes))
-
-	for _, version := range v.Messages {
-		suite.Assert().Equal(expectedVersion, version.Version.Tag)
-	}
 }
 
 func (suite *BaseSuite) assertCmdlineContains(client *talosclient.Client, node string, expectedCmdlineContains string) {
@@ -295,6 +279,17 @@ func (suite *BaseSuite) assertCmdlineContains(client *talosclient.Client, node s
 	suite.Assert().NotEmpty(cmdline, "expected cmdline to be not empty")
 
 	suite.Assert().Contains(cmdline.TypedSpec().Cmdline, expectedCmdlineContains, "expected cmdline to contain %q", expectedCmdlineContains)
+}
+
+func (suite *BaseSuite) assertCmdlineNotContains(client *talosclient.Client, node string, expectedCmdlineContains string) {
+	ctx := talosclient.WithNode(suite.ctx, node)
+
+	cmdline, err := safe.ReaderGetByID[*runtime.KernelCmdline](ctx, client.COSI, runtime.KernelCmdlineID)
+	suite.Require().NoError(err)
+
+	suite.Assert().NotEmpty(cmdline, "expected cmdline to be not empty")
+
+	suite.Assert().NotContains(cmdline.TypedSpec().Cmdline, expectedCmdlineContains, "expected cmdline not to contain %q", expectedCmdlineContains)
 }
 
 func (suite *BaseSuite) readVersion(nodeCtx context.Context, client *talosclient.Client) (
@@ -314,41 +309,63 @@ func (suite *BaseSuite) readVersion(nodeCtx context.Context, client *talosclient
 }
 
 type upgradeOptions struct {
+	SourceVersion string
+
 	TargetInstallerImage string
-	// Deprecated: staged upgrades are not supported by the new LifecycleService API.
-	// Use the legacy MachineService.Upgrade path instead.
-	UpgradeStage  bool
-	TargetVersion string
+	TargetVersion        string
+	// Use in-memory containerd: in general we should prefer to use CRI containerd,
+	// but we should use in-memory for 'enforcing' mode due to SELinux restrictions.
+	//
+	// Ignored for legacy upgrade paths (before 1.13).
+	UpgradeUseInmemoryContainerd bool
+	// RebootPowercycle control how the machine is rebooted (only for lifecycle upgrades).
+	RebootPowercycle bool
 }
 
-//nolint:gocyclo,cyclop
 func (suite *BaseSuite) upgradeNode(client *talosclient.Client, node provision.NodeInfo, options upgradeOptions) {
 	suite.T().Logf("upgrading node %s", node.IPs[0])
 
 	ctx, cancel := context.WithCancel(suite.ctx)
 	defer cancel()
 
-	nodeCtx := talosclient.WithNodes(ctx, node.IPs[0].String())
+	nodeCtx := talosclient.WithNode(ctx, node.IPs[0].String())
 
-	// Staged upgrades are not supported by the new LifecycleService API,
-	// so skip straight to the legacy path.
-	if !options.UpgradeStage {
-		if suite.tryUpgradeViaLifecycleService(nodeCtx, client, node, options) {
-			// LifecycleService.Upgrade succeeded — trigger reboot and wait.
-			suite.T().Logf("upgrade via LifecycleService succeeded, rebooting node %s", node.IPs[0])
+	if suite.tryUpgradeViaLifecycleService(nodeCtx, client, node, options) {
+		// LifecycleService.Upgrade succeeded — trigger reboot and wait.
+		rebootMode := "kexec"
 
-			suite.Require().NoError(client.Reboot(nodeCtx))
-			suite.waitForUpgrade(nodeCtx, client, node, options)
+		var rebootOptions []talosclient.RebootMode
 
-			return
+		if options.RebootPowercycle {
+			rebootMode = "powercycle"
+			rebootOptions = []talosclient.RebootMode{talosclient.WithPowerCycle}
 		}
 
-		suite.T().Logf("LifecycleService.Upgrade not available, falling back to legacy MachineService.Upgrade")
+		suite.T().Logf("upgrade via LifecycleService succeeded, rebooting node %s via %s", node.IPs[0], rebootMode)
+
+		suite.rebootNode(nodeCtx, client, rebootOptions)
+		suite.waitForUpgrade(nodeCtx, client, node, options.TargetVersion)
+
+		return
 	}
+
+	suite.T().Logf("LifecycleService.Upgrade not available, falling back to legacy MachineService.Upgrade")
 
 	// Legacy path: MachineService.Upgrade (handles image pull, install, and reboot in one call).
 	suite.upgradeNodeLegacy(nodeCtx, client, options)
-	suite.waitForUpgrade(nodeCtx, client, node, options)
+	suite.waitForUpgrade(nodeCtx, client, node, options.TargetVersion)
+}
+
+func (suite *BaseSuite) rollbackNode(client *talosclient.Client, node provision.NodeInfo, options upgradeOptions) {
+	suite.T().Logf("rolling back node %s", node.IPs[0])
+
+	ctx, cancel := context.WithCancel(suite.ctx)
+	defer cancel()
+
+	nodeCtx := talosclient.WithNode(ctx, node.IPs[0].String())
+
+	suite.rollbackNodeLegacy(nodeCtx, client)
+	suite.waitForUpgrade(nodeCtx, client, node, options.SourceVersion)
 }
 
 // tryUpgradeViaLifecycleService attempts to upgrade via the new streaming
@@ -367,8 +384,12 @@ func (suite *BaseSuite) tryUpgradeViaLifecycleService(
 	suite.T().Logf("pre-pulling installer image %q on node %s", options.TargetInstallerImage, node.IPs[0])
 
 	containerdInstance := &common.ContainerdInstance{
-		Driver:    common.ContainerDriver_CONTAINERD,
+		Driver:    common.ContainerDriver_CRI,
 		Namespace: common.ContainerdNamespace_NS_SYSTEM,
+	}
+
+	if options.UpgradeUseInmemoryContainerd {
+		containerdInstance.Driver = common.ContainerDriver_CONTAINERD
 	}
 
 	nodes := []string{node.IPs[0].String()}
@@ -580,8 +601,6 @@ func (suite *BaseSuite) upgradeViaLifecycleService(
 
 // upgradeNodeLegacy performs an upgrade using the legacy (deprecated) MachineService.Upgrade
 // unary API, which handles image pull, install, and reboot in a single call.
-//
-//nolint:gocyclo
 func (suite *BaseSuite) upgradeNodeLegacy(
 	nodeCtx context.Context,
 	c *talosclient.Client,
@@ -597,7 +616,7 @@ func (suite *BaseSuite) upgradeNodeLegacy(
 			resp, err = c.Upgrade( //nolint:staticcheck // using deprecated API for testing backward compatibility
 				nodeCtx,
 				options.TargetInstallerImage,
-				options.UpgradeStage,
+				false,
 				false,
 			)
 			if err != nil {
@@ -621,10 +640,57 @@ func (suite *BaseSuite) upgradeNodeLegacy(
 
 	actorID := resp.Messages[0].ActorId
 
+	suite.waitForSequencerReboot(nodeCtx, c, actorID, "upgrade")
+}
+
+// rollbackNodeLegacy performs a rollback using legacy API
+//
+// Note: we don't have new API yet, but we should have eventually.
+func (suite *BaseSuite) rollbackNodeLegacy(
+	nodeCtx context.Context,
+	c *talosclient.Client,
+) {
+	err := c.Rollback(nodeCtx)
+	suite.Require().NoError(err)
+
+	suite.waitForSequencerReboot(nodeCtx, c, "", "rollback")
+}
+
+// rebootNode performs a reboot using legacy API
+//
+//nolint:gocyclo
+func (suite *BaseSuite) rebootNode(
+	nodeCtx context.Context,
+	c *talosclient.Client,
+	rebootModes []talosclient.RebootMode,
+) {
+	resp, err := c.RebootWithResponse(nodeCtx, rebootModes...)
+	suite.Require().NoError(err)
+
+	actorID := resp.GetMessages()[0].GetActorId()
+
+	suite.waitForSequencerReboot(nodeCtx, c, actorID, "reboot")
+}
+
+//nolint:gocyclo
+func (suite *BaseSuite) waitForSequencerReboot(
+	nodeCtx context.Context,
+	c *talosclient.Client,
+	actorID string,
+	actionName string,
+) {
 	eventCh := make(chan talosclient.EventResult)
 
+	eventOpts := []talosclient.EventsOptionFunc{
+		talosclient.WithTailEvents(-1),
+	}
+
+	if actorID != "" {
+		eventOpts = append(eventOpts, talosclient.WithActorID(actorID))
+	}
+
 	// watch for events
-	suite.Require().NoError(c.EventsWatchV2(nodeCtx, eventCh, talosclient.WithActorID(actorID), talosclient.WithTailEvents(-1)))
+	suite.Require().NoError(c.EventsWatchV2(nodeCtx, eventCh, eventOpts...))
 
 	waitTimer := time.NewTimer(5 * time.Minute)
 	defer waitTimer.Stop()
@@ -638,20 +704,20 @@ waitLoop:
 			switch msg := ev.Event.Payload.(type) {
 			case *machineapi.SequenceEvent:
 				if msg.Error != nil {
-					suite.FailNow("upgrade failed", "%s: %s", msg.Error.Message, msg.Error.Code)
+					suite.FailNow(actionName+" failed", "%s: %s", msg.Error.Message, msg.Error.Code)
 				}
 			case *machineapi.PhaseEvent:
-				if msg.Action == machineapi.PhaseEvent_START && msg.Phase == "kexec" {
+				if msg.Action == machineapi.PhaseEvent_START && (msg.Phase == "kexec" || msg.Phase == "stopEverything") {
 					// about to be rebooted
 					break waitLoop
 				}
 
 				if msg.Action == machineapi.PhaseEvent_STOP {
-					suite.T().Logf("upgrade phase %q finished", msg.Phase)
+					suite.T().Logf(actionName+" phase %q finished", msg.Phase)
 				}
 			}
 		case <-waitTimer.C:
-			suite.FailNow("timeout waiting for upgrade to finish")
+			suite.FailNow("timeout waiting for %s to finish", actionName)
 		case <-nodeCtx.Done():
 			suite.FailNow("context canceled")
 		}
@@ -665,7 +731,7 @@ func (suite *BaseSuite) waitForUpgrade(
 	nodeCtx context.Context,
 	c *talosclient.Client,
 	node provision.NodeInfo,
-	options upgradeOptions,
+	expectedVersion string,
 ) {
 	// wait for the apid to be shut down
 	time.Sleep(10 * time.Second)
@@ -684,12 +750,12 @@ func (suite *BaseSuite) waitForUpgrade(
 					return retry.ExpectedError(err)
 				}
 
-				if version != options.TargetVersion {
+				if version != expectedVersion {
 					// upgrade not finished yet
 					return retry.ExpectedErrorf(
 						"node %q version doesn't match expected: expected %q, got %q",
 						node.IPs[0].String(),
-						options.TargetVersion,
+						expectedVersion,
 						version,
 					)
 				}
@@ -737,13 +803,35 @@ func (suite *BaseSuite) upgradeKubernetes(fromVersion, toVersion string, skipKub
 	suite.Require().NoError(kubernetes.Upgrade(suite.ctx, suite.clusterAccess, options))
 }
 
+func (suite *BaseSuite) sendMonitorCommand(ctx context.Context, nodeName, command string) {
+	statePath, err := suite.Cluster.StatePath()
+	suite.Require().NoError(err)
+
+	socketPath := filepath.Join(statePath, nodeName+".monitor")
+
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+	suite.Require().NoError(err)
+
+	defer func() {
+		suite.Require().NoError(conn.Close())
+	}()
+
+	_, err = conn.Write([]byte(command + "\n"))
+	suite.Require().NoError(err)
+}
+
 type clusterOptions struct {
 	ClusterName string
 
 	ControlplaneNodes int
 	WorkerNodes       int
 
+	// InjectExtraKernelArgs injects kernel args via the systemd-stub, i.e. they only take effect on
+	// the UKI boot of an installed machine.
 	InjectExtraKernelArgs *procfs.Cmdline
+	// InjectBootKernelArgs injects kernel args directly on the kernel command line, i.e. they take
+	// effect on the initial (pre-install) boot as well.
+	InjectBootKernelArgs *procfs.Cmdline
 
 	SourceKernelPath     string
 	SourceInitramfsPath  string
@@ -753,12 +841,21 @@ type clusterOptions struct {
 	SourceVersion        string
 	SourceK8sVersion     string
 
+	// If set, sets the machine config version contract, otherwise
+	// version contract is derived from the SourceVersion.
+	VersionContract *config.VersionContract
+
 	WithEncryption          bool
 	WithTrustedBoot         bool
 	WithBios                bool
 	WithApplyConfig         bool
 	WithSkipInjectingConfig bool
 	WithSideroLink          bool
+
+	// ConfigPatchesControlPlane and ConfigPatchesWorker are applied on top of the generated config of
+	// the respective machine type.
+	ConfigPatchesControlPlane []configpatcher.Patch
+	ConfigPatchesWorker       []configpatcher.Patch
 }
 
 // setupCluster provisions source clusters and waits for health.
@@ -834,8 +931,12 @@ func (suite *BaseSuite) setupCluster(options clusterOptions) {
 
 	suite.controlPlaneEndpoint = suite.provisioner.GetExternalKubernetesControlPlaneEndpoint(request.Network, constants.DefaultControlPlanePort)
 
-	versionContract, err := config.ParseContractFromVersion(options.SourceVersion)
-	suite.Require().NoError(err)
+	versionContract := options.VersionContract
+
+	if versionContract == nil {
+		versionContract, err = config.ParseContractFromVersion(options.SourceVersion)
+		suite.Require().NoError(err)
+	}
 
 	genOptions, bundleOptions := suite.provisioner.GenOptions(request.Network, versionContract)
 
@@ -849,17 +950,6 @@ func (suite *BaseSuite) setupCluster(options clusterOptions) {
 	controlplaneEndpoints := make([]string, options.ControlplaneNodes)
 	for i := range controlplaneEndpoints {
 		controlplaneEndpoints[i] = ips[i].String()
-	}
-
-	if DefaultSettings.CustomCNIURL != "" {
-		genOptions = append(
-			genOptions, generate.WithClusterCNIConfig(
-				&v1alpha1.CNIConfig{
-					CNIName: constants.CustomCNI,
-					CNIUrls: []string{DefaultSettings.CustomCNIURL},
-				},
-			),
-		)
 	}
 
 	var extraPatches []configpatcher.Patch
@@ -996,6 +1086,8 @@ func (suite *BaseSuite) setupCluster(options clusterOptions) {
 					},
 				),
 				bundle.WithPatch(extraPatches),
+				bundle.WithPatchControlPlane(options.ConfigPatchesControlPlane),
+				bundle.WithPatchWorker(options.ConfigPatchesWorker),
 			},
 			bundleOptions...,
 		)...,
@@ -1018,6 +1110,7 @@ func (suite *BaseSuite) setupCluster(options clusterOptions) {
 					},
 				},
 				Config:              suite.configBundle.ControlPlane(),
+				ExtraKernelArgs:     options.InjectBootKernelArgs,
 				SDStubKernelArgs:    options.InjectExtraKernelArgs,
 				SkipInjectingConfig: options.WithSkipInjectingConfig,
 			},
@@ -1040,6 +1133,7 @@ func (suite *BaseSuite) setupCluster(options clusterOptions) {
 					},
 				},
 				Config:              suite.configBundle.Worker(),
+				ExtraKernelArgs:     options.InjectBootKernelArgs,
 				SDStubKernelArgs:    options.InjectExtraKernelArgs,
 				SkipInjectingConfig: options.WithSkipInjectingConfig,
 			},

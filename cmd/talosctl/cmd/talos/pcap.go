@@ -20,7 +20,6 @@ import (
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc/codes"
 
-	"github.com/siderolabs/talos/cmd/talosctl/pkg/talos/helpers"
 	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 )
@@ -65,58 +64,64 @@ e.g. by excluding packets with the port 50000.
    `,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return WithClient(cmd.Context(), func(ctx context.Context, c *client.Client) error {
-			if err := helpers.FailIfMultiNodes(ctx, "pcap"); err != nil {
-				return err
-			}
+		ctx := cmd.Context()
 
-			if pcapCmdFlags.duration > 0 {
-				var cancel context.CancelFunc
-
-				ctx, cancel = context.WithTimeout(ctx, pcapCmdFlags.duration)
-				defer cancel()
-			}
-
-			req := machine.PacketCaptureRequest{
-				Interface:   pcapCmdFlags.iface,
-				Promiscuous: pcapCmdFlags.promisc,
-			}
-
-			var err error
-
-			req.BpfFilter, err = parseBPFInstructions(pcapCmdFlags.bpfFilter)
-			if err != nil {
-				return err
-			}
-
-			r, err := c.PacketCapture(ctx, &req)
-			if err != nil {
-				return fmt.Errorf("error copying: %w", err)
-			}
-
-			if pcapCmdFlags.output == "" {
-				return dumpPackets(ctx, r)
-			}
-
-			var out io.Writer
-
-			if pcapCmdFlags.output == "-" {
-				out = os.Stdout
-			} else {
-				out, err = os.Create(pcapCmdFlags.output)
-				if err != nil {
-					return err
-				}
-			}
-
-			_, err = io.Copy(out, r)
-
-			if errors.Is(err, io.EOF) || client.StatusCode(err) == codes.DeadlineExceeded {
-				err = nil
-			}
-
+		clientFactory, err := NewClientFactory(ctx, &pcapCmdFlags)
+		if err != nil {
 			return err
-		})
+		}
+
+		defer clientFactory.Close() //nolint:errcheck
+
+		ctx, c, _, err := clientFactory.BuildClientEnforceSingleNode(ctx, "pcap")
+		if err != nil {
+			return err
+		}
+
+		if pcapCmdFlags.duration > 0 {
+			var cancel context.CancelFunc
+
+			ctx, cancel = context.WithTimeout(ctx, pcapCmdFlags.duration)
+			defer cancel()
+		}
+
+		req := machine.PacketCaptureRequest{
+			Interface:   pcapCmdFlags.iface,
+			Promiscuous: pcapCmdFlags.promisc,
+		}
+
+		req.BpfFilter, err = parseBPFInstructions(pcapCmdFlags.bpfFilter)
+		if err != nil {
+			return err
+		}
+
+		r, err := c.PacketCapture(ctx, &req)
+		if err != nil {
+			return fmt.Errorf("error copying: %w", err)
+		}
+
+		if pcapCmdFlags.output == "" {
+			return dumpPackets(ctx, r)
+		}
+
+		var out io.Writer
+
+		if pcapCmdFlags.output == "-" {
+			out = os.Stdout
+		} else {
+			out, err = os.Create(pcapCmdFlags.output)
+			if err != nil {
+				return err
+			}
+		}
+
+		_, err = io.Copy(out, r)
+
+		if errors.Is(err, io.EOF) || client.StatusCode(err) == codes.DeadlineExceeded {
+			err = nil
+		}
+
+		return err
 	},
 }
 

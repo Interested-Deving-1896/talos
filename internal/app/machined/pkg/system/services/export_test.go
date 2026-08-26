@@ -4,7 +4,18 @@
 
 package services
 
-import "github.com/containerd/containerd/v2/pkg/oci"
+import (
+	"context"
+
+	"github.com/containerd/containerd/v2/pkg/oci"
+	"github.com/cosi-project/runtime/pkg/state"
+	"github.com/siderolabs/gen/xslices"
+)
+
+// CreateOverlayMountRequests exposes createOverlayMountRequests for tests.
+func CreateOverlayMountRequests(ctx context.Context, st state.State) error {
+	return createOverlayMountRequests(ctx, st)
+}
 
 // GetOCIOptions gets all OCI options from an Extension.
 func (svc *Extension) GetOCIOptions() ([]oci.SpecOpts, error) {
@@ -14,4 +25,9 @@ func (svc *Extension) GetOCIOptions() ([]oci.SpecOpts, error) {
 	}
 
 	return svc.getOCIOptions(envVars, svc.Spec.Container.Mounts), nil
+}
+
+// PromotionEndpoints exposes promotionEndpoints for tests.
+func PromotionEndpoints(selfEndpoints, votingMemberEndpoints, discoveredEndpoints []string) []string {
+	return promotionEndpoints(xslices.ToSetFunc(selfEndpoints, normalizeEtcdEndpoint), votingMemberEndpoints, discoveredEndpoints)
 }

@@ -57,6 +57,11 @@ func (ctrl *RenderConfigsStaticPodController) Inputs() []controller.Input {
 		},
 		{
 			Namespace: k8s.ControlPlaneNamespaceName,
+			Type:      k8s.AuthenticationConfigType,
+			Kind:      controller.InputWeak,
+		},
+		{
+			Namespace: k8s.ControlPlaneNamespaceName,
 			Type:      k8s.SchedulerConfigType,
 			ID:        optional.Some(k8s.FinalSchedulerConfigID),
 			Kind:      controller.InputWeak,
@@ -120,6 +125,12 @@ func (ctrl *RenderConfigsStaticPodController) Run(ctx context.Context, r control
 
 		kubeAPIServerVersion := compatibility.VersionFromImageRef(authorizerConfig.Image)
 
+		// authentication config is optional, so we don't return an error if it is not found
+		authenticationConfigRes, err := safe.ReaderGetByID[*k8s.AuthenticationConfig](ctx, r, k8s.AuthenticationConfigID)
+		if err != nil && !state.IsNotFoundError(err) {
+			return fmt.Errorf("error getting authentication config resource: %w", err)
+		}
+
 		kubeSchedulerRes, err := safe.ReaderGetByID[*k8s.SchedulerConfig](ctx, r, k8s.FinalSchedulerConfigID)
 		if err != nil {
 			if state.IsNotFoundError(err) {
@@ -134,6 +145,25 @@ func (ctrl *RenderConfigsStaticPodController) Run(ctx context.Context, r control
 		type configFile struct {
 			filename string
 			f        func() (runtime.Object, error)
+		}
+
+		apiServerConfigFiles := []configFile{
+			{
+				filename: "admission-control-config.yaml",
+				f:        admissionControlConfig(admissionConfig),
+			},
+			{
+				filename: "auditpolicy.yaml",
+				f:        auditPolicyConfig(auditConfig),
+			},
+			{
+				filename: "authorization-config.yaml",
+				f:        authorizationConfig(authorizerConfig, kubeAPIServerVersion),
+			},
+			{
+				filename: "authentication-config.yaml",
+				f:        authenticationConfig(authenticationConfigRes),
+			},
 		}
 
 		serializer := k8sjson.NewSerializerWithOptions(
@@ -159,20 +189,7 @@ func (ctrl *RenderConfigsStaticPodController) Run(ctx context.Context, r control
 				selinuxLabel: constants.KubernetesAPIServerConfigDirSELinuxLabel,
 				uid:          constants.KubernetesAPIServerRunUser,
 				gid:          constants.KubernetesAPIServerRunGroup,
-				configs: []configFile{
-					{
-						filename: "admission-control-config.yaml",
-						f:        admissionControlConfig(admissionConfig),
-					},
-					{
-						filename: "auditpolicy.yaml",
-						f:        auditPolicyConfig(auditConfig),
-					},
-					{
-						filename: "authorization-config.yaml",
-						f:        authorizationConfig(authorizerConfig, kubeAPIServerVersion),
-					},
-				},
+				configs:      apiServerConfigFiles,
 			},
 			{
 				name:         "kube-scheduler",
@@ -226,6 +243,10 @@ func (ctrl *RenderConfigsStaticPodController) Run(ctx context.Context, r control
 				auditRes.Metadata().Version().String() +
 				authorizerConfigRes.Metadata().Version().String() +
 				kubeSchedulerRes.Metadata().Version().String()
+
+			if authenticationConfigRes != nil {
+				r.TypedSpec().Version += authenticationConfigRes.Metadata().Version().String()
+			}
 
 			return nil
 		}); err != nil {
@@ -311,5 +332,19 @@ func authorizationConfig(spec *k8s.AuthorizationConfigSpec, kubeAPIServerVersion
 		}
 
 		return &cfg, nil
+	}
+}
+
+// authenticationConfig renders the kube-apiserver authentication configuration.
+//
+// It enables anonymous authentication only for the health endpoints, so unauthenticated probes can reach them
+// while every other endpoint keeps rejecting anonymous requests.
+func authenticationConfig(authenticationConfigRes *k8s.AuthenticationConfig) func() (runtime.Object, error) {
+	return func() (runtime.Object, error) {
+		if authenticationConfigRes == nil {
+			return &unstructured.Unstructured{Object: map[string]any{}}, nil
+		}
+
+		return &unstructured.Unstructured{Object: authenticationConfigRes.TypedSpec().Config}, nil
 	}
 }

@@ -17,6 +17,11 @@ message APIServiceConfigSpec {
   bool skip_verifying_client_cert = 4;
 }
 
+// BootIDSpec presents the kernel boot ID (contents of /proc/sys/kernel/random/boot_id).
+message BootIDSpec {
+  string boot_id = 1;
+}
+
 // BootedEntrySpec describes the booted entry resource properties.
 message BootedEntrySpec {
   string booted_entry = 1;
@@ -61,6 +66,13 @@ message ExtensionServiceConfigSpec {
 // ExtensionServiceConfigStatusSpec describes status of rendered extensions service config files.
 message ExtensionServiceConfigStatusSpec {
   string spec_version = 1;
+}
+
+// ImageFactorySchematicSpec describes Image Factory schematic information.
+message ImageFactorySchematicSpec {
+  string schematic_id = 1;
+  string flavor = 2;
+  string apiurl = 3;
 }
 
 // KernelCmdlineSpec presents kernel command line (contents of /proc/cmdline).
@@ -109,7 +121,10 @@ message KmsgLogConfigSpec {
 }
 
 // LoadedKernelModuleSpec describes loaded Linux kernel modules.
+//
+// Deprecated: use KernelModuleStatus instead.
 message LoadedKernelModuleSpec {
+  option deprecated = true;
   int64 size = 1;
   int64 reference_count = 2;
   repeated string dependencies = 3;
@@ -204,6 +219,13 @@ message ServicePIDSpec {
   int32 pid = 1;
   // MountNamespace is the mount namespace of the service.
   string mount_namespace = 2;
+}
+
+// UnattendedInstallStatusSpec describes the unattended install status.
+message UnattendedInstallStatusSpec {
+  string image = 1;
+  talos.resource.definitions.enums.RuntimeUnattendedInstallPhase phase = 2;
+  string error = 3;
 }
 
 // UniqueMachineTokenSpec is the spec for the machine unique token. Token can be empty if machine wasn't assigned any.
