@@ -45,7 +45,18 @@ var LoaderConfBytes []byte
 
 // Config describe sd-boot state.
 type Config struct {
-	Default  string
+	// BootedEntry is the UKI the system is running from right now.
+	//
+	// This is what the installer needs on upgrade, to keep the running generation around as a
+	// fallback.
+	BootedEntry string
+	// NextBootEntry is the UKI sd-boot picks on the next boot, i.e. LoaderEntryDefault.
+	//
+	// This is what kexec needs to load, as kexec replaces a firmware boot which would have been
+	// handled by sd-boot, and what reverting moves the default away from, as reverting should
+	// change the entry which boots next.
+	NextBootEntry string
+	// Fallback is the previous entry kept around by an upgrade.
 	Fallback string
 }
 
@@ -73,6 +84,10 @@ func New() *Config {
 
 // ProbeWithCallback probes the sd-boot bootloader, and calls the callback function with the Config.
 // this is called when we upgrade, do KexecLoad, or for reverting the bootloader.
+//
+// The Config carries both the entry the system is running from (Config.BootedEntry) and the entry
+// which boots next (Config.NextBootEntry): those differ e.g. right after the installer updated
+// LoaderEntryDefault, or when an operator selected a non-default entry in the sd-boot menu.
 //
 //nolint:gocyclo
 func ProbeWithCallback(disk string, options options.ProbeOptions, callback func(*Config) error) (*Config, error) {
@@ -119,10 +134,8 @@ func ProbeWithCallback(disk string, options options.ProbeOptions, callback func(
 
 			options.Logf("sd-boot: found UKI files: %v", xslices.Map(ukiFiles, filepath.Base))
 
-			// If we booted of UKI/Kernel+Initramfs/ISO Talos installer will always be run which
-			// sets the `LoaderEntryDefault` to the UKI file name, so either for reboot with Kexec or upgrade
-			// we will always have the UKI file name in the `LoaderEntryDefault`
-			// and we can use it to determine the default entry.
+			// LoaderEntryDefault is the persistent sd-boot default. It is not necessarily the
+			// entry running now, because an operator can select a different entry at boot.
 			loaderEntryDefault, err := ReadVariable(LoaderEntryDefaultName)
 			if err != nil {
 				return err
@@ -130,10 +143,8 @@ func ProbeWithCallback(disk string, options options.ProbeOptions, callback func(
 
 			options.Logf("sd-boot: LoaderEntryDefault: %s", loaderEntryDefault)
 
-			// If we booted of a Disk image, only `LoaderEntrySelected` will be set until we do an upgrade
-			// which will set the `LoaderEntryDefault` to the UKI file name.
-			// So for reboot with Kexec we will have to read the `LoaderEntrySelected`
-			// upgrades will always have `LoaderEntryDefault` set to the UKI file name.
+			// LoaderEntrySelected is the entry selected by sd-boot for this boot. It can be
+			// stale after kexec, where sd-boot did not participate in the current boot.
 			loaderEntrySelected, err := ReadVariable(LoaderEntrySelectedName)
 			if err != nil {
 				return err
@@ -141,31 +152,44 @@ func ProbeWithCallback(disk string, options options.ProbeOptions, callback func(
 
 			options.Logf("sd-boot: LoaderEntrySelected: %s", loaderEntrySelected)
 
+			loaderEntryOneShot, err := ReadVariable(LoaderEntryOneShotName)
+			if err != nil {
+				return err
+			}
+
+			options.Logf("sd-boot: LoaderEntryOneShot: %s", loaderEntryOneShot)
+
+			loaderEntryRebootReason, err := ReadVariable(LoaderEntryRebootReasonName)
+			if err != nil {
+				return err
+			}
+
+			options.Logf("sd-boot: LoaderEntryRebootReason: %s", loaderEntryRebootReason)
+
 			if loaderEntrySelected == "" && loaderEntryDefault == "" {
 				return errors.New("sd-boot: no LoaderEntryDefault or LoaderEntrySelected found, cannot continue")
 			}
 
-			var (
-				bootEntry   string
-				bootEntryOk bool
+			bootedEntry, bootedEntryOk := findBootedUKIFile(
+				ukiFiles,
+				loaderEntryDefault,
+				loaderEntrySelected,
+				loaderEntryOneShot,
+				loaderEntryRebootReason,
 			)
 
-			// first try to find the default entry, then the selected one
-			bootEntry, bootEntryOk = findMatchingUKIFile(ukiFiles, loaderEntryDefault)
-			if !bootEntryOk {
-				bootEntry, bootEntryOk = findMatchingUKIFile(ukiFiles, loaderEntrySelected)
-				if !bootEntryOk {
-					return errors.New("sd-boot: no valid boot entry found matching LoaderEntryDefault or LoaderEntrySelected")
-				}
-			}
+			nextBootEntry, nextBootEntryOk := findNextBootUKIFile(ukiFiles, loaderEntryDefault, loaderEntrySelected)
 
-			options.Logf("sd-boot: found boot entry: %s", bootEntry)
+			if !bootedEntryOk || !nextBootEntryOk {
+				return errors.New("sd-boot: no valid boot entry found matching LoaderEntrySelected or LoaderEntryDefault")
+			}
 
 			sdbootConf = &Config{
-				Default: bootEntry,
+				BootedEntry:   bootedEntry,
+				NextBootEntry: nextBootEntry,
 			}
 
-			options.Logf("sd-boot: using %s as default entry", sdbootConf.Default)
+			options.Logf("sd-boot: booted entry: %s, next boot entry: %s", sdbootConf.BootedEntry, sdbootConf.NextBootEntry)
 
 			if callback != nil {
 				return callback(sdbootConf)
@@ -203,7 +227,9 @@ func (c *Config) KexecLoad(r runtime.Runtime, disk string) error {
 	_, err := ProbeWithCallback(disk, options.ProbeOptions{}, func(conf *Config) error {
 		var kernelFd int
 
-		assetInfo, err := uki.Extract(filepath.Join(constants.EFIMountPoint, "EFI", "Linux", conf.Default))
+		// kexec replaces the next firmware boot, so load the entry sd-boot would have booted,
+		// and not the one which is running right now.
+		assetInfo, err := uki.Extract(filepath.Join(constants.EFIMountPoint, "EFI", "Linux", conf.NextBootEntry))
 		if err != nil {
 			return fmt.Errorf("failed to extract kernel and initrd from uki: %w", err)
 		}
@@ -274,53 +300,109 @@ func (c *Config) KexecLoad(r runtime.Runtime, disk string) error {
 	return err
 }
 
-// GenerateAssets generates the sd-boot bootloader assets and returns the partition options with source directory set.
-func (c *Config) GenerateAssets(opts options.InstallOptions) ([]partition.Options, error) {
-	ukiFileName, err := generateNextUKIName(opts.Version, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := c.generateAssets(opts, ukiFileName); err != nil {
-		return nil, err
-	}
-
+// PrepareBootPartitions prepares the set of partitions to create for the bootloader.
+//
+// In image mode, this also pre-populates the assets to be written to the bootloader partitions
+// when formatting the filesystem.
+// In install mode, this only returns a list of partitions to create, and the assets are written to the partitions during Install.
+func (c *Config) PrepareBootPartitions(opts options.InstallOptions) ([]partition.Options, error) {
 	quirk := quirks.New(opts.Version)
+
+	formatOptions := []partition.FormatOption{
+		partition.WithLabel(constants.EFIPartitionLabel),
+	}
+
+	if opts.ImageMode {
+		formatOptions = append(formatOptions, partition.WithSourceDirectory(filepath.Join(opts.MountPrefix, "EFI")))
+	}
 
 	partitionOptions := []partition.Options{
 		partition.NewPartitionOptions(
 			true,
 			quirk,
-			partition.WithLabel(constants.EFIPartitionLabel),
-			partition.WithSourceDirectory(filepath.Join(opts.MountPrefix, "EFI")),
+			formatOptions...,
 		),
 	}
 
-	if opts.ImageMode {
-		partitionOptions = xslices.Map(partitionOptions, func(o partition.Options) partition.Options {
-			o.Reproducible = true
-
-			return o
-		})
+	if !opts.ImageMode {
+		// in non-image mode, the actual asset copying will happen in the Install step
+		return partitionOptions, nil
 	}
+
+	// in image mode, we populate the directory with the bootloader assets
+	ukiFileName, err := generateNextUKIName(opts.Version, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := c.copyAssets(opts, ukiFileName); err != nil {
+		return nil, err
+	}
+
+	// move the files out of constants.EFIMountPoint into the "EFI" directory to prevent it being pulled into the GRUB /boot partition in dual-boot mode
+	if err := os.Rename(filepath.Join(opts.MountPrefix, constants.EFIMountPoint), filepath.Join(opts.MountPrefix, "EFI")); err != nil {
+		return nil, fmt.Errorf("failed to move EFI directory: %w", err)
+	}
+
+	partitionOptions = xslices.Map(partitionOptions, func(o partition.Options) partition.Options {
+		o.Reproducible = true
+
+		return o
+	})
 
 	return partitionOptions, nil
 }
 
 // Install the bootloader.
-// here we don't need to mount anything since we just need to write the EFI variables
-// since the partitions are already pre-populated.
+//
+// This method only runs in non-image mode, so mount the EFI partition, copy the UKI and sd-boot.efi, and update the EFI variables.
 func (c *Config) Install(opts options.InstallOptions) (*options.InstallResult, error) {
 	ukiFileName, err := generateNextUKIName(opts.Version, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	return c.setup(opts, ukiFileName)
+	var installResult *options.InstallResult
+
+	err = mount.PartitionOp(
+		opts.BootDisk,
+		[]mount.Spec{
+			{
+				PartitionLabel: constants.EFIPartitionLabel,
+				FilesystemType: partition.FilesystemTypeVFAT,
+				MountTarget:    filepath.Join(opts.MountPrefix, constants.EFIMountPoint),
+			},
+		},
+		func() error {
+			if err := c.copyAssets(opts, ukiFileName); err != nil {
+				return err
+			}
+
+			var err error
+
+			installResult, err = c.setup(opts, ukiFileName)
+			if err != nil {
+				return err
+			}
+
+			return nil
+		},
+		[]blkid.ProbeOption{
+			// installation happens with locked blockdevice
+			blkid.WithSkipLocking(true),
+		},
+		nil,
+		nil,
+		opts.BlkidInfo,
+	)
+
+	return installResult, err
 }
 
 // Upgrade the bootloader.
 // On upgrade we mount the EFI partition, cleanup old UKIs, copy the new UKI and sd-boot.efi, and update the EFI variables.
+//
+//nolint:gocyclo
 func (c *Config) Upgrade(opts options.InstallOptions) (*options.InstallResult, error) {
 	var installResult *options.InstallResult
 
@@ -347,11 +429,23 @@ func (c *Config) Upgrade(opts options.InstallOptions) (*options.InstallResult, e
 				return fmt.Errorf("failed to generate next UKI name: %w", err)
 			}
 
+			// the cleanup below might remove the UKI LoaderEntryDefault points to (when the entry which
+			// boots next is not the one we are running from), so repoint the default to the booted entry
+			// first: if the upgrade is interrupted before setup() rewrites it, the next boot still lands
+			// on a UKI which exists.
+			if !strings.EqualFold(c.NextBootEntry, c.BootedEntry) {
+				opts.Printf("sd-boot: pointing the default entry to the booted one for the duration of the upgrade: %s", c.BootedEntry)
+
+				if err = WriteVariable(LoaderEntryDefaultName, c.BootedEntry); err != nil {
+					return err
+				}
+			}
+
 			for _, file := range files {
-				if strings.EqualFold(filepath.Base(file), c.Default) {
-					if !strings.EqualFold(c.Default, ukiPath) {
-						// set fallback to the current default unless it matches the new install
-						c.Fallback = c.Default
+				if strings.EqualFold(filepath.Base(file), c.BootedEntry) {
+					if !strings.EqualFold(c.BootedEntry, ukiPath) {
+						// set fallback to the entry we are running from unless it matches the new install
+						c.Fallback = c.BootedEntry
 					}
 
 					continue
@@ -364,7 +458,7 @@ func (c *Config) Upgrade(opts options.InstallOptions) (*options.InstallResult, e
 				}
 			}
 
-			if err := c.generateAssets(opts, ukiPath); err != nil {
+			if err := c.copyAssets(opts, ukiPath); err != nil {
 				return err
 			}
 
@@ -438,7 +532,7 @@ func (c *Config) setup(opts options.InstallOptions, ukiFileName string) (*option
 	}, nil
 }
 
-func (c *Config) generateAssets(opts options.InstallOptions, ukiFileName string) error {
+func (c *Config) copyAssets(opts options.InstallOptions, ukiFileName string) error {
 	loaderDir := filepath.Join(opts.MountPrefix, constants.EFIMountPoint, "loader")
 
 	if err := os.MkdirAll(loaderDir, 0o755); err != nil {
@@ -562,7 +656,8 @@ func (c *Config) revert() error {
 	}
 
 	for _, file := range files {
-		if strings.EqualFold(filepath.Base(file), c.Default) {
+		// skip the entry which boots next, as the whole point of the revert is to boot something else
+		if strings.EqualFold(filepath.Base(file), c.NextBootEntry) {
 			continue
 		}
 
@@ -582,4 +677,37 @@ func findMatchingUKIFile(ukiFiles []string, entry string) (string, bool) {
 	}
 
 	return "", false
+}
+
+// findBootedUKIFile returns the UKI the system is running from.
+func findBootedUKIFile(ukiFiles []string, defaultEntry, selectedEntry, oneShotEntry, rebootReason string) (string, bool) {
+	// A kexec reboot bypasses sd-boot, so LoaderEntrySelected can describe an older
+	// boot. In that case the installer-updated default is the running entry.
+	if rebootReason == "reboot" && oneShotEntry == "kexec reboot" {
+		if entry, ok := findMatchingUKIFile(ukiFiles, defaultEntry); ok {
+			return entry, true
+		}
+
+		return findMatchingUKIFile(ukiFiles, selectedEntry)
+	}
+
+	// For a firmware boot, LoaderEntrySelected is the entry actually running and
+	// may intentionally differ from the persistent default after manual selection.
+	if entry, ok := findMatchingUKIFile(ukiFiles, selectedEntry); ok {
+		return entry, true
+	}
+
+	return findMatchingUKIFile(ukiFiles, defaultEntry)
+}
+
+// findNextBootUKIFile returns the UKI sd-boot boots next, which is the persistent default.
+//
+// LoaderEntrySelected is only a fallback for a system which never ran the installer (e.g. booted
+// off a disk image), as there LoaderEntryDefault is not set yet.
+func findNextBootUKIFile(ukiFiles []string, defaultEntry, selectedEntry string) (string, bool) {
+	if entry, ok := findMatchingUKIFile(ukiFiles, defaultEntry); ok {
+		return entry, true
+	}
+
+	return findMatchingUKIFile(ukiFiles, selectedEntry)
 }

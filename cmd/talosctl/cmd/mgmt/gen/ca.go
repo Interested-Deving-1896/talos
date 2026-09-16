@@ -2,18 +2,18 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-// Package gen implements the genration of various artifacts.
+// Package gen implements the generation of various artifacts.
 package gen
 
 import (
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/siderolabs/crypto/x509"
 	"github.com/spf13/cobra"
 
 	"github.com/siderolabs/talos/pkg/cli"
+	"github.com/siderolabs/talos/pkg/machinery/fileutils"
 )
 
 var genCACmdFlags struct {
@@ -49,15 +49,15 @@ var genCACmd = &cobra.Command{
 			return err
 		}
 
-		if err := os.WriteFile(caCertFile, ca.CrtPEM, 0o600); err != nil {
+		if err := fileutils.WriteSecret(caCertFile, ca.CrtPEM); err != nil {
 			return fmt.Errorf("error writing CA certificate: %w", err)
 		}
 
-		if err := os.WriteFile(caHashFile, []byte(x509.Hash(ca.Crt)), 0o600); err != nil {
+		if err := fileutils.WriteSecret(caHashFile, []byte(x509.Hash(ca.Crt))); err != nil {
 			return fmt.Errorf("error writing certificate hash: %w", err)
 		}
 
-		if err := os.WriteFile(caKeyFile, ca.KeyPEM, 0o600); err != nil {
+		if err := fileutils.WriteSecret(caKeyFile, ca.KeyPEM); err != nil {
 			return fmt.Errorf("error writing key: %w", err)
 		}
 

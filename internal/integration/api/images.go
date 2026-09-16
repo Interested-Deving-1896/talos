@@ -150,12 +150,7 @@ func (suite *ImagesSuite) TestImportRemove() {
 	suite.T().Logf("using node %s", node)
 
 	// we can only import the image if it matches Talos architecture
-	versionResp, err := suite.Client.Version(ctx)
-	suite.Require().NoError(err)
-	suite.Require().Len(versionResp.GetMessages(), 1)
-
-	arch := versionResp.GetMessages()[0].GetVersion().GetArch()
-	if arch != "amd64" {
+	if arch := suite.ReadMachineArch(ctx); arch != "amd64" {
 		suite.T().Skipf("skipping import test on unsupported architecture %q", arch)
 	}
 
@@ -257,6 +252,12 @@ func (suite *ImagesSuite) TestVerify() {
 			RuleImagePattern: "localhost:4444/*",
 			RuleDeny:         new(true),
 		},
+		{
+			// a pattern written against the Docker Hub host the way the configuration
+			// reference shows it
+			RuleImagePattern: "docker.io/library/busybox*",
+			RuleDeny:         new(true),
+		},
 	}
 
 	suite.PatchMachineConfig(ctx, imageVerificationConfig)
@@ -264,7 +265,7 @@ func (suite *ImagesSuite) TestVerify() {
 	// wait for the configuration to be applied
 	rtestutils.AssertResources(
 		ctx, suite.T(), suite.Client.COSI,
-		[]resource.ID{"0000", "0001", "0002"},
+		[]resource.ID{"0000", "0001", "0002", "0003"},
 		func(rule *securityres.ImageVerificationRule, asrt *assert.Assertions) {
 			switch rule.Metadata().ID() {
 			case "0000":
@@ -273,6 +274,8 @@ func (suite *ImagesSuite) TestVerify() {
 				asrt.Equal("registry.k8s.io/*", rule.TypedSpec().ImagePattern)
 			case "0002":
 				asrt.Equal("localhost:4444/*", rule.TypedSpec().ImagePattern)
+			case "0003":
+				asrt.Equal("docker.io/library/busybox*", rule.TypedSpec().ImagePattern)
 			}
 		},
 	)
@@ -304,6 +307,21 @@ func (suite *ImagesSuite) TestVerify() {
 	suite.Require().Error(err)
 	suite.Assert().Equal(codes.PermissionDenied, status.Code(err), "expected image verification to be denied according to our config")
 	suite.Assert().Equal("verification denied by matched rule (0002)", status.Convert(err).Message())
+
+	// the reference is normalized before it is matched, so neither a different spelling of the
+	// registry domain nor a different spelling of the Docker Hub repository evades a deny rule
+	for _, deniedRef := range []string{
+		"LOCALHOST:4444/myimage:latest",
+		"docker.io/library/busybox:1.36",
+		"index.docker.io/library/busybox:1.36",
+		"busybox:1.36",
+	} {
+		_, err = suite.Client.ImageClient.Verify(ctx, &machine.ImageServiceVerifyRequest{
+			ImageRef: deniedRef,
+		})
+		suite.Require().Error(err, "expected %q to be denied", deniedRef)
+		suite.Assert().Equal(codes.PermissionDenied, status.Code(err), "expected %q to be denied according to our config", deniedRef)
+	}
 
 	// now test via the image pull flow
 	rcv, err := suite.Client.ImageClient.Pull(ctx, &machine.ImageServicePullRequest{

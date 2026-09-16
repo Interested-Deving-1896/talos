@@ -124,7 +124,7 @@ func (suite *AddressConfigSuite) TestMachineConfigurationLegacy() {
 				ConfigVersion: "v1alpha1",
 				MachineConfig: &v1alpha1.MachineConfig{
 					MachineNetwork: &v1alpha1.NetworkConfig{ //nolint:staticcheck // legacy config
-						NetworkInterfaces: []*v1alpha1.Device{
+						NetworkInterfaces: []*v1alpha1.Device{ //nolint:staticcheck // legacy config
 							{
 								DeviceInterface: "eth3",
 								DeviceCIDR:      "192.168.0.24/28",
@@ -168,7 +168,7 @@ func (suite *AddressConfigSuite) TestMachineConfigurationLegacy() {
 					},
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
@@ -231,6 +231,32 @@ func (suite *AddressConfigSuite) TestMachineConfiguration() {
 			if r.Metadata().ID() == "configuration/enp0s3/172.20.0.1/20" {
 				asrt.Equal(uint32(100), r.TypedSpec().Priority)
 			}
+		},
+		rtestutils.WithNamespace(network.ConfigNamespaceName),
+	)
+}
+
+func (suite *AddressConfigSuite) TestVethMachineConfiguration() {
+	suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.AddressConfigController{}))
+
+	veth := networkcfg.NewVethConfigV1Alpha1("veth-metallb", "veth-router")
+	veth.LinkAddresses = []networkcfg.AddressConfig{{AddressAddress: netip.MustParsePrefix("fda1::1/127")}}
+	veth.VethPeer.LinkAddresses = []networkcfg.AddressConfig{{AddressAddress: netip.MustParsePrefix("fda1::/127")}}
+
+	ctr, err := container.New(veth)
+	suite.Require().NoError(err)
+
+	suite.Create(config.NewMachineConfig(ctr))
+
+	ctest.AssertResources(
+		suite,
+		[]string{
+			"configuration/veth-metallb/fda1::1/127",
+			"configuration/veth-router/fda1::/127",
+		},
+		func(r *network.AddressSpec, asrt *assert.Assertions) {
+			asrt.Equal(network.ConfigMachineConfiguration, r.TypedSpec().ConfigLayer)
+			asrt.Contains([]string{"veth-metallb", "veth-router"}, r.TypedSpec().LinkName)
 		},
 		rtestutils.WithNamespace(network.ConfigNamespaceName),
 	)

@@ -20,24 +20,24 @@ func TestFilterMessages(t *testing.T) {
 	reply := &common.DataResponse{
 		Messages: []*common.Data{
 			{
-				Metadata: &common.Metadata{
-					Hostname: "host1",
+				Metadata: &common.Metadata{ //nolint:staticcheck // testing legacy behavior
+					Hostname: "host1", //nolint:staticcheck // testing legacy behavior
 				},
 				Bytes: []byte("abc"),
 			},
 			{
-				Metadata: &common.Metadata{
-					Hostname: "host2",
-					Error:    "something wrong",
+				Metadata: &common.Metadata{ //nolint:staticcheck // testing legacy behavior
+					Hostname: "host2",           //nolint:staticcheck // testing legacy behavior
+					Error:    "something wrong", //nolint:staticcheck // testing legacy behavior
 				},
 			},
 			{
 				Bytes: []byte("def"),
 			},
 			{
-				Metadata: &common.Metadata{
-					Hostname: "host4",
-					Error:    "even more wrong",
+				Metadata: &common.Metadata{ //nolint:staticcheck // testing legacy behavior
+					Hostname: "host4",           //nolint:staticcheck // testing legacy behavior
+					Error:    "even more wrong", //nolint:staticcheck // testing legacy behavior
 				},
 			},
 		},
@@ -49,8 +49,8 @@ func TestFilterMessages(t *testing.T) {
 		&common.DataResponse{
 			Messages: []*common.Data{
 				{
-					Metadata: &common.Metadata{
-						Hostname: "host1",
+					Metadata: &common.Metadata{ //nolint:staticcheck // testing legacy behavior
+						Hostname: "host1", //nolint:staticcheck // testing legacy behavior
 					},
 					Bytes: []byte("abc"),
 				},
@@ -73,15 +73,15 @@ func TestFilterMessagesOnlyErrors(t *testing.T) {
 	reply := &common.DataResponse{
 		Messages: []*common.Data{
 			{
-				Metadata: &common.Metadata{
-					Hostname: "host2",
-					Error:    "something wrong",
+				Metadata: &common.Metadata{ //nolint:staticcheck // testing legacy behavior
+					Hostname: "host2",           //nolint:staticcheck // testing legacy behavior
+					Error:    "something wrong", //nolint:staticcheck // testing legacy behavior
 				},
 			},
 			{
-				Metadata: &common.Metadata{
-					Hostname: "host4",
-					Error:    "even more wrong",
+				Metadata: &common.Metadata{ //nolint:staticcheck // testing legacy behavior
+					Hostname: "host4",           //nolint:staticcheck // testing legacy behavior
+					Error:    "even more wrong", //nolint:staticcheck // testing legacy behavior
 				},
 			},
 		},
@@ -96,20 +96,20 @@ func TestFilterMessagesGRPCStatus(t *testing.T) {
 	reply := &common.DataResponse{
 		Messages: []*common.Data{
 			{
-				Metadata: &common.Metadata{
-					Hostname: "host2",
-					Error:    "should be ignored",
-					Status: &status.Status{
+				Metadata: &common.Metadata{ //nolint:staticcheck // testing legacy behavior
+					Hostname: "host2",             //nolint:staticcheck // testing legacy behavior
+					Error:    "should be ignored", //nolint:staticcheck // testing legacy behavior
+					Status: &status.Status{ //nolint:staticcheck // testing legacy behavior
 						Code:    int32(codes.Aborted),
 						Message: "something aborted",
 					},
 				},
 			},
 			{
-				Metadata: &common.Metadata{
-					Hostname: "host4",
-					Error:    "should be ignored",
-					Status: &status.Status{
+				Metadata: &common.Metadata{ //nolint:staticcheck // testing legacy behavior
+					Hostname: "host4",             //nolint:staticcheck // testing legacy behavior
+					Error:    "should be ignored", //nolint:staticcheck // testing legacy behavior
+					Status: &status.Status{ //nolint:staticcheck // testing legacy behavior
 						Code:    int32(codes.Unknown),
 						Message: "something went wrong",
 					},

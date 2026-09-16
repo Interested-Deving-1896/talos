@@ -11,6 +11,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/cosi-project/runtime/pkg/state"
@@ -56,7 +57,7 @@ func NewClient(ctx context.Context, endpoints []string, dialOpts ...grpc.DialOpt
 		Endpoints:   endpoints,
 		DialTimeout: 5 * time.Second,
 		Context:     ctx,
-		DialOptions: append(dialOpts, grpc.WithSharedWriteBuffer(true)),
+		DialOptions: dialOpts,
 		TLS:         tlsConfig,
 		Logger:      zap.NewNop(),
 	})
@@ -88,6 +89,23 @@ func NewClientFromControlPlaneIPs(ctx context.Context, resources state.State, di
 	rand.Shuffle(len(endpoints), func(i, j int) { endpoints[i], endpoints[j] = endpoints[j], endpoints[i] })
 
 	return NewClient(ctx, endpoints, dialOpts...)
+}
+
+// PromoteMember promotes a learner member to a voting member.
+//
+// It is a fail-fast version of clientv3's MemberPromote: clientv3 hardcodes grpc.WaitForReady(true)
+// in its default call options (and provides no way to override it via clientv3.Config), which makes
+// a call against an endpoint which is not accepting connections block until the context deadline
+// instead of returning the connection error. As the promotion call has to find a voting member to
+// talk to, blocking on a dead endpoint is exactly the wrong behavior.
+func (c *Client) PromoteMember(ctx context.Context, memberID uint64) error {
+	_, err := clientv3.RetryClusterClient(c.Client).MemberPromote(
+		ctx,
+		&etcdserverpb.MemberPromoteRequest{ID: memberID},
+		grpc.WaitForReady(false),
+	)
+
+	return clientv3.ContextError(ctx, err)
 }
 
 // ValidateForUpgrade validates the etcd cluster state to ensure that performing
@@ -145,10 +163,14 @@ func validateMemberHealth(ctx context.Context, memberURIs []string) (err error) 
 		return fmt.Errorf("failed to create client to member: %w", err)
 	}
 
+	defer c.Close() //nolint:errcheck
+
 	return c.ValidateQuorum(ctx)
 }
 
 // LeaveCluster removes the current member from the etcd cluster and nukes etcd data directory.
+//
+// nolint:gocyclo
 func (c *Client) LeaveCluster(ctx context.Context, st state.State) error {
 	memberID, err := GetLocalMemberID(ctx, st)
 	if err != nil {
@@ -185,9 +207,24 @@ func (c *Client) LeaveCluster(ctx context.Context, st state.State) error {
 		return fmt.Errorf("failed to stop etcd: %w", err)
 	}
 
-	// Once the member is removed, the data is no longer valid.
-	if err := os.RemoveAll(constants.EtcdDataPath); err != nil {
-		return fmt.Errorf("failed to remove %s: %w", constants.EtcdDataPath, err)
+	// Once the member is removed, the data is no longer valid. Remove the *contents* of the etcd
+	// data directory rather than the directory itself: /var/lib/etcd may be a dedicated volume
+	// mount point (promotable system volume), and unlinking a mount point fails with EBUSY.
+	entries, err := os.ReadDir(constants.EtcdDataPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+
+		return fmt.Errorf("failed to read %s: %w", constants.EtcdDataPath, err)
+	}
+
+	for _, entry := range entries {
+		p := filepath.Join(constants.EtcdDataPath, entry.Name())
+
+		if err := os.RemoveAll(p); err != nil {
+			return fmt.Errorf("failed to remove %s: %w", p, err)
+		}
 	}
 
 	return nil

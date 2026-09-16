@@ -69,6 +69,14 @@ func (ctrl *LinkStatusController) Run(ctx context.Context, r controller.Runtime,
 				Type:      network.LinkSpecType,
 				Kind:      controller.InputStrong,
 			},
+			{
+				// link changes which the kernel doesn't announce over netlink:
+				// * Wireguard settings
+				// * link alias changes
+				Namespace: network.NamespaceName,
+				Type:      network.LinkRefreshType,
+				Kind:      controller.InputWeak,
+			},
 		},
 	); err != nil {
 		return err
@@ -229,6 +237,8 @@ func (ctrl *LinkStatusController) reconcile(
 		if err = safe.WriterModify(ctx, r, network.NewLinkStatus(network.NamespaceName, link.Attributes.Name), func(r *network.LinkStatus) error {
 			status := r.TypedSpec()
 
+			prevUp := status.LinkState
+
 			status.Alias = pointer.SafeDeref(link.Attributes.Alias)
 			status.AltNames = slices.Clone(link.Attributes.AltNames)
 			status.Index = link.Index
@@ -241,6 +251,8 @@ func (ctrl *LinkStatusController) reconcile(
 			status.QueueDisc = link.Attributes.QueueDisc
 
 			status.MTU = link.Attributes.MTU
+
+			status.Veth = network.VethSpec{}
 			if link.Attributes.Master != nil {
 				status.MasterIndex = *link.Attributes.Master
 			} else {
@@ -260,6 +272,10 @@ func (ctrl *LinkStatusController) reconcile(
 				status.LinkState = ethState.Link
 			} else {
 				status.LinkState = false
+			}
+
+			if prevUp != status.LinkState && status.Physical() {
+				logger.Info("link state changed", zap.String("link", link.Attributes.Name), zap.Bool("up", status.LinkState))
 			}
 
 			if ethInfo != nil {
@@ -327,11 +343,33 @@ func (ctrl *LinkStatusController) reconcile(
 			}
 
 			switch status.Kind {
+			case network.LinkKindVeth:
+				status.Veth.PeerName = vethPeerName(links, link)
 			case network.LinkKindVLAN:
 				if rawLinkData == nil {
 					logger.Warn("VLAN link data is nil", zap.String("link", link.Attributes.Name))
 				} else if err = networkadapter.VLANSpec(&status.VLAN).Decode(rawLinkData); err != nil {
 					logger.Warn("failure decoding VLAN attributes", zap.Error(err), zap.String("link", link.Attributes.Name))
+				}
+			case network.LinkKindMacVLAN:
+				if rawLinkData == nil {
+					logger.Warn("macvlan link data is nil", zap.String("link", link.Attributes.Name))
+				} else if err = networkadapter.MacVLANSpec(&status.MacVLAN).Decode(rawLinkData); err != nil {
+					logger.Warn("failure decoding macvlan attributes", zap.Error(err), zap.String("link", link.Attributes.Name))
+				}
+			case network.LinkKindVXLAN:
+				if rawLinkData == nil {
+					logger.Warn("vxlan link data is nil", zap.String("link", link.Attributes.Name))
+				} else {
+					// the kernel doesn't report the VXLAN parent via IFLA_LINK, so pick it up from the link
+					// info and report it as LinkIndex, the same way VLANs and macvlans do
+					var parentIndex uint32
+
+					if err = networkadapter.VXLANSpec(&status.VXLAN, &parentIndex).Decode(rawLinkData); err != nil {
+						logger.Warn("failure decoding vxlan attributes", zap.Error(err), zap.String("link", link.Attributes.Name))
+					} else if parentIndex != 0 {
+						status.LinkIndex = parentIndex
+					}
 				}
 			case network.LinkKindBond:
 				if rawLinkData == nil {
@@ -381,4 +419,20 @@ func (ctrl *LinkStatusController) reconcile(
 	}
 
 	return nil
+}
+
+func vethPeerName(links []rtnetlink.LinkMessage, current rtnetlink.LinkMessage) string {
+	for _, candidate := range links {
+		if candidate.Index != current.Attributes.Type {
+			continue
+		}
+
+		if candidate.Attributes.Info == nil || candidate.Attributes.Info.Kind != network.LinkKindVeth || candidate.Attributes.Type != current.Index {
+			return ""
+		}
+
+		return candidate.Attributes.Name
+	}
+
+	return ""
 }

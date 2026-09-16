@@ -8,7 +8,6 @@ package provision
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/cosi-project/runtime/pkg/resource/rtestutils"
 	"github.com/siderolabs/gen/xslices"
+	"github.com/siderolabs/go-procfs/procfs"
 	"github.com/stretchr/testify/assert"
 	"go.yaml.in/yaml/v4"
 	"google.golang.org/grpc/codes"
@@ -32,6 +32,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/cri"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/network"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/meta"
 	"github.com/siderolabs/talos/pkg/machinery/resources/block"
@@ -66,11 +67,25 @@ func (suite *MaintenanceSideroLinkSuite) TestAPI() {
 		DefaultSettings.CurrentVersion,
 	)
 
+	// A META value seeded via the kernel command line, the way the Image Factory does it for the
+	// images it builds with META customization: while the machine runs in maintenance mode the value
+	// is only kept in memory (the META partition doesn't exist yet), so it has to be persisted as
+	// part of the install performed via the LifecycleService.
+	const metaValueFromCmdline = "seeded-from-cmdline"
+
+	bootKernelArgs := procfs.NewCmdline("")
+	bootKernelArgs.Append(
+		constants.KernelParamEnvironment,
+		constants.MetaValuesEnvVar+"="+meta.Values{{Key: meta.UserReserved2, Value: metaValueFromCmdline}}.Encode(false),
+	)
+
 	suite.setupCluster(clusterOptions{
 		ClusterName: "maintenance-siderolink",
 
 		ControlplaneNodes: maintenanceControlplanes,
 		WorkerNodes:       maintenanceWorkers,
+
+		InjectBootKernelArgs: bootKernelArgs,
 
 		SourceKernelPath:     helpers.ArtifactPath(constants.KernelAssetWithArch),
 		SourceInitramfsPath:  helpers.ArtifactPath(constants.InitramfsAssetWithArch),
@@ -89,8 +104,7 @@ func (suite *MaintenanceSideroLinkSuite) TestAPI() {
 
 		maintenanceClients[i], err = client.New(
 			suite.ctx,
-			client.WithTLSConfig(&tls.Config{InsecureSkipVerify: true}),
-			client.WithEndpoints(machine.IPs[0].String()),
+			client.WithMaintenanceMode(machine.IPs[0].String(), nil),
 		)
 		suite.Require().NoError(err)
 	}
@@ -126,9 +140,20 @@ func (suite *MaintenanceSideroLinkSuite) TestAPI() {
 	)
 	suite.Require().NoError(err)
 
+	hostDNSConfig := network.NewResolverConfigV1Alpha1()
+	hostDNSConfig.ResolverHostDNS = network.HostDNSConfig{
+		HostDNSEnabled: new(true),
+	}
+
+	hostDNSPatch, err := container.New(hostDNSConfig)
+	suite.Require().NoError(err)
+
 	maintenancePatched, err := configpatcher.Apply(
 		configpatcher.WithConfig(sideroLinkConfig),
-		[]configpatcher.Patch{configpatcher.NewStrategicMergePatch(registryMirrorConfig)},
+		[]configpatcher.Patch{
+			configpatcher.NewStrategicMergePatch(registryMirrorConfig),
+			configpatcher.NewStrategicMergePatch(hostDNSPatch),
+		},
 	)
 	suite.Require().NoError(err)
 
@@ -166,8 +191,7 @@ func (suite *MaintenanceSideroLinkSuite) TestAPI() {
 
 		sideroLinkMaintenanceClients[i], err = client.New(
 			suite.ctx,
-			client.WithTLSConfig(&tls.Config{InsecureSkipVerify: true}),
-			client.WithEndpoints(sideroLinkIP.String()),
+			client.WithMaintenanceMode(sideroLinkIP.String(), nil),
 		)
 		suite.Require().NoError(err)
 	}
@@ -191,6 +215,28 @@ func (suite *MaintenanceSideroLinkSuite) TestAPI() {
 				suite.Assert().Equal(DefaultSettings.CurrentVersion, version.GetMessages()[0].GetVersion().GetTag())
 			}
 		}, time.Minute, time.Second, "machines should listen on SideroLink IPs")
+	})
+
+	suite.Run("check META value seeded from the kernel cmdline", func() {
+		ctx, cancel := context.WithTimeout(suite.ctx, 15*time.Second)
+		defer cancel()
+
+		// the machines are not installed yet, so the value is only in memory at this point
+		for _, maintenanceClient := range sideroLinkMaintenanceClients {
+			rtestutils.AssertResource(
+				ctx, suite.T(), maintenanceClient.COSI, runtime.MetaKeyTagToID(meta.UserReserved2),
+				func(metaValue *runtime.MetaKey, asrt *assert.Assertions) {
+					asrt.Equal(metaValueFromCmdline, metaValue.TypedSpec().Value)
+				},
+			)
+
+			rtestutils.AssertResource(
+				ctx, suite.T(), maintenanceClient.COSI, constants.MetaPartitionLabel,
+				func(volumeStatus *block.VolumeStatus, asrt *assert.Assertions) {
+					asrt.Equal(block.VolumePhaseMissing, volumeStatus.TypedSpec().Phase)
+				},
+			)
+		}
 	})
 
 	suite.Run("wipe the disk", func() {
@@ -323,12 +369,6 @@ func (suite *MaintenanceSideroLinkSuite) TestAPI() {
 		}
 	})
 
-	suite.Run("write META value", func() {
-		maintenanceClient := sideroLinkMaintenanceClients[0]
-
-		suite.Require().NoError(maintenanceClient.MetaWrite(suite.ctx, meta.UserReserved1, []byte("provision")))
-	})
-
 	suite.Run("reboot one machine", func() {
 		maintenanceClient := sideroLinkMaintenanceClients[0]
 		insecureMaintenanceClient := maintenanceClients[0]
@@ -372,18 +412,27 @@ func (suite *MaintenanceSideroLinkSuite) TestAPI() {
 		suite.Assert().NotEqual(currentBootID, newBootID, "boot ID should change after reboot")
 	})
 
-	suite.Run("read back META value", func() {
+	// nothing has flushed META on this machine other than the install itself: the value has to have
+	// been carried from the kernel cmdline into the META partition the installer created
+	suite.Run("read back META value seeded from the kernel cmdline", func() {
 		ctx, cancel := context.WithTimeout(suite.ctx, 15*time.Second)
 		defer cancel()
 
 		maintenanceClient := sideroLinkMaintenanceClients[0]
 
 		rtestutils.AssertResource(
-			ctx, suite.T(), maintenanceClient.COSI, runtime.MetaKeyTagToID(meta.UserReserved1),
+			ctx, suite.T(), maintenanceClient.COSI, runtime.MetaKeyTagToID(meta.UserReserved2),
 			func(metaValue *runtime.MetaKey, asrt *assert.Assertions) {
-				asrt.Equal("provision", metaValue.TypedSpec().Value)
+				asrt.Equal(metaValueFromCmdline, metaValue.TypedSpec().Value)
 			},
 		)
+	})
+
+	// MetaWrite flushes the whole in-memory META, so this has to come after the assertion above
+	suite.Run("write META value", func() {
+		maintenanceClient := sideroLinkMaintenanceClients[0]
+
+		suite.Require().NoError(maintenanceClient.MetaWrite(suite.ctx, meta.UserReserved1, []byte("provision")))
 	})
 
 	suite.Run("upgrade using legacy API", func() {
@@ -428,6 +477,25 @@ func (suite *MaintenanceSideroLinkSuite) TestAPI() {
 		// check that boot ID has changed after reboot
 		newBootID := suite.readBootID(maintenanceClient)
 		suite.Assert().NotEqual(currentBootID, newBootID, "boot ID should change after reboot")
+	})
+
+	suite.Run("read back META values after the upgrade", func() {
+		ctx, cancel := context.WithTimeout(suite.ctx, 15*time.Second)
+		defer cancel()
+
+		maintenanceClient := sideroLinkMaintenanceClients[0]
+
+		for tag, expected := range map[uint8]string{
+			meta.UserReserved1: "provision",
+			meta.UserReserved2: metaValueFromCmdline,
+		} {
+			rtestutils.AssertResource(
+				ctx, suite.T(), maintenanceClient.COSI, runtime.MetaKeyTagToID(tag),
+				func(metaValue *runtime.MetaKey, asrt *assert.Assertions) {
+					asrt.Equal(expected, metaValue.TypedSpec().Value)
+				},
+			)
+		}
 	})
 
 	suite.Run("apply config and have a cluster", func() {

@@ -17,6 +17,11 @@ message APIServiceConfigSpec {
   bool skip_verifying_client_cert = 4;
 }
 
+// BootIDSpec presents the kernel boot ID (contents of /proc/sys/kernel/random/boot_id).
+message BootIDSpec {
+  string boot_id = 1;
+}
+
 // BootedEntrySpec describes the booted entry resource properties.
 message BootedEntrySpec {
   string booted_entry = 1;
@@ -63,6 +68,13 @@ message ExtensionServiceConfigStatusSpec {
   string spec_version = 1;
 }
 
+// ImageFactorySchematicSpec describes Image Factory schematic information.
+message ImageFactorySchematicSpec {
+  string schematic_id = 1;
+  string flavor = 2;
+  string apiurl = 3;
+}
+
 // KernelCmdlineSpec presents kernel command line (contents of /proc/cmdline).
 message KernelCmdlineSpec {
   string cmdline = 1;
@@ -105,11 +117,23 @@ message KernelParamStatusSpec {
 
 // KmsgLogConfigSpec describes configuration for kmsg log streaming.
 message KmsgLogConfigSpec {
+  // Destinations is retained for compatibility with clients which do not support tagged destinations.
   repeated common.URL destinations = 1;
+  // TaggedDestinations associates each endpoint with its dedicated extra tags.
+  repeated KmsgLogDestination tagged_destinations = 2;
+}
+
+// KmsgLogDestination configures a destination for kernel message logs.
+message KmsgLogDestination {
+  common.URL endpoint = 1;
+  map<string, string> extra_tags = 2;
 }
 
 // LoadedKernelModuleSpec describes loaded Linux kernel modules.
+//
+// Deprecated: use KernelModuleStatus instead.
 message LoadedKernelModuleSpec {
+  option deprecated = true;
   int64 size = 1;
   int64 reference_count = 2;
   repeated string dependencies = 3;
@@ -196,6 +220,7 @@ message SecurityStateSpec {
   bool booted_with_uki = 5;
   talos.resource.definitions.enums.RuntimeFIPSState fips_state = 6;
   bool module_signature_enforced = 7;
+  talos.resource.definitions.enums.RuntimeLockdownState lockdown_state = 8;
 }
 
 // ServicePIDSpec is the spec for the service PID.
@@ -204,6 +229,13 @@ message ServicePIDSpec {
   int32 pid = 1;
   // MountNamespace is the mount namespace of the service.
   string mount_namespace = 2;
+}
+
+// UnattendedInstallStatusSpec describes the unattended install status.
+message UnattendedInstallStatusSpec {
+  string image = 1;
+  talos.resource.definitions.enums.RuntimeUnattendedInstallPhase phase = 2;
+  string error = 3;
 }
 
 // UniqueMachineTokenSpec is the spec for the machine unique token. Token can be empty if machine wasn't assigned any.

@@ -58,7 +58,7 @@ type KubeSpanConfigV1Alpha1 struct {
 
 	//   description: |
 	//     Enable the KubeSpan feature.
-	//     Cluster discovery should be enabled with cluster.discovery.enabled for KubeSpan to be enabled.
+	//     Requires cluster discovery to be enabled through a DiscoveryServiceConfig document.
 	//   schema:
 	//     type: boolean
 	ConfigEnabled *bool `yaml:"enabled,omitempty"`
@@ -117,6 +117,26 @@ type KubeSpanFiltersConfig struct {
 	ConfigEndpoints []string `yaml:"endpoints,omitempty"`
 
 	//   description: |
+	//     Filter endpoints received from other KubeSpan peers before this node attempts to connect to them.
+	//
+	//     This filter is the opposite of the `endpoints` filter: `endpoints` filters the addresses this node
+	//     advertises to the whole cluster, affecting how every peer connects to this node, while `peerEndpoints`
+	//     filters the endpoints received from other peers, affecting only outgoing connections of this node.
+	//
+	//     Use it to exclude endpoints which are known to be unreachable from this node
+	//     (e.g., addresses of a private network this node is not connected to), so they are never attempted.
+	//
+	//     Default value: no filtering.
+	//   examples:
+	//     - name: Exclude peer endpoints in the 192.168.0.0/16 subnet.
+	//       value: '[]string{"0.0.0.0/0", "!192.168.0.0/16", "::/0"}'
+	//   schema:
+	//     type: array
+	//     items:
+	//       type: string
+	ConfigPeerEndpoints []string `yaml:"peerEndpoints,omitempty"`
+
+	//   description: |
 	//     Filter networks (e.g., host addresses, pod CIDRs if enabled) which will be advertised over KubeSpan.
 	//
 	//     By default, all networks are advertised.
@@ -128,13 +148,13 @@ type KubeSpanFiltersConfig struct {
 	//     Default value: no filtering.
 	//   examples:
 	//     - name: Exclude private networks from being advertised.
-	//       value: '[]Prefix{{netip.MustParsePrefix("192.168.1.0/24")}}'
+	//       value: '[]meta.Prefix{{netip.MustParsePrefix("192.168.1.0/24")}}'
 	//   schema:
 	//     type: array
 	//     items:
 	//       type: string
 	//       pattern: ^[0-9a-f.:]+/\d{1,3}$
-	ConfigExcludeAdvertisedNetworks []Prefix `yaml:"excludeAdvertisedNetworks,omitempty"`
+	ConfigExcludeAdvertisedNetworks []meta.Prefix `yaml:"excludeAdvertisedNetworks,omitempty"`
 }
 
 // NewKubeSpanV1Alpha1 creates a new KubeSpanConfig config document.
@@ -156,7 +176,7 @@ func exampleKubeSpanV1Alpha1() *KubeSpanConfigV1Alpha1 {
 	cfg.ConfigMTU = new(uint32(1420))
 	cfg.ConfigFilters = &KubeSpanFiltersConfig{
 		ConfigEndpoints:                 []string{"0.0.0.0/0", "::/0"},
-		ConfigExcludeAdvertisedNetworks: []Prefix{{netip.MustParsePrefix("192.168.1.0/24")}, {netip.MustParsePrefix("2003::/16")}},
+		ConfigExcludeAdvertisedNetworks: []meta.Prefix{{Prefix: netip.MustParsePrefix("192.168.1.0/24")}, {Prefix: netip.MustParsePrefix("2003::/16")}},
 	}
 
 	return cfg
@@ -181,6 +201,14 @@ func (s *KubeSpanConfigV1Alpha1) Validate(validation.RuntimeMode, ...validation.
 
 			if _, err := sideronet.ParseSubnetOrAddress(cidr); err != nil {
 				errs = errors.Join(errs, fmt.Errorf("KubeSpan endpoint filter is not valid: %q", cidr))
+			}
+		}
+
+		for _, cidr := range s.ConfigFilters.ConfigPeerEndpoints {
+			cidr = strings.TrimPrefix(cidr, "!")
+
+			if _, err := sideronet.ParseSubnetOrAddress(cidr); err != nil {
+				errs = errors.Join(errs, fmt.Errorf("KubeSpan peer endpoint filter is not valid: %q", cidr))
 			}
 		}
 	}
@@ -242,7 +270,12 @@ func (f *KubeSpanFiltersConfig) Endpoints() []string {
 	return f.ConfigEndpoints
 }
 
+// PeerEndpoints implements config.NetworkKubeSpanFilters interface.
+func (f *KubeSpanFiltersConfig) PeerEndpoints() []string {
+	return f.ConfigPeerEndpoints
+}
+
 // ExcludeAdvertisedNetworks implements config.NetworkKubeSpanFilters interface.
 func (f *KubeSpanFiltersConfig) ExcludeAdvertisedNetworks() []netip.Prefix {
-	return xslices.Map(f.ConfigExcludeAdvertisedNetworks, func(p Prefix) netip.Prefix { return p.Prefix })
+	return xslices.Map(f.ConfigExcludeAdvertisedNetworks, func(p meta.Prefix) netip.Prefix { return p.Prefix })
 }

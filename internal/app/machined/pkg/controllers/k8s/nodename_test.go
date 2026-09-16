@@ -43,7 +43,7 @@ func (suite *NodenameSuite) TestDefault() {
 				ConfigVersion: "v1alpha1",
 				MachineConfig: &v1alpha1.MachineConfig{},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
@@ -73,12 +73,12 @@ func (suite *NodenameSuite) TestFQDN() {
 			&v1alpha1.Config{
 				ConfigVersion: "v1alpha1",
 				MachineConfig: &v1alpha1.MachineConfig{
-					MachineKubelet: &v1alpha1.KubeletConfig{
-						KubeletRegisterWithFQDN: new(true),
+					MachineKubelet: &v1alpha1.KubeletConfig{ //nolint:staticcheck // legacy config
+						KubeletRegisterWithFQDN: new(true), //nolint:staticcheck // legacy config
 					},
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},

@@ -51,7 +51,9 @@ func (suite *APIDSuite) TestGetConnection() {
 	md1 := metadata.New(nil)
 	md1.Set(":authority", "127.0.0.2")
 	md1.Set("nodes", "127.0.0.1")
+	md1.Set("runtime", "Talos")
 	md1.Set("key", "value1", "value2")
+	md1.Set("talos-role", "os:admin")
 	ctx1 := metadata.NewIncomingContext(authz.ContextWithRoles(context.Background(), role.MakeSet(role.Admin)), md1)
 
 	outCtx1, conn1, err1 := suite.b.GetConnection(ctx1, "")
@@ -61,9 +63,13 @@ func (suite *APIDSuite) TestGetConnection() {
 
 	mdOut1, ok1 := metadata.FromOutgoingContext(outCtx1)
 	suite.Require().True(ok1)
-	suite.Assert().Equal([]string{"value1", "value2"}, mdOut1.Get("key"))
+	suite.Assert().Equal([]string{"Talos"}, mdOut1.Get("runtime"))
 	suite.Assert().Equal([]string{"127.0.0.2"}, mdOut1.Get("proxyfrom"))
 	suite.Assert().Equal([]string{"os:admin"}, mdOut1.Get("talos-role"))
+	// not allowlisted for proxying
+	suite.Assert().Empty(mdOut1.Get("key"))
+	suite.Assert().Empty(mdOut1.Get("nodes"))
+	suite.Assert().Empty(mdOut1.Get(":authority"))
 
 	suite.Run(
 		"Same context", func() {
@@ -75,9 +81,10 @@ func (suite *APIDSuite) TestGetConnection() {
 
 			mdOut2, ok2 := metadata.FromOutgoingContext(outCtx2)
 			suite.Require().True(ok2)
-			suite.Assert().Equal([]string{"value1", "value2"}, mdOut2.Get("key"))
+			suite.Assert().Equal([]string{"Talos"}, mdOut2.Get("runtime"))
 			suite.Assert().Equal([]string{"127.0.0.2"}, mdOut2.Get("proxyfrom"))
 			suite.Assert().Equal([]string{"os:admin"}, mdOut2.Get("talos-role"))
+			suite.Assert().Empty(mdOut2.Get("key"))
 		},
 	)
 
@@ -86,7 +93,10 @@ func (suite *APIDSuite) TestGetConnection() {
 			md3 := metadata.New(nil)
 			md3.Set(":authority", "127.0.0.2")
 			md3.Set("nodes", "127.0.0.1")
+			md3.Set("runtime", "Talos")
 			md3.Set("key", "value3", "value4")
+			// a caller asserting a role it doesn't hold: the proxy must overwrite it
+			md3.Set("talos-role", "os:admin")
 			ctx3 := metadata.NewIncomingContext(
 				authz.ContextWithRoles(context.Background(), role.MakeSet(role.Reader)),
 				md3,
@@ -99,9 +109,10 @@ func (suite *APIDSuite) TestGetConnection() {
 
 			mdOut3, ok3 := metadata.FromOutgoingContext(outCtx3)
 			suite.Require().True(ok3)
-			suite.Assert().Equal([]string{"value3", "value4"}, mdOut3.Get("key"))
+			suite.Assert().Equal([]string{"Talos"}, mdOut3.Get("runtime"))
 			suite.Assert().Equal([]string{"127.0.0.2"}, mdOut3.Get("proxyfrom"))
 			suite.Assert().Equal([]string{"os:reader"}, mdOut3.Get("talos-role"))
+			suite.Assert().Empty(mdOut3.Get("key"))
 		},
 	)
 }
@@ -127,8 +138,8 @@ func (suite *APIDSuite) TestAppendInfoUnary() {
 	suite.Require().NoError(err)
 
 	suite.Assert().EqualValues([]byte("foobar"), newReply.Messages[0].Bytes)
-	suite.Assert().Equal(suite.b.String(), newReply.Messages[0].Metadata.Hostname)
-	suite.Assert().Empty(newReply.Messages[0].Metadata.Error)
+	suite.Assert().Equal(suite.b.String(), newReply.Messages[0].Metadata.Hostname) //nolint:staticcheck // legacy behavior
+	suite.Assert().Empty(newReply.Messages[0].Metadata.Error)                      //nolint:staticcheck // legacy behavior
 }
 
 func (suite *APIDSuite) TestAppendInfoStreaming() {
@@ -148,16 +159,16 @@ func (suite *APIDSuite) TestAppendInfoStreaming() {
 	suite.Require().NoError(err)
 
 	suite.Assert().EqualValues([]byte("foobar"), newResponse.Bytes)
-	suite.Assert().Equal(suite.b.String(), newResponse.Metadata.Hostname)
-	suite.Assert().Empty(newResponse.Metadata.Error)
+	suite.Assert().Equal(suite.b.String(), newResponse.Metadata.Hostname) //nolint:staticcheck // legacy behavior
+	suite.Assert().Empty(newResponse.Metadata.Error)                      //nolint:staticcheck // legacy behavior
 }
 
 func (suite *APIDSuite) TestAppendInfoStreamingMetadata() {
 	// this tests the case when metadata field is appended twice
 	// to the message, but protobuf merges definitions
 	response := &common.Data{
-		Metadata: &common.Metadata{
-			Error: "something went wrong",
+		Metadata: &common.Metadata{ //nolint:staticcheck // legacy behavior
+			Error: "something went wrong", //nolint:staticcheck // legacy behavior
 		},
 	}
 
@@ -173,8 +184,8 @@ func (suite *APIDSuite) TestAppendInfoStreamingMetadata() {
 	suite.Require().NoError(err)
 
 	suite.Assert().Nil(newResponse.Bytes)
-	suite.Assert().Equal(suite.b.String(), newResponse.Metadata.Hostname)
-	suite.Assert().Equal("something went wrong", newResponse.Metadata.Error)
+	suite.Assert().Equal(suite.b.String(), newResponse.Metadata.Hostname)    //nolint:staticcheck // legacy behavior
+	suite.Assert().Equal("something went wrong", newResponse.Metadata.Error) //nolint:staticcheck // legacy behavior
 }
 
 func (suite *APIDSuite) TestBuildErrorUnary() {
@@ -187,8 +198,8 @@ func (suite *APIDSuite) TestBuildErrorUnary() {
 	suite.Require().NoError(err)
 
 	suite.Assert().Nil(reply.Messages[0].Bytes)
-	suite.Assert().Equal(suite.b.String(), reply.Messages[0].Metadata.Hostname)
-	suite.Assert().Equal("some error", reply.Messages[0].Metadata.Error)
+	suite.Assert().Equal(suite.b.String(), reply.Messages[0].Metadata.Hostname) //nolint:staticcheck // legacy behavior
+	suite.Assert().Equal("some error", reply.Messages[0].Metadata.Error)        //nolint:staticcheck // legacy behavior
 }
 
 func (suite *APIDSuite) TestBuildErrorStreaming() {
@@ -201,8 +212,8 @@ func (suite *APIDSuite) TestBuildErrorStreaming() {
 	suite.Require().NoError(err)
 
 	suite.Assert().Nil(response.Bytes)
-	suite.Assert().Equal(suite.b.String(), response.Metadata.Hostname)
-	suite.Assert().Equal("some error", response.Metadata.Error)
+	suite.Assert().Equal(suite.b.String(), response.Metadata.Hostname) //nolint:staticcheck // legacy behavior
+	suite.Assert().Equal("some error", response.Metadata.Error)        //nolint:staticcheck // legacy behavior
 }
 
 func TestAPIDSuite(t *testing.T) {

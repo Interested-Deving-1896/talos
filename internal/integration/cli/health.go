@@ -78,7 +78,14 @@ func (suite *HealthSuite) TestServerSide() {
 }
 
 func (suite *HealthSuite) testClientSide(extraArgs ...string) {
-	args := append([]string{"--server=false"}, extraArgs...)
+	randomControlPlaneNodeInternalIP := suite.RandomDiscoveredNodeInternalIP(machine.TypeControlPlane)
+	args := append(
+		[]string{
+			"--server=false",
+			"--nodes", randomControlPlaneNodeInternalIP,
+		},
+		extraArgs...,
+	)
 
 	if suite.K8sEndpoint != "" {
 		args = append(args, "--k8s-endpoint", suite.K8sEndpoint)
@@ -104,7 +111,7 @@ func (suite *HealthSuite) isDiscoveryEnabled() (bool, error) {
 		return false, err
 	}
 
-	return temp.Spec.DiscoveryEnabled, nil
+	return temp.Spec.RegistryKubernetesEnabled || len(temp.Spec.ServiceEndpoints) > 0, nil
 }
 
 func init() {

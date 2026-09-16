@@ -16,13 +16,16 @@ type Option func(*Options)
 
 // Options for makefs.
 type Options struct {
-	Label               string
-	ConfigFile          string
-	SourceDirectory     string
-	SectorSize          uint
-	Force               bool
-	Reproducible        bool
-	UnsupportedFSOption bool
+	Label                  string
+	ConfigFile             string
+	SourceDirectory        string
+	SectorSize             uint
+	SectorsPerCluster      uint
+	DeviceSize             uint64
+	MinAllocationGroupSize uint64
+	Force                  bool
+	Reproducible           bool
+	UnsupportedFSOption    bool
 
 	Printf func(string, ...any)
 }
@@ -79,6 +82,37 @@ func WithSourceDirectory(sourceDir string) Option {
 func WithSectorSize(sectorSize uint) Option {
 	return func(o *Options) {
 		o.SectorSize = sectorSize
+	}
+}
+
+// WithSectorsPerCluster overrides the cluster size (in sectors) used by mkfs.
+//
+// It is only honored by VFAT. Zero leaves the mkfs defaults alone.
+//
+// Note that FAT type is derived from the cluster count by most implementations,
+// so growing the cluster size on a small filesystem may push it below the 65525
+// cluster minimum and turn a FAT32 filesystem into one that reads as FAT16.
+func WithSectorsPerCluster(sectorsPerCluster uint) Option {
+	return func(o *Options) {
+		o.SectorsPerCluster = sectorsPerCluster
+	}
+}
+
+// WithDeviceSize sets the size of the device being formatted, in bytes.
+//
+// It is only used to derive filesystem geometry, see WithMinAllocationGroupSize.
+func WithDeviceSize(size uint64) Option {
+	return func(o *Options) {
+		o.DeviceSize = size
+	}
+}
+
+// WithMinAllocationGroupSize sets the minimum allocation group size (in bytes) for XFS.
+//
+// It has no effect unless WithDeviceSize is set as well. Zero leaves the mkfs defaults alone.
+func WithMinAllocationGroupSize(size uint64) Option {
+	return func(o *Options) {
+		o.MinAllocationGroupSize = size
 	}
 }
 

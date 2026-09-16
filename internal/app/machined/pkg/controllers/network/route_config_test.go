@@ -18,6 +18,7 @@ import (
 	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
 	netctrl "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/network"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
 	networkcfg "github.com/siderolabs/talos/pkg/machinery/config/types/network"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
@@ -108,7 +109,7 @@ func (suite *RouteConfigSuite) TestMachineConfigurationLegacy() {
 				ConfigVersion: "v1alpha1",
 				MachineConfig: &v1alpha1.MachineConfig{
 					MachineNetwork: &v1alpha1.NetworkConfig{ //nolint:staticcheck // legacy config
-						NetworkInterfaces: []*v1alpha1.Device{
+						NetworkInterfaces: []*v1alpha1.Device{ //nolint:staticcheck // legacy config
 							{
 								DeviceInterface: "eth3",
 								DeviceAddresses: []string{"192.168.0.24/28"},
@@ -175,7 +176,7 @@ func (suite *RouteConfigSuite) TestMachineConfigurationLegacy() {
 					},
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
@@ -235,15 +236,15 @@ func (suite *RouteConfigSuite) TestMachineConfiguration() {
 	lc1 := networkcfg.NewLinkConfigV1Alpha1("enp0s2")
 	lc1.LinkRoutes = []networkcfg.RouteConfig{
 		{
-			RouteDestination: networkcfg.Prefix{Prefix: netip.MustParsePrefix("10.12.3.0/24")},
-			RouteGateway:     networkcfg.Addr{Addr: netip.MustParseAddr("10.12.3.1")},
+			RouteDestination: meta.Prefix{Prefix: netip.MustParsePrefix("10.12.3.0/24")},
+			RouteGateway:     meta.Addr{Addr: netip.MustParseAddr("10.12.3.1")},
 		},
 	}
 
 	lc2 := networkcfg.NewLinkConfigV1Alpha1("enp0s3")
 	lc2.LinkRoutes = []networkcfg.RouteConfig{
 		{
-			RouteGateway: networkcfg.Addr{Addr: netip.MustParseAddr("2001:470:6d:30e:8ed2:b60c:9d2f:803b")},
+			RouteGateway: meta.Addr{Addr: netip.MustParseAddr("2001:470:6d:30e:8ed2:b60c:9d2f:803b")},
 			RouteMetric:  200,
 			RouteTable:   nethelpers.Table101,
 		},

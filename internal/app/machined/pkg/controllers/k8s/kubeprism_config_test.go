@@ -28,18 +28,18 @@ func (suite *KubePrismConfigControllerSuite) TestGeneration() {
 		ConfigVersion: "v1alpha1",
 		MachineConfig: &v1alpha1.MachineConfig{
 			MachineFeatures: &v1alpha1.FeaturesConfig{
-				KubePrismSupport: &v1alpha1.KubePrism{
+				KubePrismSupport: &v1alpha1.KubePrism{ //nolint:staticcheck // legacy config
 					ServerEnabled: new(true),
 					ServerPort:    7445,
 				},
 			},
 		},
 		ClusterConfig: &v1alpha1.ClusterConfig{
-			ControlPlane: &v1alpha1.ControlPlaneConfig{
+			ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 				Endpoint: &v1alpha1.Endpoint{
 					URL: must(url.Parse("https://example.com"))(suite.Require()),
 				},
-				LocalAPIServerPort: 6445,
+				LocalAPIServerPort: 6445, //nolint:staticcheck // testing deprecated field
 			},
 		},
 	}
@@ -74,7 +74,7 @@ func (suite *KubePrismConfigControllerSuite) TestGeneration() {
 	})
 
 	ctest.UpdateWithConflicts(suite, mc, func(cfg *config.MachineConfig) error {
-		balancer := cfg.Config().Machine().Features().KubePrism().(*v1alpha1.KubePrism)
+		balancer := cfg.Provider().RawV1Alpha1().MachineConfig.MachineFeatures.KubePrismSupport //nolint:staticcheck // legacy config
 		balancer.ServerEnabled = new(false)
 
 		return nil
@@ -83,7 +83,7 @@ func (suite *KubePrismConfigControllerSuite) TestGeneration() {
 	ctest.AssertNoResource[*k8s.KubePrismConfig](suite, k8s.KubePrismConfigID)
 
 	ctest.UpdateWithConflicts(suite, mc, func(cfg *config.MachineConfig) error {
-		balancer := cfg.Config().Machine().Features().KubePrism().(*v1alpha1.KubePrism)
+		balancer := cfg.Provider().RawV1Alpha1().MachineConfig.MachineFeatures.KubePrismSupport //nolint:staticcheck // legacy config
 		balancer.ServerEnabled = new(true)
 		balancer.ServerPort = 7446
 

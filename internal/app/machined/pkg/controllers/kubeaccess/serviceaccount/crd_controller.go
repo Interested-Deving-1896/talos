@@ -34,7 +34,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
-	corelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
@@ -103,7 +102,6 @@ type CRDController struct {
 	secretsSynced  cache.InformerSynced
 	talosSAsSynced cache.InformerSynced
 
-	secretsLister corelisters.SecretLister
 	dynamicLister dynamiclister.Lister
 
 	eventRecorder record.EventRecorder
@@ -169,7 +167,6 @@ func NewCRDController(
 		secretsSynced:  secrets.Informer().HasSynced,
 		talosSAsSynced: informer.HasSynced,
 		eventRecorder:  recorder,
-		secretsLister:  secrets.Lister(),
 	}
 
 	if _, err = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -301,7 +298,11 @@ func (t *CRDController) syncHandler(ctx context.Context, key string) error {
 		return err
 	}
 
-	secret, err := t.secretsLister.Secrets(namespace).Get(name)
+	// Read the secret from the live API, not the informer cache: a stale-positive
+	// cache (e.g. right after a controller restart that re-lists, before a delete is
+	// reflected) would make the controller take the no-op path below and emit "Synced"
+	// while the secret is actually absent from the API.
+	secret, err := t.kubeClient.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
 
 	secretNotFound := kubeerrors.IsNotFound(err)
 	if err != nil && !secretNotFound {
@@ -322,7 +323,11 @@ func (t *CRDController) syncHandler(ctx context.Context, key string) error {
 	}
 
 	desiredRoles, found, err := unstructured.NestedStringSlice(talosSA.UnstructuredContent(), "spec", "roles")
-	if err != nil || !found {
+
+	// parse desiredRoles to see if they are empty.
+	desiredRoleSet, _ := role.Parse(desiredRoles)
+
+	if err != nil || !found || desiredRoleSet.Empty() {
 		msg := messageRolesNotFound
 
 		updateErr := t.updateTalosSAStatus(ctx, talosSA, msg)
@@ -336,10 +341,8 @@ func (t *CRDController) syncHandler(ctx context.Context, key string) error {
 			return fmt.Errorf("%s: %w", msg, err)
 		}
 
-		return errors.New(msg)
+		return errors.New(msg) //nolint:staticcheck // msg doubles as the user-facing Kubernetes Event message
 	}
-
-	desiredRoleSet, _ := role.Parse(desiredRoles)
 
 	if !slices.ContainsFunc(t.allowedNamespaces, func(allowedNS string) bool {
 		return allowedNS == namespace
@@ -356,6 +359,7 @@ func (t *CRDController) syncHandler(ctx context.Context, key string) error {
 		return nil
 	}
 
+	// every requested role must appear in the allowlist; the empty desiredRoles list is handled above.
 	var unallowedRoles []string
 
 	for _, desiredRole := range desiredRoles {
@@ -387,7 +391,10 @@ func (t *CRDController) syncHandler(ctx context.Context, key string) error {
 		}
 
 		_, err = t.kubeClient.CoreV1().Secrets(namespace).Create(ctx, newSecret, metav1.CreateOptions{})
-		if err != nil {
+		// tolerate a lost create race: if the secret already exists, it is durably
+		// present, which is all "Synced" needs to guarantee; content is reconciled on
+		// the next resync via needsUpdate.
+		if err != nil && !kubeerrors.IsAlreadyExists(err) {
 			return err
 		}
 	} else if t.needsUpdate(secret, desiredRoleSet.Strings()) {

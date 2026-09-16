@@ -24,12 +24,14 @@ import (
 
 type provisioner struct {
 	vm.Provisioner
+
+	apiPorts apiPortAllocator
 }
 
 // NewProvisioner initializes qemu provisioner.
 func NewProvisioner(ctx context.Context) (provision.Provisioner, error) {
 	p := &provisioner{
-		vm.Provisioner{
+		Provisioner: vm.Provisioner{
 			Name: "qemu",
 		},
 	}
@@ -43,7 +45,11 @@ func (p *provisioner) Close() error {
 }
 
 // GenOptions provides a list of additional config generate options.
-func (p *provisioner) GenOptions(networkReq provision.NetworkRequest, contract *config.VersionContract) ([]generate.Option, []bundle.Option) {
+//
+//nolint:gocyclo
+func (p *provisioner) GenOptions(clusterReq provision.ClusterRequest, contract *config.VersionContract) ([]generate.Option, []bundle.Option) {
+	networkReq := clusterReq.Network
+
 	hasIPv4 := false
 	hasIPv6 := false
 
@@ -56,12 +62,15 @@ func (p *provisioner) GenOptions(networkReq provision.NetworkRequest, contract *
 	}
 
 	genOpts := []generate.Option{
-		generate.WithInstallDisk("/dev/vda"),
+		generate.WithInstallDisk(clusterReq.InstallDiskPath()),
 	}
 
 	var bundleOpts []bundle.Option
 
-	if contract.MultidocNetworkConfigSupported() {
+	// authentic full-CLOS nodes have no management net0 at all (only fabric uplinks + a loopback
+	// identity): skip the net0 alias/DHCP injection. The per-node config (loopback + BGPInstanceConfig on the
+	// fabric NICs) is baked by the configmaker and delivered over the fabric link-local.
+	if !networkReq.CLOSNoNet0 && contract.MultidocNetworkConfigSupported() {
 		aliasConfig := networkcfg.NewLinkAliasConfigV1Alpha1("net0")
 		aliasConfig.Selector = networkcfg.LinkSelector{
 			Match: cel.MustExpression(cel.ParseBooleanExpression(`link.driver == "virtio_net"`, celenv.LinkLocator())),
@@ -69,10 +78,14 @@ func (p *provisioner) GenOptions(networkReq provision.NetworkRequest, contract *
 
 		documents := []configconfig.Document{aliasConfig}
 
-		if hasIPv4 {
+		// NoDHCP leaves net0 IPv6-link-local only (BGP-reachability test: identity is on a loopback).
+		switch {
+		case networkReq.NoDHCP:
+			// no DHCP config injected
+		case hasIPv4:
 			dhcp4Config := networkcfg.NewDHCPv4ConfigV1Alpha1("net0")
 			documents = append(documents, dhcp4Config)
-		} else if hasIPv6 {
+		case hasIPv6:
 			dhcp6Config := networkcfg.NewDHCPv6ConfigV1Alpha1("net0")
 			documents = append(documents, dhcp6Config)
 		}
@@ -86,7 +99,7 @@ func (p *provisioner) GenOptions(networkReq provision.NetworkRequest, contract *
 			bundleOpts,
 			bundle.WithPatch([]configpatcher.Patch{configpatcher.NewStrategicMergePatch(ctr)}),
 		)
-	} else {
+	} else if !networkReq.CLOSNoNet0 {
 		virtioSelector := v1alpha1.IfaceBySelector(v1alpha1.NetworkDeviceSelector{
 			NetworkDeviceKernelDriver: "virtio_net",
 		})
@@ -100,6 +113,8 @@ func (p *provisioner) GenOptions(networkReq provision.NetworkRequest, contract *
 			),
 		)
 	}
+
+	bundleOpts = append(bundleOpts, vm.MMCDiscardWorkaroundOptions(clusterReq, contract)...)
 
 	if !contract.GrubUseUKICmdlineDefault() {
 		genOpts = append(

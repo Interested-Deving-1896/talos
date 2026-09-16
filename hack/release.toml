@@ -7,7 +7,7 @@ match_deps = "^github.com/((talos-systems|siderolabs)/[a-zA-Z0-9-]+)$"
 ignore_deps = ["github.com/coredns/coredns"]
 
 # previous release
-previous = "v1.13.0"
+previous = "v1.14.0"
 
 pre_release = true
 
@@ -18,116 +18,284 @@ preface = """
     [notes.updates]
         title = "Component Updates"
         description = """\
-Linux: 6.18.32
-Kubernetes: 1.36.1
-containerd: 2.3.1
+Linux: 6.18.50
+Kubernetes: 1.37.0
+containerd: 2.3.5
+CoreDNS: 1.14.7
 
-Talos is built with Go 1.26.3.
+Talos is built with Go 1.27.1.
 """
 
-    [notes.nts]
-        title = "NTS for Time Synchronization"
+    [notes.kubespan_peer_endpoint_filters]
+        title = "KubeSpan Peer Endpoint Filters"
         description = """\
-Talos now supports Network Time Security (NTS) for secure time synchronization.
-This feature enhances the security of NTP by providing cryptographic authentication of time sources.
+KubeSpan now supports filtering the endpoints received from other peers via `filters.peerEndpoints` in the `KubeSpanConfig` document.
 
-NTS is enabled by default (without any configuration sources) for the default `time.cloudflare.com` time server
-NTS can be enabled for custom time servers via the new `useNTS` field in the `TimeServerConfig` document.
+While `filters.endpoints` filters the addresses a node advertises to the whole cluster, `filters.peerEndpoints` filters the endpoints
+received from other peers before the node connects to them, affecting only that node. This allows excluding peer-advertised endpoints
+which are known to be unreachable from a node (e.g., addresses of a private network the node is not connected to), so that KubeSpan
+endpoint rotation never attempts them.
 """
 
-    [notes.tls13]
-        title = "TLS 1.3 Minimum Version"
+    [notes.ipvs]
+        title = "IPVS Support"
         description = """\
-Talos now runs etcd and kube-apiserver with a minimum TLS version of 1.3, improving security by leveraging the latest TLS features and cipher suites.
-Custom settings for cipher suites have been removed, as they are ignored when TLS 1.3 is used, which simplifies configuration and ensures the use of modern, secure defaults.
+Following Kubernetes deprecation of IPVS support (`kube-proxy`), Talos Linux now ships IPVS as kernel modules which are not loaded by default.
+
+If you require IPVS support, you can enable it by loading the following kernel modules:
+
+* `ip_vs` (core)
+* `ip_vs_rr`, `ip_vs_wrr`, `ip_vs_lc`, `ip_vs_sh` or `ip_vs_mh` (scheduling algorithms)
+* `xt_ipvs` (nftables/iptables match)
 """
 
-    [notes.defaultInstaller]
-        title = "Default Installer Image"
+    [notes.lockdown]
+        title = "Secure Boot images no longer have lockdown=confidentiality enabled by default"
         description = """\
-The default installer image has been updated to use the Image Factory.
-The `ghcr.io/siderolabs/installer` image is no longer published with releases; use the Image Factory installer image instead.
+Secure Boot images no longer have `lockdown=confidentiality` enabled by default.
+This change was made to improve compatibility with eBPF tooling under default schematic.
+This means that Secure Boot images will now have `lockdown=integrity` enabled by default (implicitly), which is the recommended setting for most users.
+Users can override it by adding `lockdown=confidentiality` to the kernel command line through Image Factory if they require it.
 """
 
-    [notes.hostdnsconfig]
-        title = "Host DNS Configuration"
+    [notes.diskfree]
+        title = "Disk Free"
         description = """\
-HostDNS configuration was moved from the v1alpha1 config `.machine.features.hostDNS` field to the new `hostDNS` in the `ResolverConfig` document.
+A new `talosctl diskfree` command (aliased to `df`) reports storage and inode usage for mounted volumes.
 """
 
-    [notes.httpProbe]
-        title = "HTTP Probe Support"
+    [notes.containers_namespace]
+        title = "Unified --namespace Flag"
         description = """\
-Talos now supports HTTP network probes, allowing for monitoring of HTTP endpoints.
-HTTP responses with status 200-399 are considered successful, while connection and transport errors are treated as failures.
+`talosctl containers`, `logs`, `stats` and `restart` now select the containerd namespace through the same `--namespace` flag and vocabulary already used by `talosctl image` and `talosctl debug`: `system` (the default), `cri` for Kubernetes workloads, and `taloscontainers` for containers declared via a `ContainerConfig` document.
+
+The `--kubernetes`/`-k` flag is deprecated in favor of `--namespace cri`.
+
+`talosctl image list` also supports `--namespace taloscontainers`, to inspect images pulled for `ContainerConfig` containers. `talosctl debug` does not support the `taloscontainers` namespace.
 """
 
-    [notes.kubernetesmulti]
-        title = "Kubernetes Multi-document Configuration"
+    [notes.extension_service_configuration]
+        title = "Extension Service Configuration"
         description = """\
-Talos introduces new multi-document Kubernetes configuration, which allows for more flexible and modular configuration of Kubernetes components.
-Talos still supports the old v1alpha1 config for backwards compatibility, but new features and fields will only be available in the new multi-document format.
+`ExtensionServiceConfig` is supported only for extension services whose service manifest explicitly declares a configuration dependency:
 
-List of changes:
+```yaml
+depends:
+  - configuration: true
+```
 
-- `.cluster.secretboxEncryptionSecret` field was deprecated in the v1alpha1 config, and full etcd encryption configuration is available in `KubeEtcdEncryptionConfig` document.
-- `.cluster.scheduler` field was deprecated in the v1alpha1 config, and kube-scheduler configuration is available in `KubeSchedulerConfig` document
+Using `ExtensionServiceConfig` with a service that does not declare this dependency is unsupported and has undefined startup behavior.
+The service might start before its configuration is rendered, leaving config files or environment variables unavailable until a later service restart.
+Extension authors must declare the dependency before documenting `ExtensionServiceConfig` support.
 """
 
-    [notes.dhcpsearchdomains]
-        title = "DHCP Search Domains"
+    [notes.multipath_configuration]
+        title = "Multipath Configuration"
         description = """\
-DHCPv4 search domains are now applied to the resolver configuration.
-"""
+The `multipath-tools` system extension now reads `/etc/multipath.conf` from the Talos host instead of using `ExtensionServiceConfig`.
+The `multipathd` service waits for this file and bind-mounts it read-only into its service container.
 
-[notes.EPHEMERAL]
-        title = "noexec on EPHEMERAL (/var)"
-        description = """\
-The EPHEMERAL volume (`/var`) is now mounted with `noexec` in addition to the existing `nosuid` and `nodev`,
-blocking binary execution from `/var`.
-
-Workloads that exec binaries placed under `/var` will break.
-For example, Longhorn v1's `instance-manager` exec's engine binaries the `engine-image` DaemonSet drops under `/var/lib/longhorn/engine-binaries/`,
-which now fails with `permission denied`. Affected users can opt out via a `VolumeConfig` document:
+Before updating the extension, apply a machine config patch that deletes the existing `ExtensionServiceConfig` document and adds an `EtcFileConfig` document:
 
 ```yaml
 apiVersion: v1alpha1
-kind: VolumeConfig
-name: EPHEMERAL
-mount:
-  secure: false
+kind: ExtensionServiceConfig
+name: multipathd
+$patch: delete
+---
+apiVersion: v1alpha1
+kind: EtcFileConfig
+name: multipath.conf
+mode: 0o644
+contents: |
+  defaults {
+      user_friendly_names yes
+      find_multipaths no
+      path_selector "round-robin 0"
+  }
 ```
 
-> NOTE: Setting `secure: false` will also disable `nosuid` and `nodev`, which may have security implications. Use with caution.
-
-Upgrade note: apply this `VolumeConfig` patch *before* upgrading, otherwise affected workloads will fail after the next reboot. Longhorn v2 (SPDK data engine) runs the data plane inside the instance manager process and is not affected.
+The extension does not provide a default configuration, so `multipathd` remains waiting until `/etc/multipath.conf` is present.
 """
 
-    [notes.DoT]
-        title = "DNS over TLS (DoT) and DNS over HTTPS (DoH) Support"
+    [notes.macvlan]
+        title = "MACVLAN Links"
         description = """\
-Talos now supports DNS over TLS (DoT) and DNS over HTTPS (DoH) for secure DNS resolution.
-These features allow Talos to encrypt DNS queries and responses, enhancing privacy and security for DNS traffic.
-The DNS protocol can be configured on a per-name server basis in the `ResolverConfig` document, allowing for flexible configuration of DNS resolution.
+Talos Linux now supports creating MACVLAN links with a new `MacVLANConfig` document:
+
+```yaml
+apiVersion: v1alpha1
+kind: MacVLANConfig
+name: eth0.macvlan
+parent: eth0
+mode: bridge # optional, defaults to `bridge`
+addresses:
+  - address: 192.168.1.100/24
+```
+
+The `source` mode is not supported yet, as it requires a list of allowed source MAC addresses.
 """
 
-    [notes.imagecache]
-        title = "Image Cache Configuration"
+    [notes.vxlan]
+        title = "VXLAN Links"
         description = """\
-Talos now supports a new `ImageCacheConfig` document for configuring the Image Cache feature, replacing the old `machine.features.imageCache` field in the v1alpha1 config.
-Old configuration is still supported for backwards compatibility.
+Talos Linux now supports creating VXLAN links with a new `VXLANConfig` document:
+
+```yaml
+apiVersion: v1alpha1
+kind: VXLANConfig
+name: vxlan100
+id: 100 # VXLAN network identifier (VNI)
+parent: eth0
+local: 10.255.0.1 # or `group:` for a multicast group, but not both
+port: 4789 # optional, defaults to 4789
+learning: false # optional, defaults to true
+addresses:
+  - address: 192.168.1.100/24
+```
 """
 
-    [notes.flannel]
-        title = "Flannel CNI"
+    [notes.kmsg_log_extra_tags]
+        title = "Kernel Log Extra Tags"
         description = """\
-Talos now configures Flannel with the `EnableNFTables` option enabled, which uses nftables native backend instead of `iptables-nft` compatibility layer.
+The `KmsgLogConfig` document now supports an `extraTags` field which attaches additional key-value pairs
+to every kernel log message sent to that destination:
+
+```yaml
+apiVersion: v1alpha1
+kind: KmsgLogConfig
+name: apiSink
+url: https://kmsglog.api/logs
+extraTags:
+  cluster: staging-west
+  node: worker-1
+```
+
+Tags are scoped to the destination they are configured on, so different endpoints can receive different tags.
+The keys `facility`, `seq`, `clock`, `priority`, `msg`, `talos-time` and `talos-level` are reserved and rejected,
+as they are set by Talos itself.
 """
 
-    [notes.etcd]
-        title = "etcd"
+    [notes.disk_smart]
+        title = "Disk SMART Status"
         description = """\
-Talos is now compatible with etcd v3.6.x only (the default version was etcd 3.6.x since Talos v1.11).
+Talos can now collect SMART (Self-Monitoring, Analysis and Reporting Technology) health information from disks,
+exposed via the new `SMARTStatus` resource (one per disk, keyed by the disk device name).
+
+Collection is controlled by the presence of the new `DiskSMARTConfig` document: while the document is part of
+the machine configuration SMART status is collected, and removing the document disables collection (any
+`SMARTStatus` resources already produced are removed as well). There is no `enabled` field.
+
+```yaml
+apiVersion: v1alpha1
+kind: DiskSMARTConfig
+interval: 30m0s
+```
+
+`talosctl gen config` and `talosctl cluster create` emit this document by default, so SMART status collection
+is enabled by default for machine configurations generated by Talos 1.15. Clusters upgraded from an earlier
+version keep their existing machine configuration, which carries no `DiskSMARTConfig` document, so SMART
+status collection stays off there until the document is added.
+
+Rotational disks are never spun up just to be probed: a disk in standby is detected via ATA
+`CHECK POWER MODE` and its SMART data is left untouched until it is active again.
+
+To retrieve SMART statuses:
+
+```bash
+talosctl get smart
+```
+
+The resource reports an overall health verdict, temperature, power-on hours and power cycles, NVMe wear
+indicators (percent used, available spare, critical warning, media errors) and, for ATA/SATA disks, the raw
+SMART attribute table with per-attribute thresholds.
+"""
+
+    [notes.containerd_config_version]
+        title = "containerd Configuration Version 4"
+        description = """\
+Talos now generates `containerd` configuration with `version = 4` (previously `version = 3`).
+
+`containerd` only migrates configuration from older versions, so any custom CRI configuration provided via
+`CRICustomizationConfig` documents (or shipped by system extensions) is now interpreted as version 4, and settings
+which moved in version 4 are silently ignored (only a `Ignoring unknown key in TOML` warning is logged by `containerd`).
+
+In version 4, the top-level server sections moved into plugin configuration blocks, so the following patches need to be adjusted:
+
+| version 3 | version 4 |
+|-----------|-----------|
+| `[metrics]` `address` | `[plugins."io.containerd.server.v1.metrics"]` `address` |
+| `[metrics]` `grpc_histogram` | `[plugins."io.containerd.metrics.v1.grpc-prometheus"]` `grpc_histogram` |
+| `[grpc]` `address`, `uid`, `gid`, `max_recv_message_size`, `max_send_message_size` | `[plugins."io.containerd.server.v1.grpc"]` (same keys) |
+| `[grpc]` `tcp_address`, `tcp_tls_ca`, `tcp_tls_cert`, `tcp_tls_key`, `tcp_tls_common_name` | `[plugins."io.containerd.server.v1.grpc-tcp"]` `address`, `tls_ca`, `tls_cert`, `tls_key`, `tls_common_name` |
+| `[ttrpc]` `address`, `uid`, `gid` | `[plugins."io.containerd.server.v1.ttrpc"]` (same keys) |
+| `[debug]` `address`, `uid`, `gid` | `[plugins."io.containerd.server.v1.debug"]` (same keys) |
+
+For example, the `containerd` metrics customization documented for previous versions of Talos:
+
+```yaml
+apiVersion: v1alpha1
+kind: CRICustomizationConfig
+name: enable-metrics
+content: |
+  [metrics]
+    address = "0.0.0.0:11234"
+```
+
+should now be written as:
+
+```yaml
+apiVersion: v1alpha1
+kind: CRICustomizationConfig
+name: enable-metrics
+content: |
+  [plugins."io.containerd.server.v1.metrics"]
+    address = "0.0.0.0:11234"
+```
+
+Note that `[debug]` `level`, `format` and `log_trace_id` stay at the top level, and that the `ttrpc` address is no longer
+derived from the `grpc` address: if the `grpc` address is customized, the `ttrpc` plugin address has to be set explicitly.
+"""
+
+    [notes.secret_file_permissions]
+        title = "Permissions of the Generated Files"
+        description = """\
+`talosctl` now writes every file which might contain secrets with `0600` permissions (owner read/write only),
+and it restricts the permissions of the files it overwrites as well.
+
+This affects the machine configuration (`talosctl gen config`, `talosctl machineconfig patch`,
+`talosctl cluster create --skip-injecting-config`), `talosconfig` and `kubeconfig`.
+"""
+
+
+    [notes.nfs_external_volumes]
+        title = "NFS External Volumes"
+        description = """\
+Talos now supports NFS as an `ExternalVolumeConfig` filesystem type alongside `virtiofs`, allowing nodes to mount network exports at `/var/mnt/<name>` through the existing block volume machinery.
+
+```yaml
+apiVersion: v1alpha1
+kind: ExternalVolumeConfig
+name: shared
+filesystemType: nfs
+mount:
+  nfs:
+    server: 10.0.0.10
+    path: /export
+    version: "4.1"
+```
+
+Supported `version` values are `3`, `4`, `4.1`, and `4.2`.
+The `mount.nfs` spec configures the kernel NFS client:
+
+* Connectivity: `server` (hostname or IP; IPv6 is bracketed automatically) and absolute `path` are required; optional `port`, `transport` (`tcp`/`udp`), and NFSv3-only `mountPort`/`mountTransport` (otherwise `rpcbind` discovery is used).
+* NFSv3 locking: `locking` (`local` default / `remote`) controls `nolock`/`lock`; Talos does not run `rpc.statd`, so `local` (nolock) is the safe default. You need `rpc.statd` extension for remote locking.
+* Recovery: `recovery` (`hard`/`soft`/`soft-error`) maps to `hard`/`soft`/`softerr`.
+* Tuning: `timeout` (`timeo`, deciseconds), `retransmissions` (`retrans`), `readSize`/`writeSize` (`rsize`/`wsize`, 1024–1048576 multiples of 1024), `connections` (`nconnect`, 1–16, TCP only), `reservedPort` (`resvport`/`noresvport`), and `security` (`none`/`sys`; Kerberos flavors are unsupported as Talos does not run `rpc.gssd`).
+* NFSv4 enforces `tcp` transport.
+
+Common `mount` flags (`readOnly`, `disableAccessTime`, `secure`) apply as with other volume types.
+Validation rejects `mountPort`/`mountTransport`/`locking` outside NFSv3 and `udp` for NFSv4.
 """
 
 [make_deps]

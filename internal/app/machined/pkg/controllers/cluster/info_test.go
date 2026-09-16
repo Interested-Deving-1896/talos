@@ -5,6 +5,7 @@
 package cluster_test
 
 import (
+	"net/url"
 	"testing"
 	"time"
 
@@ -29,8 +30,13 @@ func (suite *InfoSuite) TestReconcile() {
 	cfg := config.NewMachineConfig(container.NewV1Alpha1(&v1alpha1.Config{
 		ConfigVersion: "v1alpha1",
 		ClusterConfig: &v1alpha1.ClusterConfig{
-			ClusterID:   "cluster1",
-			ClusterName: "foo",
+			ClusterID:   "cluster1", //nolint:staticcheck // testing deprecated field
+			ClusterName: "foo",      //nolint:staticcheck // testing deprecated field
+			ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
+				Endpoint: &v1alpha1.Endpoint{
+					URL: must(url.Parse("https://example.com/")),
+				},
+			},
 		},
 	}))
 

@@ -80,7 +80,7 @@ func (suite *EtcFileConfigSuite) ExtraSetup() {
 				ConfigVersion: "v1alpha1",
 				MachineConfig: &v1alpha1.MachineConfig{
 					MachineNetwork: &v1alpha1.NetworkConfig{ //nolint:staticcheck // legacy config
-						ExtraHostEntries: []*v1alpha1.ExtraHost{
+						ExtraHostEntries: []*v1alpha1.ExtraHost{ //nolint:staticcheck // legacy config
 							{
 								HostIP:      "10.0.0.1",
 								HostAliases: []string{"a", "b"},
@@ -93,7 +93,7 @@ func (suite *EtcFileConfigSuite) ExtraSetup() {
 					},
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
@@ -273,7 +273,7 @@ func (suite *EtcFileConfigSuite) TestNoSearchDomainLegacy() {
 				ConfigVersion: "v1alpha1",
 				MachineConfig: &v1alpha1.MachineConfig{
 					MachineNetwork: &v1alpha1.NetworkConfig{ //nolint:staticcheck // legacy config
-						NetworkDisableSearchDomain: new(true),
+						NetworkDisableSearchDomain: new(true), //nolint:staticcheck // legacy config
 					},
 				},
 			},
@@ -361,7 +361,7 @@ func (suite *EtcFileConfigSuite) ExtraTearDown() {
 		if suite.etcRoot.FSType() == "os" {
 			suite.Require().NoError(os.Remove(suite.podResolvConfPath))
 		} else {
-			suite.Require().NoError(mount.SafeUnmount(context.Background(), nil, suite.podResolvConfPath, false))
+			suite.Require().NoError(mount.SafeUnmount(context.Background(), nil, suite.podResolvConfPath, false, false))
 		}
 	}
 

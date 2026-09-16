@@ -133,9 +133,9 @@ func (suite *GenSuite) TestGenConfigURLValidation() {
 // TestGenConfigPatchStrategic verifies that gen config --config-patch works with strategic merge patches.
 func (suite *GenSuite) TestGenConfigPatchStrategic() {
 	patch, err := yaml.Marshal(map[string]any{
-		"cluster": map[string]any{
-			"clusterName": "bar",
-		},
+		"apiVersion":  "v1alpha1",
+		"kind":        "KubeClusterConfig",
+		"clusterName": "bar",
 	})
 	suite.Require().NoError(err)
 
@@ -175,12 +175,46 @@ func (suite *GenSuite) TestGenConfigPatchStrategic() {
 
 				switch {
 				case tt.shouldAffect[configName]:
-					suite.Assert().Equal("bar", cfg.Cluster().Name(), "checking %q", configName)
+					suite.Assert().Equal("bar", cfg.K8sClusterConfig().ClusterName(), "checking %q", configName)
 				default:
-					suite.Assert().Equal("foo", cfg.Cluster().Name(), "checking %q", configName)
+					suite.Assert().Equal("foo", cfg.K8sClusterConfig().ClusterName(), "checking %q", configName)
 				}
 			}
 		})
+	}
+}
+
+// TestGenConfigPermissions verifies that generated configs are not readable by group/others.
+func (suite *GenSuite) TestGenConfigPermissions() {
+	configNames := []string{"controlplane.yaml", "worker.yaml", "talosconfig"}
+
+	suite.RunCLI([]string{"gen", "config", "foo", "https://192.168.0.1:6443"},
+		base.StdoutEmpty(),
+		base.StderrNotEmpty(),
+		base.StderrShouldMatch(regexp.MustCompile("generating PKI and tokens")))
+
+	for _, configName := range configNames {
+		st, err := os.Stat(configName)
+		suite.Require().NoError(err)
+
+		suite.Assert().Equal(os.FileMode(0o600), st.Mode().Perm(), "checking %q", configName)
+	}
+
+	// overwriting configs left over by an older version of talosctl should restrict the mode as well
+	for _, configName := range configNames {
+		suite.Require().NoError(os.Chmod(configName, 0o644))
+	}
+
+	suite.RunCLI([]string{"gen", "config", "--force", "foo", "https://192.168.0.1:6443"},
+		base.StdoutEmpty(),
+		base.StderrNotEmpty(),
+		base.StderrShouldMatch(regexp.MustCompile("generating PKI and tokens")))
+
+	for _, configName := range configNames {
+		st, err := os.Stat(configName)
+		suite.Require().NoError(err)
+
+		suite.Assert().Equal(os.FileMode(0o600), st.Mode().Perm(), "checking %q", configName)
 	}
 }
 

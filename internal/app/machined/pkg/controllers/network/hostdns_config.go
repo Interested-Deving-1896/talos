@@ -92,13 +92,15 @@ func (ctrl *HostDNSConfigController) Run(ctx context.Context, r controller.Runti
 			res.TypedSpec().ListenAddresses = []netip.AddrPort{
 				netip.MustParseAddrPort("127.0.0.53:53"),
 			}
+			// Keep resolv.conf pointed at Host DNS during early bootstrap. The active
+			// machine configuration can disable it once it is loaded.
+			res.TypedSpec().Enabled = cfg == nil
+			res.TypedSpec().ResolveMemberNames = false
 
 			res.TypedSpec().ServiceHostDNSAddress = netip.Addr{}
 			res.TypedSpec().ServiceHostDNSAddressV6 = netip.Addr{}
 
 			if hostDNSConfig == nil {
-				res.TypedSpec().Enabled = false
-
 				return nil
 			}
 
@@ -109,15 +111,15 @@ func (ctrl *HostDNSConfigController) Run(ctx context.Context, r controller.Runti
 				return nil
 			}
 
-			var podCIDRs []string
+			var podCIDRs []netip.Prefix
 
-			if cfg.Config().Cluster() != nil {
-				podCIDRs = cfg.Config().Cluster().Network().PodCIDRs()
+			if k8sNetwork := cfg.Config().K8sNetworkConfig(); k8sNetwork != nil {
+				podCIDRs = k8sNetwork.PodCIDRs()
 			}
 
 			if slices.ContainsFunc(
 				podCIDRs,
-				func(cidr string) bool { return netip.MustParsePrefix(cidr).Addr().Is4() },
+				func(cidr netip.Prefix) bool { return cidr.Addr().Is4() },
 			) {
 				parsed := netip.MustParseAddr(constants.HostDNSAddress)
 				newServiceAddrs = append(newServiceAddrs, parsed)
@@ -128,7 +130,7 @@ func (ctrl *HostDNSConfigController) Run(ctx context.Context, r controller.Runti
 
 			if slices.ContainsFunc(
 				podCIDRs,
-				func(cidr string) bool { return netip.MustParsePrefix(cidr).Addr().Is6() },
+				func(cidr netip.Prefix) bool { return cidr.Addr().Is6() },
 			) {
 				parsed := netip.MustParseAddr(constants.HostDNSAddressV6)
 				newServiceAddrs = append(newServiceAddrs, parsed)

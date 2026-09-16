@@ -11,6 +11,7 @@ import (
 
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/provision"
+	"github.com/siderolabs/talos/pkg/provision/providers/vm"
 )
 
 // Create Talos cluster as a set of qemu VMs.
@@ -63,6 +64,14 @@ func (p *provisioner) Create(ctx context.Context, request provision.ClusterReque
 		return nil, fmt.Errorf("unable to provision CNI network: %w", err)
 	}
 
+	if options.NFSEnabled {
+		fmt.Fprintln(options.LogWriter, "creating NFS server")
+
+		if err = p.CreateNFS(state, request); err != nil {
+			return nil, fmt.Errorf("error creating NFS server: %w", err)
+		}
+	}
+
 	fmt.Fprintln(options.LogWriter, "creating load balancer")
 
 	if err = p.CreateLoadBalancer(state, request); err != nil {
@@ -108,11 +117,32 @@ func (p *provisioner) Create(ctx context.Context, request provision.ClusterReque
 		}
 	}
 
+	if options.BGPEnabled {
+		fmt.Fprintln(options.LogWriter, "creating BGP fabric peer")
+
+		if err = p.CreateBGP(state, request, options); err != nil {
+			return nil, fmt.Errorf("error creating BGP fabric peer: %w", err)
+		}
+	}
+
 	if options.JSONLogsEndpoint != "" {
 		fmt.Fprintln(options.LogWriter, "creating JSON logs server")
 
 		if err = p.CreateJSONLogs(state, request, options); err != nil {
 			return nil, fmt.Errorf("error creating JSON logs server: %w", err)
+		}
+	}
+
+	for _, extraDHCPRecord := range request.Network.ExtraDHCPRecords {
+		if err = vm.DumpIPAMRecord(statePath, vm.IPAMRecord{
+			IP:       extraDHCPRecord.IP.Addr(),
+			Netmask:  byte(extraDHCPRecord.IP.Bits()),
+			Gateway:  extraDHCPRecord.Gateway,
+			MAC:      extraDHCPRecord.MAC,
+			Hostname: extraDHCPRecord.Name,
+			MTU:      request.Network.MTU,
+		}); err != nil {
+			return nil, fmt.Errorf("error dumping extra IPAM record: %w", err)
 		}
 	}
 
@@ -124,7 +154,8 @@ func (p *provisioner) Create(ctx context.Context, request provision.ClusterReque
 		return nil, err
 	}
 
-	// On darwin, qemu creates the bridge interface to which the dhcpd server is attached to, so at least one machine has to be created first.
+	// On darwin the bridge already exists here: CreateNetwork brought it up and holds it open for the
+	// network lifetime, so the dhcpd finds it regardless of node creation order.
 	fmt.Fprintln(options.LogWriter, "creating dhcpd")
 
 	if err = p.CreateDHCPd(ctx, state, request); err != nil {
@@ -166,6 +197,7 @@ func (p *provisioner) Create(ctx context.Context, request provision.ClusterReque
 			NoMasqueradeCIDRs: request.Network.NoMasqueradeCIDRs,
 			GatewayAddrs:      request.Network.GatewayAddrs,
 			MTU:               request.Network.MTU,
+			ExtraDHCPRecords:  request.Network.ExtraDHCPRecords,
 		},
 		Nodes:              nodeInfo,
 		ExtraNodes:         pxeNodeInfo,

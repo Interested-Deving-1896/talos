@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/suite"
 	"golang.org/x/sys/unix"
 
+	networkadapter "github.com/siderolabs/talos/internal/app/machined/pkg/adapters/network"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
 	netctrl "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/network"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
@@ -155,6 +156,47 @@ func (suite *LinkStatusSuite) TestDummyInterface() {
 	ctest.AssertNoResource[*network.LinkStatus](suite, dummyInterface)
 }
 
+func (suite *LinkStatusSuite) TestVethInterface() {
+	if os.Geteuid() != 0 {
+		suite.T().Skip("requires root")
+	}
+
+	name := uniqueDummyInterface()
+	peerName := uniqueDummyInterface()
+
+	conn, err := rtnetlink.Dial(nil)
+	suite.Require().NoError(err)
+
+	defer conn.Close() //nolint:errcheck
+
+	data, err := networkadapter.VethSpec(&network.VethSpec{PeerName: peerName}).Encode()
+	suite.Require().NoError(err)
+	suite.Require().NoError(conn.Link.New(&rtnetlink.LinkMessage{
+		Type: unix.ARPHRD_ETHER,
+		Attributes: &rtnetlink.LinkAttributes{
+			Name: name,
+			Info: &rtnetlink.LinkInfo{
+				Kind: network.LinkKindVeth,
+				Data: &rtnetlink.LinkData{Name: network.LinkKindVeth, Data: data},
+			},
+		},
+	}))
+
+	iface, err := net.InterfaceByName(name)
+	suite.Require().NoError(err)
+
+	defer conn.Link.Delete(uint32(iface.Index)) //nolint:errcheck
+
+	ctest.AssertResource(suite, name, func(r *network.LinkStatus, asrt *assert.Assertions) {
+		asrt.Equal(network.LinkKindVeth, r.TypedSpec().Kind)
+		asrt.Equal(peerName, r.TypedSpec().Veth.PeerName)
+	})
+	ctest.AssertResource(suite, peerName, func(r *network.LinkStatus, asrt *assert.Assertions) {
+		asrt.Equal(network.LinkKindVeth, r.TypedSpec().Kind)
+		asrt.Equal(name, r.TypedSpec().Veth.PeerName)
+	})
+}
+
 func (suite *LinkStatusSuite) TestBridgeInterface() {
 	if os.Geteuid() != 0 {
 		suite.T().Skip("requires root")
@@ -196,6 +238,146 @@ func (suite *LinkStatusSuite) TestBridgeInterface() {
 	ctest.AssertResource(suite, bridgeInterface, func(r *network.LinkStatus, asrt *assert.Assertions) {
 		asrt.Equal("ether", r.TypedSpec().Type.String())
 		asrt.True(r.TypedSpec().BridgeMaster.STP.Enabled)
+	})
+}
+
+func (suite *LinkStatusSuite) TestMacVLANInterface() {
+	if os.Geteuid() != 0 {
+		suite.T().Skip("requires root")
+	}
+
+	parentInterface := uniqueDummyInterface()
+	macvlanInterface := uniqueDummyInterface()
+
+	conn, err := rtnetlink.Dial(nil)
+	suite.Require().NoError(err)
+
+	defer conn.Close() //nolint:errcheck
+
+	suite.Require().NoError(
+		conn.Link.New(
+			&rtnetlink.LinkMessage{
+				Type: unix.ARPHRD_ETHER,
+				Attributes: &rtnetlink.LinkAttributes{
+					Name: parentInterface,
+					Info: &rtnetlink.LinkInfo{
+						Kind: "dummy",
+					},
+				},
+			},
+		),
+	)
+
+	parentIface, err := net.InterfaceByName(parentInterface)
+	suite.Require().NoError(err)
+
+	defer conn.Link.Delete(uint32(parentIface.Index)) //nolint:errcheck
+
+	macvlanData, err := networkadapter.MacVLANSpec(
+		&network.MacVLANSpec{Mode: nethelpers.MacvlanModePrivate},
+	).Encode()
+	suite.Require().NoError(err)
+
+	suite.Require().NoError(
+		conn.Link.New(
+			&rtnetlink.LinkMessage{
+				Type: unix.ARPHRD_ETHER,
+				Attributes: &rtnetlink.LinkAttributes{
+					Name: macvlanInterface,
+					Type: uint32(parentIface.Index),
+					Info: &rtnetlink.LinkInfo{
+						Kind: "macvlan",
+						Data: &rtnetlink.LinkData{
+							Name: "macvlan",
+							Data: macvlanData,
+						},
+					},
+				},
+			},
+		),
+	)
+
+	macvlanIface, err := net.InterfaceByName(macvlanInterface)
+	suite.Require().NoError(err)
+
+	defer conn.Link.Delete(uint32(macvlanIface.Index)) //nolint:errcheck
+
+	ctest.AssertResource(suite, macvlanInterface, func(r *network.LinkStatus, asrt *assert.Assertions) {
+		asrt.Equal("ether", r.TypedSpec().Type.String())
+		asrt.Equal(network.LinkKindMacVLAN, r.TypedSpec().Kind)
+		asrt.EqualValues(parentIface.Index, r.TypedSpec().LinkIndex)
+		asrt.Equal(nethelpers.MacvlanModePrivate, r.TypedSpec().MacVLAN.Mode)
+	})
+}
+
+func (suite *LinkStatusSuite) TestVXLANInterface() {
+	if os.Geteuid() != 0 {
+		suite.T().Skip("requires root")
+	}
+
+	parentInterface := uniqueDummyInterface()
+	vxlanInterface := uniqueDummyInterface()
+
+	conn, err := rtnetlink.Dial(nil)
+	suite.Require().NoError(err)
+
+	defer conn.Close() //nolint:errcheck
+
+	suite.Require().NoError(
+		conn.Link.New(
+			&rtnetlink.LinkMessage{
+				Type: unix.ARPHRD_ETHER,
+				Attributes: &rtnetlink.LinkAttributes{
+					Name: parentInterface,
+					Info: &rtnetlink.LinkInfo{
+						Kind: "dummy",
+					},
+				},
+			},
+		),
+	)
+
+	parentIface, err := net.InterfaceByName(parentInterface)
+	suite.Require().NoError(err)
+
+	defer conn.Link.Delete(uint32(parentIface.Index)) //nolint:errcheck
+
+	vxlanSpec := network.VXLANSpec{
+		ID:       100,
+		Port:     4789,
+		Learning: false,
+	}
+
+	vxlanData, err := networkadapter.VXLANSpec(&vxlanSpec, new(uint32(parentIface.Index))).Encode()
+	suite.Require().NoError(err)
+
+	suite.Require().NoError(
+		conn.Link.New(
+			&rtnetlink.LinkMessage{
+				Type: unix.ARPHRD_ETHER,
+				Attributes: &rtnetlink.LinkAttributes{
+					Name: vxlanInterface,
+					Info: &rtnetlink.LinkInfo{
+						Kind: "vxlan",
+						Data: &rtnetlink.LinkData{
+							Name: "vxlan",
+							Data: vxlanData,
+						},
+					},
+				},
+			},
+		),
+	)
+
+	vxlanIface, err := net.InterfaceByName(vxlanInterface)
+	suite.Require().NoError(err)
+
+	defer conn.Link.Delete(uint32(vxlanIface.Index)) //nolint:errcheck
+
+	ctest.AssertResource(suite, vxlanInterface, func(r *network.LinkStatus, asrt *assert.Assertions) {
+		asrt.Equal("ether", r.TypedSpec().Type.String())
+		asrt.Equal(network.LinkKindVXLAN, r.TypedSpec().Kind)
+		asrt.Equal(vxlanSpec, r.TypedSpec().VXLAN)
 	})
 }
 

@@ -17,13 +17,23 @@ import (
 // Should be used only in this file.
 const mdKey = constants.APIAuthzRoleMetadataKey
 
-// SetMetadata sets given roles in gRPC metadata.
+// SetMetadata sets given roles in gRPC metadata, replacing any value already present.
+//
+// An empty role set removes the key.
 func SetMetadata(md metadata.MD, roles role.Set) {
-	md.Set(mdKey, roles.Strings()...)
+	roleStrings := roles.Strings()
+
+	if len(roleStrings) == 0 {
+		md.Delete(mdKey)
+
+		return
+	}
+
+	md.Set(mdKey, roleStrings...)
 }
 
 // getFromMetadata returns roles extracted from gRPC metadata.
-func getFromMetadata(ctx context.Context, logf func(format string, v ...any)) (role.Set, bool) {
+func getFromMetadata(ctx context.Context, annotate func(ctx context.Context, format string, v ...any)) (role.Set, bool) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		panic("no request metadata")
@@ -31,17 +41,13 @@ func getFromMetadata(ctx context.Context, logf func(format string, v ...any)) (r
 
 	strings := md.Get(mdKey)
 	if len(strings) == 0 {
-		if logf != nil {
-			logf("no roles in metadata")
-		}
+		annotate(ctx, "no roles in metadata")
 
 		return role.Zero, false
 	}
 
 	roles, unknownRoles := role.Parse(strings)
-	if logf != nil {
-		logf("parsed metadata %v as %v (unknownRoles = %v)", strings, roles.Strings(), unknownRoles)
-	}
+	annotate(ctx, "parsed metadata %v as %v (unknownRoles = %v)", strings, roles.Strings(), unknownRoles)
 
 	return roles, true
 }

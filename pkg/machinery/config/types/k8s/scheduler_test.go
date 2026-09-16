@@ -107,6 +107,7 @@ func TestKubeSchedulerConfigUnmarshal(t *testing.T) {
 	}, docs[0])
 }
 
+//nolint:dupl
 func TestKubeSchedulerConfigValidate(t *testing.T) {
 	t.Parallel()
 
@@ -235,6 +236,7 @@ func TestKubeSchedulerConfigValidate(t *testing.T) {
 	}
 }
 
+//nolint:dupl
 func TestKubeSchedulerConfigV1Alpha1Validate(t *testing.T) {
 	t.Parallel()
 
@@ -252,7 +254,7 @@ func TestKubeSchedulerConfigV1Alpha1Validate(t *testing.T) {
 			name: "v1alpha1 with cluster scheduler config set",
 			v1alpha1Cfg: &v1alpha1.Config{
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					SchedulerConfig: &v1alpha1.SchedulerConfig{},
+					SchedulerConfig: &v1alpha1.SchedulerConfig{}, //nolint:staticcheck // testing deprecated field
 				},
 			},
 
@@ -262,7 +264,7 @@ func TestKubeSchedulerConfigV1Alpha1Validate(t *testing.T) {
 			name: "v1alpha1 with machine control plane scheduler config set",
 			v1alpha1Cfg: &v1alpha1.Config{
 				MachineConfig: &v1alpha1.MachineConfig{
-					MachineControlPlane: &v1alpha1.MachineControlPlaneConfig{
+					MachineControlPlane: &v1alpha1.MachineControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						MachineScheduler: &v1alpha1.MachineSchedulerConfig{}, //nolint:staticcheck // testing deprecated field
 					},
 				},

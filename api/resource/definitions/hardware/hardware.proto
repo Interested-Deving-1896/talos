@@ -5,6 +5,71 @@ package talos.resource.definitions.hardware;
 option go_package = "github.com/siderolabs/talos/pkg/machinery/api/resource/definitions/hardware";
 option java_package = "dev.talos.api.resource.definitions.hardware";
 
+import "common/common.proto";
+
+// BMCDeviceSpec describes a BMC as reported over the local IPMI interface.
+//
+// The identity fields come from Get Device ID, the network configuration from
+// Get LAN Configuration Parameters. Network configuration is best-effort: a BMC
+// with no LAN channel configured (or one which doesn't implement the commands)
+// yields the identity fields only.
+message BMCDeviceSpec {
+  // ManufacturerID is the IANA enterprise number of the BMC vendor (e.g. 674 for Dell).
+  uint32 manufacturer_id = 1;
+  // Manufacturer is the vendor name resolved from ManufacturerID, empty if the vendor is not known.
+  string manufacturer = 2;
+  // ProductID is the vendor-specific product identifier of the BMC.
+  uint32 product_id = 3;
+  // FirmwareVersion is the BMC firmware revision, e.g. `7.10`.
+  string firmware_version = 4;
+  // IPMIVersion is the IPMI specification version supported by the BMC, e.g. `2.0`.
+  string ipmi_version = 5;
+  // Channel is the IPMI LAN channel the network configuration was read from.
+  uint32 channel = 6;
+  // Address is the BMC IP address with its subnet mask.
+  common.NetIPPrefix address = 7;
+  // Gateway is the BMC default gateway.
+  common.NetIP gateway = 8;
+  // HardwareAddr is the MAC address of the BMC LAN interface.
+  bytes hardware_addr = 9;
+}
+
+// CPUCoreSpec represents a single CPU core as seen by the Linux kernel.
+message CPUCoreSpec {
+  // Socket is the physical package (socket) identifier the core belongs to.
+  string socket = 1;
+  // CoreID is the core identifier within the socket.
+  string core_id = 2;
+  // LogicalCPUs is the sorted list of logical CPU (hardware thread) numbers belonging to this core.
+  repeated uint32 logical_cp_us = 3;
+  // VendorID is the CPU vendor identifier (e.g. `GenuineIntel`, `AuthenticAMD`).
+  string vendor_id = 4;
+  // CPUFamily is the CPU family.
+  string cpu_family = 5;
+  // Model is the CPU model number.
+  string model = 6;
+  // ModelName is the human-readable CPU model name.
+  string model_name = 7;
+  // Stepping is the CPU stepping.
+  string stepping = 8;
+  // Microcode is the microcode revision.
+  string microcode = 9;
+  // CacheSize is the CPU cache size as reported by the kernel (e.g. `512 KB`).
+  string cache_size = 10;
+  // CoresPerSocket is the number of cores in the socket this core belongs to.
+  uint32 cores_per_socket = 11;
+  // ThreadsPerSocket is the number of logical CPUs (siblings) in the socket this core belongs to.
+  uint32 threads_per_socket = 12;
+  // Flags is the list of CPU feature flags.
+  repeated string flags = 13;
+  // Bugs is the list of known CPU bugs.
+  repeated string bugs = 14;
+  // BogoMips is the kernel BogoMips measurement for the core.
+  double bogo_mips = 15;
+  // AddressSizes describes the physical and virtual address sizes.
+  string address_sizes = 16;
+}
+
 // MemoryModuleSpec represents a single Memory.
 message MemoryModuleSpec {
   uint32 size = 1;
@@ -69,5 +134,6 @@ message SystemInformationSpec {
   string uuid = 5;
   string wake_up_type = 6;
   string sku_number = 7;
+  string bios_version = 8;
 }
 

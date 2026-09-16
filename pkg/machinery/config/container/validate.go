@@ -9,13 +9,18 @@ import (
 	"fmt"
 	"slices"
 
+	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/hashicorp/go-multierror"
+	"github.com/siderolabs/gen/xslices"
 
 	"github.com/siderolabs/talos/pkg/machinery/config"
+	configconfig "github.com/siderolabs/talos/pkg/machinery/config/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 	"github.com/siderolabs/talos/pkg/machinery/config/validation"
+	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
+	"github.com/siderolabs/talos/pkg/machinery/resources/block"
 )
 
 // ValidateAsClient validates the config in the client context (outside of Talos).
@@ -102,8 +107,12 @@ func (container *Container) validate(mode validation.RuntimeMode, opt ...validat
 		}
 	}
 
-	if err := container.validateContainer(mode); err != nil {
-		multiErr = multierror.Append(multiErr, err)
+	containerWarnings, containerErr := container.validateContainer(mode)
+
+	warnings = append(warnings, containerWarnings...)
+
+	if containerErr != nil {
+		multiErr = multierror.Append(multiErr, containerErr)
 	}
 
 	return warnings, multiErr.ErrorOrNil()
@@ -143,16 +152,71 @@ func (container *Container) runtimeValidate(ctx context.Context, st state.State,
 		}
 	}
 
+	if err := container.runtimeValidateContainer(ctx, st); err != nil {
+		multiErr = multierror.Append(multiErr, err)
+	}
+
 	return warnings, multiErr.ErrorOrNil()
+}
+
+// runtimeValidateContainer validates the full configuration container in the runtime context.
+//
+// This is the runtime-context counterpart to validateContainer: it performs validation which only
+// makes sense for the whole configuration (vs. individual documents) and which requires runtime
+// state. In particular, it detects a promotable system volume (ETCD, CRI, KUBELET, LOG) whose backing
+// VolumeConfig document has been removed while the volume is still backed by a live dedicated
+// partition. The per-document VolumeConfig.RuntimeValidate cannot catch this because a removed
+// document is no longer part of the container.
+func (container *Container) runtimeValidateContainer(ctx context.Context, st state.State) error {
+	var errs *multierror.Error
+
+	volumes := container.Volumes()
+
+	for _, name := range configconfig.PromotableSystemVolumeNames {
+		if _, present := volumes.ByName(name); present {
+			// the document is still present: VolumeConfig.RuntimeValidate handles any backing conflict.
+			continue
+		}
+
+		volumeStatus, err := safe.StateGetByID[*block.VolumeStatus](ctx, st, name)
+		if err != nil {
+			if state.IsNotFoundError(err) {
+				// the volume was never established (cluster creation / boot): nothing to conflict with.
+				continue
+			}
+
+			return err
+		}
+
+		// only compare against a settled volume; an in-flight volume is not yet established.
+		if volumeStatus.TypedSpec().Phase != block.VolumePhaseReady {
+			continue
+		}
+
+		if volumeStatus.TypedSpec().Type == block.VolumeTypePartition {
+			errs = multierror.Append(errs, fmt.Errorf(
+				"the %q system volume is backed by a dedicated partition and its VolumeConfig cannot be removed; "+
+					"migrating a system volume off a dedicated partition is not supported",
+				name,
+			))
+		}
+	}
+
+	return errs.ErrorOrNil()
 }
 
 // validateContainer validates the full configuration container.
 //
 // This validation is used to do validation which only makes sense for the full configuration (vs. individual documents).
 //
-//nolint:gocyclo
-func (container *Container) validateContainer(mode validation.RuntimeMode) error {
-	var errs error
+// The method returns warnings and fatal errors (as multierror).
+//
+//nolint:gocyclo,cyclop
+func (container *Container) validateContainer(mode validation.RuntimeMode) ([]string, error) {
+	var (
+		warnings []string
+		errs     error
+	)
 
 	if mode.InContainer() {
 		// in container mode, HostDNS must be enabled and forward KubeDNS to host must be enabled as well
@@ -189,24 +253,109 @@ func (container *Container) validateContainer(mode validation.RuntimeMode) error
 		}
 	}
 
+	// Discovery requires a cluster identity
+	if discoveryConfigs := container.DiscoveryServiceConfigs(); len(discoveryConfigs) > 0 {
+		identity := container.DiscoveryIdentityConfig()
+
+		if identity == nil || identity.ClusterID() == "" {
+			errs = multierror.Append(errs, fmt.Errorf("cluster ID (.cluster.id or DiscoveryIdentityConfig) should be set when cluster discovery (DiscoveryServiceConfig) is enabled"))
+		}
+
+		if identity == nil || identity.ClusterSecret() == "" {
+			errs = multierror.Append(errs, fmt.Errorf("cluster secret (.cluster.secret or DiscoveryIdentityConfig) should be set when cluster discovery (DiscoveryServiceConfig) is enabled"))
+		}
+	}
+
+	// Container dependencies must form a DAG, and must only reference containers that exist.
+	// A per-document Validate() cannot see the other documents, so this is a container-level check.
+	if err := validateContainerDependencies(container.ContainerConfigs()); err != nil {
+		errs = multierror.Append(errs, err)
+	}
+
+	// KubeSpan requires a cluster identity, provided either by the deprecated .cluster.id/.cluster.secret
+	// or by a DiscoveryIdentityConfig document. The identity may live in a separate document, so this
+	// cross-document check is done at the container level.
+	if kubeSpanConfig := container.NetworkKubeSpanConfig(); kubeSpanConfig != nil && kubeSpanConfig.Enabled() {
+		discoveryEnabled := len(container.DiscoveryServiceConfigs()) > 0
+
+		if !discoveryEnabled {
+			errs = multierror.Append(errs, fmt.Errorf("KubeSpan requires cluster discovery to be enabled"))
+		}
+	}
+
+	// machine type specific checks
+	var machineType machine.Type
+
+	if container.Machine() != nil {
+		machineType = container.Machine().Type()
+	}
+
 	// control plane specific checks
-	if container.Machine() != nil && container.Machine().Type().IsControlPlane() {
-		hasLegacyEtcdEncryptionConfig := container.Cluster() != nil && (container.Cluster().SecretboxEncryptionSecret() != "" || container.Cluster().AESCBCEncryptionSecret() != "")
-		hasKubeEtcdEncryptionConfig := container.K8sEtcdEncryptionConfig() != nil
+	if machineType.IsControlPlane() {
+		// switching here on api-server CA config instead of api-server config,
+		// as due to backwards compatibility reasons, the empty legacy `.cluster.apiServer` config
+		// resolves to "default api-server".
+		if container.K8sAPIServerCAConfig() != nil {
+			hasLegacyEtcdEncryptionConfig := container.Cluster() != nil && (container.Cluster().SecretboxEncryptionSecret() != "" || container.Cluster().AESCBCEncryptionSecret() != "")
+			hasKubeEtcdEncryptionConfig := container.K8sEtcdEncryptionConfig() != nil
 
-		if !hasLegacyEtcdEncryptionConfig && !hasKubeEtcdEncryptionConfig {
-			errs = multierror.Append(errs, fmt.Errorf("etcd encryption config is required for control plane machines"))
+			if !hasLegacyEtcdEncryptionConfig && !hasKubeEtcdEncryptionConfig {
+				errs = multierror.Append(errs, fmt.Errorf("etcd encryption config is required for control plane machines running kube-apiserver"))
+			}
+		}
+
+		// the legacy .machine.nodeLabels/.machine.nodeTaints are amended with the control plane role
+		// label and taint for control plane machines, while the KubeNodeConfig document is used as-is,
+		// so warn if the control plane role label is missing after the migration
+		//
+		// the taint is not checked, as skipping it is a valid way to allow scheduling on control planes
+		if nodeConfigs := findMatchingDocs[configconfig.K8sNodeConfig](container.documents); len(nodeConfigs) > 0 {
+			nodeConfig := nodeConfigs[0]
+
+			_, hasControlPlaneLabel := nodeConfig.Labels()[constants.LabelNodeRoleControlPlane]
+
+			// if the node is not registered in Kubernetes, the labels and taints are not used at all
+			if !hasControlPlaneLabel && !nodeConfig.SkipNodeRegistration() {
+				warnings = append(warnings, fmt.Sprintf(
+					"KubeNodeConfig document should set the %q node label on control plane machines "+
+						"(and, unless scheduling on control planes is allowed, the %q taint): "+
+						"unlike .machine.nodeLabels/.machine.nodeTaints, the document contents are used as-is",
+					constants.LabelNodeRoleControlPlane,
+					constants.LabelNodeRoleControlPlane+": "+constants.TaintEffectNoSchedule,
+				))
+			}
 		}
 	}
 
-	// worker specific checks
-	if container.Machine() != nil && container.Machine().Type() == machine.TypeWorker {
-		if container.K8sEtcdEncryptionConfig() != nil {
-			errs = multierror.Append(errs, fmt.Errorf("etcd encryption config is not supported for worker machines"))
-		}
+	// if Kubernetes is configured for this machine (there is a Kubernetes CA), the cluster name and
+	// endpoint are required: they might be provided either by the legacy .cluster.controlPlane.endpoint
+	// or by the KubeClusterConfig document, so this is a cross-document check
+	//
+	// configs generated with Kubernetes disabled have neither, so they are not affected
+	if container.K8sAPIServerCAConfig() != nil && container.K8sClusterConfig() == nil {
+		errs = multierror.Append(errs, fmt.Errorf("cluster name and endpoint are required when Kubernetes is configured: "+
+			"either .cluster.clusterName/.cluster.controlPlane.endpoint or the KubeClusterConfig document"))
 	}
 
-	return errs
+	controlplaneDocs := findMatchingDocs[ControlplaneOnlyConfig](container.documents)
+
+	if len(controlplaneDocs) > 0 && !machineType.IsControlPlane() {
+		kinds := xslices.Map(controlplaneDocs, func(d ControlplaneOnlyConfig) string {
+			return d.Kind()
+		})
+		slices.Sort(kinds)
+		kinds = slices.Compact(kinds)
+
+		errs = multierror.Append(
+			errs,
+			fmt.Errorf(
+				"the following document kinds are only allowed on control plane machines: %v",
+				kinds,
+			),
+		)
+	}
+
+	return warnings, errs
 }
 
 // Validate is the legacy validation method.

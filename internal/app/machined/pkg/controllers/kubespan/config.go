@@ -19,7 +19,7 @@ import (
 // ConfigController watches v1alpha1.Config, updates KubeSpan config.
 type ConfigController = transform.Controller[*config.MachineConfig, *kubespan.Config]
 
-// NewConfigController instanciates the config controller.
+// NewConfigController instantiates the config controller.
 func NewConfigController() *ConfigController {
 	return transform.NewController(
 		transform.Settings[*config.MachineConfig, *kubespan.Config]{
@@ -30,6 +30,10 @@ func NewConfigController() *ConfigController {
 				}
 
 				if cfg.Config().Machine() == nil || cfg.Config().Cluster() == nil {
+					return optional.None[*kubespan.Config]()
+				}
+
+				if cfg.Config().DiscoveryIdentityConfig() == nil {
 					return optional.None[*kubespan.Config]()
 				}
 
@@ -52,12 +56,15 @@ func NewConfigController() *ConfigController {
 
 						if c.NetworkKubeSpanConfig().Filters() != nil {
 							res.TypedSpec().EndpointFilters = c.NetworkKubeSpanConfig().Filters().Endpoints()
+							res.TypedSpec().PeerEndpointFilters = c.NetworkKubeSpanConfig().Filters().PeerEndpoints()
 							res.TypedSpec().ExcludeAdvertisedNetworks = c.NetworkKubeSpanConfig().Filters().ExcludeAdvertisedNetworks()
 						}
 					}
 
-					res.TypedSpec().ClusterID = c.Cluster().ID()
-					res.TypedSpec().SharedSecret = c.Cluster().Secret()
+					identity := c.DiscoveryIdentityConfig()
+					res.TypedSpec().ClusterID = identity.ClusterID()
+					res.TypedSpec().SharedSecret = identity.ClusterSecret()
+
 					res.TypedSpec().ExtraEndpoints = c.KubespanConfig().ExtraAnnouncedEndpoints()
 				}
 
