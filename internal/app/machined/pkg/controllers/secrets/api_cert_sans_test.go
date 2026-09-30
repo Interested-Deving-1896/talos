@@ -25,10 +25,8 @@ import (
 
 func TestAPICertSANsSuite(t *testing.T) {
 	suite.Run(t, &APICertSANsSuite{
-		DefaultSuite: ctest.DefaultSuite{
-			AfterSetup: func(suite *ctest.DefaultSuite) {
-				suite.Require().NoError(suite.Runtime().RegisterController(&secretsctrl.APICertSANsController{}))
-			},
+		AfterSetup: func(suite *ctest.DefaultSuite) {
+			suite.Require().NoError(suite.Runtime().RegisterController(&secretsctrl.APICertSANsController{}))
 		},
 	})
 }
@@ -80,7 +78,7 @@ func (suite *APICertSANsSuite) TestReconcileControlPlane() {
 		spec := certSANs.TypedSpec()
 
 		suite.Assert().Equal([]string{"bar", "bar.some.org", "some.org"}, spec.DNSNames)
-		suite.Assert().Equal("[10.2.1.3 10.4.3.2 172.16.0.1]", fmt.Sprintf("%v", spec.IPs))
+		suite.Assert().Equal("[10.2.1.3 10.4.3.2 127.0.0.1 172.16.0.1]", fmt.Sprintf("%v", spec.IPs))
 		suite.Assert().Equal("bar.some.org", spec.FQDN)
 
 		return nil

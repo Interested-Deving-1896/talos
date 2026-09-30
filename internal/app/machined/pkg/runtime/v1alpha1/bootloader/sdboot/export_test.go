@@ -6,7 +6,9 @@ package sdboot
 
 // exported for testing only.
 var (
+	FindBootedUKIFile   = findBootedUKIFile
+	FindNextBootUKIFile = findNextBootUKIFile
 	FindMatchingUKIFile = findMatchingUKIFile
 	GenerateNextUKIName = generateNextUKIName
-	GenerateAssets      = (*Config).generateAssets
+	CopyAssets          = (*Config).copyAssets
 )

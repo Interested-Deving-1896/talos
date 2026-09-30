@@ -52,6 +52,14 @@ func getParams(mode runtime.Mode) []*kernel.Param {
 			Key:   "proc.sys.net.ipv4.ip_local_reserved_ports",
 			Value: "50000,50001",
 		},
+		{
+			Key:   "proc.sys.net.ipv4.conf.all.send_redirects",
+			Value: "0",
+		},
+		{
+			Key:   "proc.sys.net.ipv4.conf.default.send_redirects",
+			Value: "0",
+		},
 	}
 
 	if mode != runtime.ModeContainer {
@@ -67,6 +75,10 @@ func getParams(mode runtime.Mode) []*kernel.Param {
 			{
 				Key:   "proc.sys.fs.protected_fifos",
 				Value: "2",
+			},
+			{
+				Key:   "proc.sys.kernel.ctrl-alt-del",
+				Value: "0",
 			},
 		}...)
 	}
@@ -108,8 +120,6 @@ func TestKernelParamDefaultsSuite(t *testing.T) {
 	t.Parallel()
 
 	suite.Run(t, &KernelParamDefaultsSuite{
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 5 * time.Second,
-		},
+		Timeout: 5 * time.Second,
 	})
 }

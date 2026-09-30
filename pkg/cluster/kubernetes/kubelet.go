@@ -17,7 +17,7 @@ import (
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/siderolabs/gen/xiter"
 	"github.com/siderolabs/go-retry/retry"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/siderolabs/talos/pkg/kubernetes"
@@ -185,20 +185,19 @@ func upgradeKubeletPatcher(
 ) func(config.Container) (configpatcher.Patch, error) {
 	return func(cfg config.Container) (configpatcher.Patch, error) {
 		oldImage := kubeletSpec.TypedSpec().Image
-		oldImage, _, _ = strings.Cut(oldImage, "@") // ignore digest if present
+		oldVersion, _ := kubernetes.VersionFromImageRef(oldImage)
 
-		oldSuffix := extractKubeletVersionSuffix(oldImage)
+		oldSuffix := extractKubeletVersionSuffix(oldVersion)
 		newVersion := options.Path.ToVersion() + oldSuffix
 
-		logUpdate := func(oldImage string) {
-			_, version, _ := strings.Cut(oldImage, ":")
-			if version == "" {
-				version = options.Path.FromVersion()
+		logUpdate := func(oldVersion string) {
+			if oldVersion == "" {
+				oldVersion = options.Path.FromVersion()
 			}
 
-			version = strings.TrimLeft(version, "v")
+			oldVersion = strings.TrimLeft(oldVersion, "v")
 
-			options.Log(" > update %s: %s -> %s", kubelet, version, newVersion)
+			options.Log(" > update %s: %s -> %s", kubelet, oldVersion, newVersion)
 
 			if options.DryRun {
 				options.Log(" > skipped in dry-run")
@@ -211,7 +210,7 @@ func upgradeKubeletPatcher(
 			return nil, errUpdateSkipped
 		}
 
-		logUpdate(oldImage)
+		logUpdate(oldVersion)
 
 		if options.DryRun {
 			return nil, errUpdateSkipped
@@ -267,11 +266,11 @@ func checkNodeKubeletVersion(ctx context.Context, cluster UpgradeProvider, nodeT
 		ready := false
 
 		for _, condition := range node.Status.Conditions {
-			if condition.Type != v1.NodeReady {
+			if condition.Type != corev1.NodeReady {
 				continue
 			}
 
-			if condition.Status == v1.ConditionTrue {
+			if condition.Status == corev1.ConditionTrue {
 				ready = true
 
 				break

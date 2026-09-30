@@ -32,6 +32,7 @@ type Manager struct {
 	extraDirs             []string
 	extraUnmountCallbacks []func(m *Manager)
 	recursiveUnmount      bool
+	lazyUnmount           bool
 
 	point *Point
 }
@@ -112,6 +113,7 @@ func (m *Manager) Unmount() error {
 	opts := UnmountOptions{
 		Printer:   printer,
 		Recursive: m.recursiveUnmount,
+		Lazy:      m.lazyUnmount,
 	}
 
 	for _, cb := range m.extraUnmountCallbacks {
@@ -217,9 +219,14 @@ func WithDisableAccessTime() ManagerOption {
 	return WithMountAttributes(unix.MOUNT_ATTR_NOATIME)
 }
 
-// WithSecure sets MOUNT_ATTR_NOSUID, MOUNT_ATTR_NODEV, and MOUNT_ATTR_NOEXEC.
+// WithSecure sets MOUNT_ATTR_NOSUID and MOUNT_ATTR_NODEV.
 func WithSecure() ManagerOption {
-	return WithMountAttributes(unix.MOUNT_ATTR_NOSUID | unix.MOUNT_ATTR_NODEV | unix.MOUNT_ATTR_NOEXEC)
+	return WithMountAttributes(unix.MOUNT_ATTR_NOSUID | unix.MOUNT_ATTR_NODEV)
+}
+
+// WithNoExec sets MOUNT_ATTR_NOEXEC.
+func WithNoExec() ManagerOption {
+	return WithMountAttributes(unix.MOUNT_ATTR_NOEXEC)
 }
 
 // WithReadOnly sets the mount as read only.
@@ -261,6 +268,19 @@ func WithRecursiveUnmount() ManagerOption {
 	return ManagerOption{
 		set: func(m *Manager) {
 			m.recursiveUnmount = true
+		},
+	}
+}
+
+// WithLazyUnmount enables a lazy detach (MNT_DETACH) as a last resort when the target,
+// or one of its submounts, can't be unmounted otherwise.
+//
+// It's meant for volatile pseudo mounts (e.g. /system, /run) torn down on shutdown,
+// not for real filesystems where a busy mount is better left for the caller to retry.
+func WithLazyUnmount() ManagerOption {
+	return ManagerOption{
+		set: func(m *Manager) {
+			m.lazyUnmount = true
 		},
 	}
 }

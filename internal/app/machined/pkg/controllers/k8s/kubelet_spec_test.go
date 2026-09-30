@@ -270,11 +270,9 @@ func TestKubeletSpecSuite(t *testing.T) {
 	t.Parallel()
 
 	suite.Run(t, &KubeletSpecSuite{
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 3 * time.Second,
-			AfterSetup: func(suite *ctest.DefaultSuite) {
-				suite.Require().NoError(suite.Runtime().RegisterController(&k8sctrl.KubeletSpecController{}))
-			},
+		Timeout: 3 * time.Second,
+		AfterSetup: func(suite *ctest.DefaultSuite) {
+			suite.Require().NoError(suite.Runtime().RegisterController(&k8sctrl.KubeletSpecController{}))
 		},
 	})
 }
@@ -342,11 +340,9 @@ func TestNewKubeletConfigurationMerge(t *testing.T) {
 	t.Parallel()
 
 	defaultKubeletConfig := kubeletconfig.KubeletConfiguration{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: kubeletconfig.SchemeGroupVersion.String(),
-			Kind:       "KubeletConfiguration",
-		},
-		Port: constants.KubeletPort,
+		APIVersion: kubeletconfig.SchemeGroupVersion.String(),
+		Kind:       "KubeletConfiguration",
+		Port:       constants.KubeletPort,
 		Authentication: kubeletconfig.KubeletAuthentication{
 			X509: kubeletconfig.KubeletX509Authentication{
 				ClientCAFile: constants.KubernetesCACert,
@@ -362,8 +358,8 @@ func TestNewKubeletConfigurationMerge(t *testing.T) {
 			Mode: kubeletconfig.KubeletAuthorizationModeWebhook,
 		},
 		CgroupRoot:            "/",
-		SystemCgroups:         constants.CgroupSystem,
-		KubeletCgroups:        constants.CgroupKubelet,
+		SystemCgroups:         "/" + constants.CgroupSystem,
+		KubeletCgroups:        "/" + constants.CgroupKubelet,
 		RotateCertificates:    true,
 		ProtectKernelDefaults: true,
 		Address:               "0.0.0.0",
@@ -419,6 +415,9 @@ func TestNewKubeletConfigurationMerge(t *testing.T) {
 			cfgSpec: &k8s.KubeletConfigSpec{
 				ClusterDNS:    []string{"10.0.0.5"},
 				ClusterDomain: "cluster.local",
+				RegisterWithTaints: map[string]string{
+					constants.LabelNodeRoleControlPlane: string(corev1.TaintEffectNoSchedule),
+				},
 			},
 			kubeletVersion: compatibility.VersionFromImageRef("ghcr.io/siderolabs/kubelet:v1.29.0"),
 			expectedOverrides: func(kc *kubeletconfig.KubeletConfiguration) {

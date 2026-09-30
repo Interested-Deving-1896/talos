@@ -15,7 +15,7 @@ import (
 	"path/filepath"
 	"time"
 
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -33,27 +33,21 @@ type Client struct {
 // NewClient creates new kubelet API client.
 func NewClient(nodename string, clientCert, clientKey, caPEM []byte) (*Client, error) {
 	config := &rest.Config{
-		Host: fmt.Sprintf("https://127.0.0.1:%d/", constants.KubeletPort),
-		ContentConfig: rest.ContentConfig{
-			NegotiatedSerializer: serializer.WithoutConversionCodecFactory{CodecFactory: scheme.Codecs},
-		},
+		Host:                 fmt.Sprintf("https://127.0.0.1:%d/", constants.KubeletPort),
+		NegotiatedSerializer: serializer.WithoutConversionCodecFactory{CodecFactory: scheme.Codecs},
 
-		TLSClientConfig: rest.TLSClientConfig{
-			CertData:   clientCert,
-			KeyData:    clientKey,
-			CAData:     caPEM,
-			ServerName: nodename,
-		},
+		CertData:   clientCert,
+		KeyData:    clientKey,
+		CAData:     caPEM,
+		ServerName: nodename,
 	}
 
 	kubeletCert, err := os.ReadFile(filepath.Join(constants.KubeletPKIDir, "kubelet.crt"))
 	if err == nil {
 		config.CAData = append(config.CAData, kubeletCert...)
-	} else if err != nil {
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		// ignore if file doesn't exist, assume cert isn't self-signed
-		if !errors.Is(err, fs.ErrNotExist) {
-			return nil, fmt.Errorf("error reading kubelet certificate: %w", err)
-		}
+		return nil, fmt.Errorf("error reading kubelet certificate: %w", err)
 	}
 
 	client := &Client{}
@@ -90,8 +84,8 @@ type PodList struct {
 
 // Pod returns pod details.
 type Pod struct {
-	Metadata Metadata     `json:"metadata"`
-	Status   v1.PodStatus `json:"status"`
+	Metadata Metadata         `json:"metadata"`
+	Status   corev1.PodStatus `json:"status"`
 }
 
 // Metadata is a pod metadata.

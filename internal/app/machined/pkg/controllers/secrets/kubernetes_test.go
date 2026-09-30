@@ -27,11 +27,9 @@ import (
 
 func TestKubernetesSuite(t *testing.T) {
 	suite.Run(t, &KubernetesSuite{
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 5 * time.Second,
-			AfterSetup: func(suite *ctest.DefaultSuite) {
-				suite.Require().NoError(suite.Runtime().RegisterController(&secretsctrl.KubernetesController{}))
-			},
+		Timeout: 5 * time.Second,
+		AfterSetup: func(suite *ctest.DefaultSuite) {
+			suite.Require().NoError(suite.Runtime().RegisterController(&secretsctrl.KubernetesController{}))
 		},
 	})
 }
@@ -71,6 +69,11 @@ func (suite *KubernetesSuite) TestReconcile() {
 	rootSecrets.TypedSpec().AggregatorCA = &x509.PEMEncodedCertificateAndKey{
 		Crt: aggregatorCA.CrtPEM,
 		Key: aggregatorCA.KeyPEM,
+	}
+	rootSecrets.TypedSpec().AcceptedAggregatorCAs = []*x509.PEMEncodedCertificate{
+		{
+			Crt: aggregatorCA.CrtPEM,
+		},
 	}
 	rootSecrets.TypedSpec().ServiceAccount = &x509.PEMEncodedKey{
 		Key: serviceAccount.KeyPEM,

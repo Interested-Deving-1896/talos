@@ -13,7 +13,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -241,14 +241,13 @@ func (au *AWSUploader) registerAMI(ctx context.Context, region string, svc *ec2.
 
 	log.Printf("aws: applied policy to bucket %q", bucketName)
 
-	uploader := manager.NewUploader(s3Svc) //nolint:staticcheck
+	uploader := transfermanager.New(s3Svc)
 
 	var g errgroup.Group
 
 	for _, arch := range au.Options.Architectures {
 		g.Go(func() error {
-			err = au.registerAMIArch(ctx, region, svc, arch, bucketName, uploader)
-			if err != nil {
+			if err := au.registerAMIArch(ctx, region, svc, arch, bucketName, uploader); err != nil {
 				log.Printf("WARNING: aws: ignoring failure to upload AMI into %s/%s: %s", region, arch, err)
 			}
 
@@ -259,6 +258,21 @@ func (au *AWSUploader) registerAMI(ctx context.Context, region string, svc *ec2.
 	return g.Wait()
 }
 
+// imageTags are applied to both the AMI and the snapshot backing it, so that cleanup
+// tooling can apply a retention policy without parsing image names.
+func (au *AWSUploader) imageTags(imageName string) []types.Tag {
+	return []types.Tag{
+		{
+			Key:   new("Name"),
+			Value: new(imageName),
+		},
+		{
+			Key:   new(BuildTypeTagKey),
+			Value: new(au.Options.BuildType),
+		},
+	}
+}
+
 //nolint:gocyclo
 func (au *AWSUploader) tagSnapshot(ctx context.Context, svc *ec2.Client, snapshotID, imageName string) {
 	if snapshotID == "" {
@@ -267,10 +281,7 @@ func (au *AWSUploader) tagSnapshot(ctx context.Context, svc *ec2.Client, snapsho
 
 	_, tagErr := svc.CreateTags(ctx, &ec2.CreateTagsInput{
 		Resources: []string{snapshotID},
-		Tags: []types.Tag{{
-			Key:   new("Name"),
-			Value: new(imageName),
-		}},
+		Tags:      au.imageTags(imageName),
 	})
 	if tagErr != nil {
 		log.Printf("WARNING: failed to tag snapshot %s: %v", snapshotID, tagErr)
@@ -278,7 +289,7 @@ func (au *AWSUploader) tagSnapshot(ctx context.Context, svc *ec2.Client, snapsho
 }
 
 //nolint:gocyclo
-func (au *AWSUploader) registerAMIArch(ctx context.Context, region string, svc *ec2.Client, arch, bucketName string, uploader *manager.Uploader) error { //nolint:staticcheck
+func (au *AWSUploader) registerAMIArch(ctx context.Context, region string, svc *ec2.Client, arch, bucketName string, uploader *transfermanager.Client) error {
 	err := retry.Constant(30*time.Minute, retry.WithUnits(time.Second), retry.WithErrorLogging(true)).RetryWithContext(ctx, func(ctx context.Context) error {
 		source, err := os.Open(au.Options.AWSImage(arch))
 		if err != nil {
@@ -294,7 +305,7 @@ func (au *AWSUploader) registerAMIArch(ctx context.Context, region string, svc *
 
 		defer image.Close()
 
-		_, err = uploader.Upload(ctx, &s3.PutObjectInput{ //nolint:staticcheck
+		_, err = uploader.UploadObject(ctx, &transfermanager.UploadObjectInput{
 			Bucket: new(bucketName),
 			Key:    new(fmt.Sprintf("disk-%s.raw", arch)),
 			Body:   image,
@@ -423,6 +434,12 @@ func (au *AWSUploader) registerAMIArch(ctx context.Context, region string, svc *
 		Description:        new(fmt.Sprintf("Talos AMI %s %s %s", au.Options.Tag, arch, region)),
 		Architecture:       awsArchitectures[arch],
 		ImdsSupport:        types.ImdsSupportValuesV20,
+		TagSpecifications: []types.TagSpecification{
+			{
+				ResourceType: types.ResourceTypeImage,
+				Tags:         au.imageTags(imageName),
+			},
+		},
 	}
 
 	registerResp, err := svc.RegisterImage(ctx, registerReq)

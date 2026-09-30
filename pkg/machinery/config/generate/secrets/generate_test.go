@@ -43,14 +43,33 @@ func TestNewBundle(t *testing.T) {
 			name:            "current",
 			versionContract: config.TalosVersionCurrent,
 		},
+		{
+			name:            "current + no k8s + no etcd",
+			versionContract: config.TalosVersionCurrent.DisableKubernetes().DisableEtcd(),
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			_, err := secrets.NewBundle(secrets.NewFixedClock(time.Now()), test.versionContract)
+			bundle, err := secrets.NewBundle(secrets.NewFixedClock(time.Now()), test.versionContract)
 			require.NoError(t, err)
+
+			require.NoError(t, bundle.Validate(test.versionContract))
 		})
 	}
+}
+
+func TestNewBundleServiceAccountKeyType(t *testing.T) {
+	t.Parallel()
+
+	bundle, err := secrets.NewBundle(secrets.NewFixedClock(time.Now()), config.TalosVersionCurrent)
+	require.NoError(t, err)
+	require.Contains(t, string(bundle.Certs.K8sServiceAccount.Key), "RSA PRIVATE KEY")
+
+	bundle, err = secrets.NewBundle(secrets.NewFixedClock(time.Now()), config.TalosVersionCurrent, secrets.WithECDSAServiceAccountKey())
+	require.NoError(t, err)
+	require.Contains(t, string(bundle.Certs.K8sServiceAccount.Key), "EC PRIVATE KEY")
+	require.NoError(t, bundle.Validate(config.TalosVersionCurrent))
 }
 
 func TestNewBundleFromConfig(t *testing.T) {

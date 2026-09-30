@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest"
 )
 
@@ -39,6 +40,7 @@ type DefaultSuite struct {
 
 	AfterSetup    func(suite *DefaultSuite)
 	AfterTearDown func(suite *DefaultSuite)
+	Logger        *zap.Logger
 	Timeout       time.Duration
 }
 
@@ -50,11 +52,22 @@ func (suite *DefaultSuite) SetupTest() {
 
 	suite.ctx, suite.ctxCancel = context.WithTimeout(context.Background(), suite.Timeout)
 
-	suite.state = state.WrapCore(namespaced.NewState(inmem.Build))
+	suite.state = state.WrapCore(namespaced.NewState(
+		func(ns resource.Namespace) state.CoreState {
+			return inmem.NewStateWithOptions(
+				inmem.WithHistoryMaxCapacity(1000),
+			)(ns)
+		},
+	))
 
 	var err error
 
-	suite.runtime, err = runtime.NewRuntime(suite.state, zaptest.NewLogger(suite.T()))
+	logger := suite.Logger
+	if logger == nil {
+		logger = zaptest.NewLogger(suite.T())
+	}
+
+	suite.runtime, err = runtime.NewRuntime(suite.state, logger)
 	suite.Require().NoError(err)
 
 	suite.startRuntime()

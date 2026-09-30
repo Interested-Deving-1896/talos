@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"time"
 
 	"golang.org/x/net/http/httpproxy"
 	"golang.org/x/net/proxy"
@@ -90,6 +91,10 @@ func DynamicProxyDialerWithTLSConfig(tlsConfigFunc func() *tls.Config) func(ctx 
 				return nil, err
 			}
 
+			if cd, ok := socks5Dialer.(proxy.ContextDialer); ok {
+				return cd.DialContext(ctx, "tcp", addr)
+			}
+
 			return socks5Dialer.Dial("tcp", addr)
 		}
 
@@ -123,6 +128,57 @@ func mapAddress(address string) (*url.URL, error) {
 	}
 
 	return httpproxy.FromEnvironment().ProxyFunc()(req.URL)
+}
+
+// ForProxyURL returns a context dialer that routes connections through the given proxy URL.
+// Use "direct" to explicitly bypass any proxy (including env vars).
+// Supported schemes: socks5, http, https.
+func ForProxyURL(rawURL string) func(ctx context.Context, addr string) (net.Conn, error) {
+	if rawURL == "direct" {
+		return func(ctx context.Context, addr string) (net.Conn, error) {
+			return NetDialerWithTCPKeepalive().DialContext(ctx, "tcp", addr)
+		}
+	}
+
+	return func(ctx context.Context, addr string) (net.Conn, error) {
+		proxyURL, err := url.Parse(rawURL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid proxy URL: %w", err)
+		}
+
+		switch proxyURL.Scheme {
+		case "socks5":
+			socks5Dialer, err := proxySocksFromURL(proxyURL)
+			if err != nil {
+				return nil, err
+			}
+
+			if cd, ok := socks5Dialer.(proxy.ContextDialer); ok {
+				return cd.DialContext(ctx, "tcp", addr)
+			}
+
+			return socks5Dialer.Dial("tcp", addr)
+		case "http":
+			conn, err := NetDialerWithTCPKeepalive().DialContext(ctx, "tcp", proxyURL.Host)
+			if err != nil {
+				return nil, err
+			}
+
+			return doHTTPConnectHandshake(ctx, conn, addr, proxyURL, grpcUA)
+		case "https":
+			conn, err := (&tls.Dialer{
+				NetDialer: NetDialerWithTCPKeepalive(),
+				Config:    &tls.Config{},
+			}).DialContext(ctx, "tcp", proxyURL.Host)
+			if err != nil {
+				return nil, err
+			}
+
+			return doHTTPConnectHandshake(ctx, conn, addr, proxyURL, grpcUA)
+		default:
+			return nil, fmt.Errorf("unsupported proxy scheme %q", proxyURL.Scheme)
+		}
+	}
 }
 
 // To read a response from a net.Conn, http.ReadResponse() takes a bufio.Reader.
@@ -207,15 +263,37 @@ func sendHTTPRequest(ctx context.Context, req *http.Request, conn net.Conn) erro
 	return nil
 }
 
+// TCP keepalive settings for the Talos API client connections.
+//
+// Most long-running Talos API calls are server-streaming (e.g. `Events`), so the client sends
+// nothing at all once the request is on the wire. A peer which goes away without closing the
+// connection - a node kexec'ed into a new kernel by an upgrade is the common case - is therefore
+// invisible at the HTTP/2 level: it produces silence, not an error, and the connection stays
+// `READY` forever.
+//
+// TCP keepalives probe the connection from below HTTP/2, so unlike gRPC keepalive pings they are
+// never seen by the server and can't trip its keepalive enforcement policy on a connection which
+// is idle but perfectly valid (e.g. while the node is pulling an image).
+//
+// Only `Idle` and `Interval` are set: those are the knobs supported across the platforms
+// `talosctl` runs on, while the probe count is not (it is unavailable on OpenBSD and on Windows
+// releases before 10 1709). Leaving the count at the OS default (8-10 probes) puts the detection
+// time at around two minutes.
+const (
+	tcpKeepaliveIdle     = 30 * time.Second
+	tcpKeepaliveInterval = 10 * time.Second
+)
+
 // NetDialerWithTCPKeepalive returns a net.Dialer that enables TCP keepalives on
-// the underlying connection with OS default values for keepalive parameters.
+// the underlying connection to detect peers which went away without closing the connection.
 func NetDialerWithTCPKeepalive() *net.Dialer {
 	return &net.Dialer{
 		KeepAliveConfig: net.KeepAliveConfig{
 			Enable:   true,
-			Idle:     -1,
-			Count:    -1,
-			Interval: -1,
+			Idle:     tcpKeepaliveIdle,
+			Interval: tcpKeepaliveInterval,
+			// not set: unsupported on some platforms, so the OS default applies
+			Count: -1,
 		},
 	}
 }

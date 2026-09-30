@@ -35,7 +35,10 @@ func (a *Akamai) Name() string {
 }
 
 // ParseMetadata converts Akamai platform metadata into platform network config.
-func (a *Akamai) ParseMetadata(metadata *akametadata.InstanceData, interfaceAddresses *akametadata.NetworkData) (*runtime.PlatformNetworkConfig, error) {
+func (a *Akamai) ParseMetadata(
+	metadata *akametadata.InstanceData,
+	interfaceAddresses *akametadata.NetworkData,
+) (*runtime.PlatformNetworkConfig, error) {
 	networkConfig := &runtime.PlatformNetworkConfig{}
 
 	if metadata.Label != "" {
@@ -50,7 +53,11 @@ func (a *Akamai) ParseMetadata(metadata *akametadata.InstanceData, interfaceAddr
 		networkConfig.Hostnames = append(networkConfig.Hostnames, hostnameSpec)
 	}
 
-	publicIPs := make([]string, 0, len(interfaceAddresses.IPv4.Public)+len(interfaceAddresses.IPv6.Ranges))
+	publicIPs := make(
+		[]string,
+		0,
+		len(interfaceAddresses.IPv4.Public)+len(interfaceAddresses.IPv6.Ranges),
+	)
 
 	// external IP
 	for _, iface := range interfaceAddresses.IPv4.Public {
@@ -98,37 +105,43 @@ func (a *Akamai) ParseMetadata(metadata *akametadata.InstanceData, interfaceAddr
 		)
 	}
 
-	networkConfig.Addresses = append(
-		networkConfig.Addresses,
-		network.AddressSpecSpec{
+	// only add IPv6 link-local address and gateway route if IPv6 is supported
+	// (VPC interfaces don't support IPv6, so the metadata doesn't include it)
+	if interfaceAddresses.IPv6.LinkLocal.IsValid() {
+		networkConfig.Addresses = append(
+			networkConfig.Addresses,
+			network.AddressSpecSpec{
+				ConfigLayer: network.ConfigPlatform,
+				LinkName:    "eth0",
+				Address:     interfaceAddresses.IPv6.LinkLocal,
+				Scope:       nethelpers.ScopeLink,
+				Family:      nethelpers.FamilyInet6,
+			},
+		)
+
+		ipv6gw, err := netip.ParseAddr(
+			strings.Split(interfaceAddresses.IPv6.LinkLocal.String(), ":")[0] + "::1",
+		)
+		if err != nil {
+			return nil, err
+		}
+
+		route := network.RouteSpecSpec{
 			ConfigLayer: network.ConfigPlatform,
-			LinkName:    "eth0",
-			Address:     interfaceAddresses.IPv6.LinkLocal,
-			Scope:       nethelpers.ScopeLink,
+			Gateway:     ipv6gw,
+			OutLinkName: "eth0",
+			Destination: interfaceAddresses.IPv6.LinkLocal,
+			Table:       nethelpers.TableMain,
+			Protocol:    nethelpers.ProtocolStatic,
+			Type:        nethelpers.TypeUnicast,
 			Family:      nethelpers.FamilyInet6,
-		},
-	)
+			Priority:    1024,
+		}
 
-	ipv6gw, err := netip.ParseAddr(strings.Split(interfaceAddresses.IPv6.LinkLocal.String(), ":")[0] + "::1")
-	if err != nil {
-		return nil, err
+		route.Normalize()
+
+		networkConfig.Routes = append(networkConfig.Routes, route)
 	}
-
-	route := network.RouteSpecSpec{
-		ConfigLayer: network.ConfigPlatform,
-		Gateway:     ipv6gw,
-		OutLinkName: "eth0",
-		Destination: interfaceAddresses.IPv6.LinkLocal,
-		Table:       nethelpers.TableMain,
-		Protocol:    nethelpers.ProtocolStatic,
-		Type:        nethelpers.TypeUnicast,
-		Family:      nethelpers.FamilyInet6,
-		Priority:    1024,
-	}
-
-	route.Normalize()
-
-	networkConfig.Routes = append(networkConfig.Routes, route)
 
 	for _, ipStr := range publicIPs {
 		if ip, err := netip.ParseAddr(ipStr); err == nil {
@@ -143,6 +156,7 @@ func (a *Akamai) ParseMetadata(metadata *akametadata.InstanceData, interfaceAddr
 		InstanceType: metadata.Type,
 		InstanceID:   strconv.Itoa(metadata.ID),
 		ProviderID:   fmt.Sprintf("linode://%d", metadata.ID),
+		Tags:         convertTagsFromAkamai(metadata.Tags),
 	}
 
 	return networkConfig, nil
@@ -185,7 +199,11 @@ func (a *Akamai) KernelArgs(string, quirks.Quirks) procfs.Parameters {
 }
 
 // NetworkConfiguration implements the runtime.Platform interface.
-func (a *Akamai) NetworkConfiguration(ctx context.Context, _ state.State, ch chan<- *runtime.PlatformNetworkConfig) error {
+func (a *Akamai) NetworkConfiguration(
+	ctx context.Context,
+	_ state.State,
+	ch chan<- *runtime.PlatformNetworkConfig,
+) error {
 	metadataClient, err := akametadata.NewClient(ctx)
 	if err != nil {
 		return fmt.Errorf("new metadata client: %w", err)
@@ -213,4 +231,17 @@ func (a *Akamai) NetworkConfiguration(ctx context.Context, _ state.State, ch cha
 	}
 
 	return nil
+}
+
+// convertTagsFromAkamai converts Akamai instance tags into the format expected by PlatformMetadata.
+func convertTagsFromAkamai(akamaiTags []string) map[string]string {
+	var platformMetadataTags map[string]string
+	if len(akamaiTags) > 0 {
+		platformMetadataTags = make(map[string]string, len(akamaiTags))
+		for _, key := range akamaiTags {
+			platformMetadataTags[key] = ""
+		}
+	}
+
+	return platformMetadataTags
 }

@@ -61,6 +61,8 @@ const (
 )
 
 // TestDeploy verifies that tink can be deployed with a single control-plane node.
+//
+//nolint:gocyclo
 func (suite *TinkSuite) TestDeploy() {
 	if testing.Short() {
 		suite.T().Skip("skipping in short mode")
@@ -68,6 +70,15 @@ func (suite *TinkSuite) TestDeploy() {
 
 	if suite.Cluster == nil {
 		suite.T().Skip("without full cluster state reaching out to the node IP is not reliable")
+	}
+
+	if suite.SelinuxEnforcing {
+		// The in-container Talos composes /etc as a writable overlay; writing a managed file into a
+		// lower-provided subdir (e.g. cri/conf.d) triggers an overlayfs copy-up that propagates the
+		// pod rootfs's containerd_state_t label onto the tmpfs upper. Creating a containerd_state_t
+		// inode on tmpfs_t is denied (associate), and the pod runs pod_t with no way to relabel, so
+		// the inner Talos cannot write /etc. Skip until the host policy permits this copy-up.
+		suite.T().Skip("skipping in SELinux enforcing mode: in-container /etc overlay copy-up is denied")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
@@ -219,11 +230,16 @@ func (suite *TinkSuite) TestDeploy() {
 		suite.T().Fatalf("failed to bootstrap Talos-in-Kubernetes")
 	}
 
+	suite.T().Cleanup(func() {
+		// dump the TinK pod logs if the test failed, to help with debugging
+		if suite.T().Failed() {
+			suite.LogPodLogs(suite.T().Context(), namespace, ss+"-0")
+		}
+	})
+
 	clusterAccess := &tinkClusterAccess{
-		KubernetesClient: cluster.KubernetesClient{
-			ClientProvider: &cluster.ConfigClientProvider{
-				TalosConfig: talosconfig,
-			},
+		ClientProvider: &cluster.ConfigClientProvider{
+			TalosConfig: talosconfig,
 		},
 
 		nodeIP: podIP,
@@ -294,26 +310,18 @@ func (suite *TinkSuite) getTinkManifests(namespace, serviceName, ssName, talosIm
 
 	tinkManifests := []runtime.Object{ //nolint:prealloc // this is a test
 		&corev1.Namespace{
-			TypeMeta: metav1.TypeMeta{
-				Kind:       "Namespace",
-				APIVersion: "v1",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: namespace,
-				Labels: map[string]string{
-					podsecurity.EnforceLevelLabel: string(podsecurity.LevelPrivileged),
-				},
+			Kind:       "Namespace",
+			APIVersion: "v1",
+			Name:       namespace,
+			Labels: map[string]string{
+				podsecurity.EnforceLevelLabel: string(podsecurity.LevelPrivileged),
 			},
 		},
 		&corev1.Service{
-			TypeMeta: metav1.TypeMeta{
-				Kind:       "Service",
-				APIVersion: "v1",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      serviceName,
-				Namespace: namespace,
-			},
+			Kind:       "Service",
+			APIVersion: "v1",
+			Name:       serviceName,
+			Namespace:  namespace,
 			Spec: corev1.ServiceSpec{
 				Type:     corev1.ServiceTypeNodePort,
 				Selector: labels,
@@ -336,14 +344,10 @@ func (suite *TinkSuite) getTinkManifests(namespace, serviceName, ssName, talosIm
 	}
 
 	statefulSet := &appsv1.StatefulSet{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "StatefulSet",
-			APIVersion: "apps/v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ssName,
-			Namespace: namespace,
-		},
+		Kind:       "StatefulSet",
+		APIVersion: "apps/v1",
+		Name:       ssName,
+		Namespace:  namespace,
 		Spec: appsv1.StatefulSetSpec{
 			ServiceName: serviceName,
 			Replicas:    new(int32(1)),
@@ -378,6 +382,12 @@ func (suite *TinkSuite) getTinkManifests(namespace, serviceName, ssName, talosIm
 									corev1.ResourceMemory: resource.MustParse("1Gi"),
 									corev1.ResourceCPU:    resource.MustParse("750m"),
 								},
+								// A memory limit caps the inner Talos and, as a side effect, exempts the pod from the
+								// Talos userspace OOM handler on the host node: the default cgroup ranking gives a
+								// cgroup with memory.max set a zero score, so it never gets picked as a victim.
+								Limits: corev1.ResourceList{
+									corev1.ResourceMemory: resource.MustParse("2Gi"),
+								},
 							},
 							Ports: []corev1.ContainerPort{
 								{
@@ -408,10 +418,8 @@ func (suite *TinkSuite) getTinkManifests(namespace, serviceName, ssName, talosIm
 		statefulSet.Spec.Template.Spec.Volumes = append(
 			statefulSet.Spec.Template.Spec.Volumes,
 			corev1.Volume{
-				Name: ephemeralMount,
-				VolumeSource: corev1.VolumeSource{
-					EmptyDir: &corev1.EmptyDirVolumeSource{},
-				},
+				Name:     ephemeralMount,
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		)
 	}
@@ -421,27 +429,16 @@ func (suite *TinkSuite) getTinkManifests(namespace, serviceName, ssName, talosIm
 		Size       string
 	}
 
-	for _, overlayMount := range append(
-		[]overlayMountSpec{
-			{
-				MountPoint: constants.StateMountPoint,
-				Size:       "100Mi",
-			},
-			{
-				MountPoint: constants.EphemeralMountPoint,
-				Size:       "6Gi",
-			},
+	for _, overlayMount := range []overlayMountSpec{
+		{
+			MountPoint: constants.StateMountPoint,
+			Size:       "100Mi",
 		},
-		xslices.Map(
-			xslices.Filter(constants.Overlays, func(overlay constants.SELinuxLabeledPath) bool { return overlay.Path != "/opt" }), // /opt/cni/bin contains CNI binaries
-			func(mnt constants.SELinuxLabeledPath) overlayMountSpec {
-				return overlayMountSpec{
-					MountPoint: mnt.Path,
-					Size:       "100Mi",
-				}
-			},
-		)...,
-	) {
+		{
+			MountPoint: constants.EphemeralMountPoint,
+			Size:       "6Gi",
+		},
+	} {
 		name := strings.ReplaceAll(strings.TrimLeft(overlayMount.MountPoint, "/"), "/", "-")
 
 		statefulSet.Spec.Template.Spec.Containers[0].VolumeMounts = append(
@@ -455,9 +452,7 @@ func (suite *TinkSuite) getTinkManifests(namespace, serviceName, ssName, talosIm
 		statefulSet.Spec.VolumeClaimTemplates = append(
 			statefulSet.Spec.VolumeClaimTemplates,
 			corev1.PersistentVolumeClaim{
-				ObjectMeta: metav1.ObjectMeta{
-					Name: name,
-				},
+				Name: name,
 				Spec: corev1.PersistentVolumeClaimSpec{
 					AccessModes: []corev1.PersistentVolumeAccessMode{
 						corev1.ReadWriteOnce,

@@ -1,0 +1,146 @@
+syntax = "proto3";
+
+package talos.resource.definitions.hypervisor;
+
+option go_package = "github.com/siderolabs/talos/pkg/machinery/api/resource/definitions/hypervisor";
+option java_package = "dev.talos.api.resource.definitions.hypervisor";
+
+import "resource/definitions/enums/enums.proto";
+
+// ContentLibraryStatusSpec is the spec for ContentLibraryStatus.
+message ContentLibraryStatusSpec {
+  // VolumeID is the ID of the volume backing the library.
+  string volume_id = 1;
+  // Path is the absolute path of the library's contents, the target the backing volume is mounted at.
+  //
+  // Only meaningful when Ready.
+  string path = 2;
+  // Ready is true once the backing volume is mounted.
+  bool ready = 3;
+  // Error describes why the library is not ready.
+  string error = 4;
+}
+
+// VirtualMachineCPUSpec describes the desired virtual CPUs and the host CPU time they may consume.
+message VirtualMachineCPUSpec {
+  uint32 count = 1;
+  // Limit is the whole-domain host CPU ceiling in millicores; zero means unlimited.
+  uint64 limit = 2;
+  // Pins are the per-vCPU host CPU pins; an unlisted vCPU is unpinned.
+  repeated VirtualMachineVCPUPinSpec pins = 3;
+  // EmulatorPin is the host CPU list the emulator threads are pinned to; empty means unpinned.
+  string emulator_pin = 4;
+  // Topology is the guest-visible CPU geometry; nil leaves it to libvirt.
+  VirtualMachineCPUTopologySpec topology = 5;
+}
+
+// VirtualMachineCPUTopologySpec describes the sockets, cores and threads presented to the guest.
+message VirtualMachineCPUTopologySpec {
+  uint32 sockets = 1;
+  uint32 cores = 2;
+  uint32 threads = 3;
+}
+
+// VirtualMachineConsoleSpec describes requested guest consoles.
+message VirtualMachineConsoleSpec {
+  bool serial = 1;
+  bool vnc = 2;
+}
+
+// VirtualMachineDiskFromImageSpec identifies an image in a content library.
+message VirtualMachineDiskFromImageSpec {
+  string library = 1;
+  string file = 2;
+  string digest = 3;
+  string mode = 4;
+}
+
+// VirtualMachineDiskProvisionSpec names exactly one volume-content source.
+message VirtualMachineDiskProvisionSpec {
+  bool blank = 1;
+  VirtualMachineDiskFromImageSpec from_image = 2;
+}
+
+// VirtualMachineDiskSpec describes a disk before its volume has a host source.
+message VirtualMachineDiskSpec {
+  string name = 1;
+  string pool = 2;
+  uint64 size = 3;
+  string format = 4;
+  string bus = 5;
+  string type = 6;
+  uint32 boot_order = 7;
+  VirtualMachineDiskProvisionSpec provision = 8;
+}
+
+// VirtualMachineDomainSpecSpec is the spec for VirtualMachineDomainSpec.
+message VirtualMachineDomainSpecSpec {
+  // DomainXML is the libvirt domain description used to start the guest.
+  string domain_xml = 1;
+  // PowerState selects running or stopped transient-domain behavior.
+  string power_state = 2;
+}
+
+// VirtualMachineDomainStatusSpec describes a domain as observed in libvirt.
+message VirtualMachineDomainStatusSpec {
+  string uuid = 1;
+  talos.resource.definitions.enums.HypervisorVirtualMachinePowerState power_state = 2;
+  string error = 3;
+  uint32 state = 4;
+  uint64 max_memory_ki_b = 5;
+  uint64 memory_ki_b = 6;
+  uint32 vcp_us = 7;
+}
+
+// VirtualMachineFirmwareSpec describes firmware selection without host firmware paths.
+message VirtualMachineFirmwareSpec {
+  string type = 1;
+  bool secure_boot = 2;
+}
+
+// VirtualMachineMemoryBallooningSpec describes the desired memory ballooning state.
+message VirtualMachineMemoryBallooningSpec {
+  bool enabled = 1;
+}
+
+// VirtualMachineMemoryNUMASpec places the guest memory on host NUMA nodes.
+message VirtualMachineMemoryNUMASpec {
+  string mode = 1;
+  string nodes = 2;
+}
+
+// VirtualMachineMemorySpec describes the desired guest memory.
+message VirtualMachineMemorySpec {
+  // Size is the guest memory size in bytes.
+  uint64 size = 1;
+  VirtualMachineMemoryBallooningSpec ballooning = 2;
+  // NUMA is the host NUMA placement of the guest memory; nil leaves placement to the host.
+  VirtualMachineMemoryNUMASpec numa = 3;
+}
+
+// VirtualMachineSpecSpec is the spec for VirtualMachineSpec.
+message VirtualMachineSpecSpec {
+  VirtualMachineCPUSpec cpu = 1;
+  VirtualMachineMemorySpec memory = 2;
+  string power_state = 3;
+  VirtualMachineFirmwareSpec firmware = 4;
+  VirtualMachineConsoleSpec console = 5;
+  repeated VirtualMachineDiskSpec disks = 6;
+}
+
+// VirtualMachineStatusSpec describes observed power state and reconciliation stage.
+message VirtualMachineStatusSpec {
+  // PowerState is the matched domain's observed power, or unknown when no domain was observed.
+  talos.resource.definitions.enums.HypervisorVirtualMachinePowerState power_state = 1;
+  // Stage distinguishes unknown observation, convergence, readiness, and observed obstacles.
+  talos.resource.definitions.enums.HypervisorVirtualMachineStage stage = 2;
+  // Error describes an observation failure or obstacle, when known.
+  string error = 3;
+}
+
+// VirtualMachineVCPUPinSpec pins one guest vCPU to a host CPU list.
+message VirtualMachineVCPUPinSpec {
+  uint32 vcpu = 1;
+  string cp_us = 2;
+}
+

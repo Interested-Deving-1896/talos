@@ -23,15 +23,16 @@ import (
 	ssacli "github.com/siderolabs/go-kubernetes/kubernetes/ssa/cli"
 	"github.com/siderolabs/go-kubernetes/kubernetes/upgrade"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/siderolabs/talos/pkg/cluster"
+	"github.com/siderolabs/talos/pkg/kubernetes"
 	"github.com/siderolabs/talos/pkg/machinery/api/common"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	"github.com/siderolabs/talos/pkg/machinery/config"
@@ -164,7 +165,7 @@ func Upgrade(ctx context.Context, cluster UpgradeProvider, options UpgradeOption
 
 	useSSA := minTalosVersion.SupportsSSAManifestSync()
 
-	return PerformManifestsSync(ctx, cluster, useSSA, options)
+	return PerformManifestsSync(client.WithNode(ctx, options.controlPlaneNodes[0]), cluster, useSSA, options)
 }
 
 func prePullImages(ctx context.Context, talosClient *client.Client, options UpgradeOptions) error {
@@ -270,6 +271,81 @@ func controlplaneConfigResourceType(service string) resource.Type {
 	panic(fmt.Sprintf("unknown service ID %q", service))
 }
 
+var errConfigNotFound = errors.New("service configuration not found")
+
+// watchControlPlaneConfigResource starts a watch on a single control plane component configuration resource,
+// returning the watch channel along with the initial state of the resource.
+//
+// If the resource doesn't exist, errConfigNotFound is returned.
+func watchControlPlaneConfigResource(ctx context.Context, c *client.Client, md resource.Metadata) (<-chan state.Event, resource.Resource, context.CancelFunc, error) {
+	watchCtx, watchCancel := context.WithCancel(ctx)
+
+	watchCh := make(chan state.Event)
+
+	if err := c.COSI.Watch(watchCtx, md, watchCh); err != nil {
+		watchCancel()
+
+		return nil, nil, nil, fmt.Errorf("error watching service configuration %q: %w", md.ID(), err)
+	}
+
+	var ev state.Event
+
+	select {
+	case ev = <-watchCh:
+	case <-ctx.Done():
+		watchCancel()
+
+		return nil, nil, nil, ctx.Err()
+	}
+
+	var err error
+
+	switch ev.Type {
+	case state.Created:
+		return watchCh, ev.Resource, watchCancel, nil
+	case state.Destroyed:
+		err = errConfigNotFound
+	case state.Errored:
+		err = fmt.Errorf("error watching service configuration %q: %w", md.ID(), ev.Error)
+	case state.Updated, state.Bootstrapped, state.Noop:
+		err = fmt.Errorf("unexpected event type: %d", ev.Type)
+	}
+
+	watchCancel()
+
+	return nil, nil, nil, err
+}
+
+// watchControlPlaneConfig starts a watch on the control plane component configuration resource which the node
+// renders the static pod from.
+//
+// Talos 1.14+ renders the static pod from the "final-" prefixed configuration resource, and stamps the version of
+// that resource into the pod annotation, while older versions of Talos use the non-prefixed resource for both.
+// The two resources have independent version counters which are free to diverge, so the version compared against
+// the pod annotation has to come from the resource the node actually rendered the pod from.
+//
+// Watch the "final-" resource first, falling back to the non-prefixed one if it doesn't exist. The probe is done
+// per node, so a cluster running a mix of Talos versions is handled correctly.
+func watchControlPlaneConfig(ctx context.Context, c *client.Client, service string) (<-chan state.Event, resource.Resource, context.CancelFunc, error) {
+	resourceType := controlplaneConfigResourceType(service)
+
+	for _, id := range []resource.ID{k8s.FinalPrefix + service, service} {
+		watchCh, initialConfig, stopWatch, err := watchControlPlaneConfigResource(ctx, c,
+			resource.NewMetadata(k8s.ControlPlaneNamespaceName, resourceType, id, resource.VersionUndefined))
+
+		switch {
+		case err == nil:
+			return watchCh, initialConfig, stopWatch, nil
+		case errors.Is(err, errConfigNotFound):
+			// the resource doesn't exist, try the next ID
+		default:
+			return nil, nil, nil, err
+		}
+	}
+
+	return nil, nil, nil, fmt.Errorf("configuration for service %q not found", service)
+}
+
 //nolint:gocyclo
 func upgradeStaticPodOnNode(ctx context.Context, cluster UpgradeProvider, options UpgradeOptions, service, node string) error {
 	ctx, cancel := context.WithCancel(ctx)
@@ -284,28 +360,14 @@ func upgradeStaticPodOnNode(ctx context.Context, cluster UpgradeProvider, option
 
 	options.Log(" > %q: starting update", node)
 
-	watchCh := make(chan state.Event)
-
-	if err = c.COSI.Watch(ctx, resource.NewMetadata(k8s.ControlPlaneNamespaceName, controlplaneConfigResourceType(service), service, resource.VersionUndefined), watchCh); err != nil {
-		return fmt.Errorf("error watching service configuration: %w", err)
+	watchCh, initialConfig, stopWatch, err := watchControlPlaneConfig(ctx, c, service)
+	if err != nil {
+		return err
 	}
 
-	var (
-		expectedConfigVersion string
-		initialConfig         resource.Resource
-	)
+	defer stopWatch()
 
-	select {
-	case ev := <-watchCh:
-		if ev.Type != state.Created {
-			return fmt.Errorf("unexpected event type: %d", ev.Type)
-		}
-
-		expectedConfigVersion = ev.Resource.Metadata().Version().String()
-		initialConfig = ev.Resource
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	expectedConfigVersion := initialConfig.Metadata().Version()
 
 	skipConfigWait := false
 
@@ -328,11 +390,14 @@ func upgradeStaticPodOnNode(ctx context.Context, cluster UpgradeProvider, option
 	if !skipConfigWait {
 		select {
 		case ev := <-watchCh:
-			if ev.Type != state.Updated {
+			switch ev.Type {
+			case state.Updated:
+				expectedConfigVersion = ev.Resource.Metadata().Version()
+			case state.Errored:
+				return fmt.Errorf("error watching service configuration: %w", ev.Error)
+			case state.Created, state.Destroyed, state.Bootstrapped, state.Noop:
 				return fmt.Errorf("unexpected event type: %d", ev.Type)
 			}
-
-			expectedConfigVersion = ev.Resource.Metadata().Version().String()
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -384,14 +449,15 @@ func upgradeStaticPodPatcher(
 		}
 
 		logUpdate := func(oldImage string) {
-			oldImage, _, _ = strings.Cut(oldImage, "@") // ignore digest if present
-			_, version, _ := strings.Cut(oldImage, ":")
+			oldVersion, _ := kubernetes.VersionFromImageRef(oldImage)
 
-			if version == "" {
-				version = options.Path.FromVersion()
+			if oldVersion == "" {
+				oldVersion = options.Path.FromVersion()
 			}
 
-			options.Log(" > update %s: %s -> %s", service, version, options.Path.ToVersion())
+			oldVersion = strings.TrimLeft(oldVersion, "v")
+
+			options.Log(" > update %s: %s -> %s", service, oldVersion, options.Path.ToVersion())
 
 			if options.DryRun {
 				options.Log(" > skipped in dry-run")
@@ -436,6 +502,8 @@ func upgradeStaticPodPatcher(
 }
 
 // PerformManifestsSync performs manifests sync from Talos manifest list to Kubernetes.
+//
+// The context passed should be tied to a single Talos controlplane node.
 func PerformManifestsSync(
 	ctx context.Context,
 	cluster UpgradeProvider,
@@ -462,11 +530,6 @@ func getManifests(ctx context.Context, cluster UpgradeProvider) ([]*unstructured
 	}
 
 	defer cluster.Close() //nolint:errcheck
-
-	md, _ := metadata.FromOutgoingContext(ctx)
-	if nodes := md["nodes"]; len(nodes) > 0 {
-		ctx = client.WithNode(ctx, nodes[0])
-	}
 
 	return manifests.GetBootstrapManifests(ctx, talosclient.COSI, nil)
 }
@@ -534,6 +597,13 @@ func syncManifestsSSA(ctx context.Context, objects []*unstructured.Unstructured,
 		WaitTimeout:     options.ReconcileTimeout,
 		NoPrune:         options.NoPrune,
 		Force:           options.ForceManifests,
+		CustomStageKinds: map[schema.GroupKind]struct{}{
+			// perform sync for configmaps/secrets before e.g. deployments/daemonsets,
+			// as there is a common pattern of linking them via a label/annotation checksum,
+			// to ensure that the dependent resources are reconciled after the configmap/secret is updated.
+			schema.ParseGroupKind("ConfigMap"): {},
+			schema.ParseGroupKind("Secret"):    {},
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("error applying manifests: %w", err)
@@ -557,7 +627,7 @@ func syncManifestsSSA(ctx context.Context, objects []*unstructured.Unstructured,
 }
 
 //nolint:gocyclo
-func checkPodStatus(ctx context.Context, cluster UpgradeProvider, options UpgradeOptions, service, node, configVersion string) error {
+func checkPodStatus(ctx context.Context, cluster UpgradeProvider, options UpgradeOptions, service, node string, configVersion resource.Version) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
@@ -576,7 +646,7 @@ func checkPodStatus(ctx context.Context, cluster UpgradeProvider, options Upgrad
 		}),
 	)
 
-	notifyCh := make(chan *v1.Pod)
+	notifyCh := make(chan *corev1.Pod)
 
 	informer := informerFactory.Core().V1().Pods().Informer()
 
@@ -587,9 +657,9 @@ func checkPodStatus(ctx context.Context, cluster UpgradeProvider, options Upgrad
 	}
 
 	if _, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj any) { channel.SendWithContext(ctx, notifyCh, obj.(*v1.Pod)) },
+		AddFunc:    func(obj any) { channel.SendWithContext(ctx, notifyCh, obj.(*corev1.Pod)) },
 		DeleteFunc: func(_ any) {},
-		UpdateFunc: func(_, obj any) { channel.SendWithContext(ctx, notifyCh, obj.(*v1.Pod)) },
+		UpdateFunc: func(_, obj any) { channel.SendWithContext(ctx, notifyCh, obj.(*corev1.Pod)) },
 	}); err != nil {
 		return fmt.Errorf("error adding watch event handler: %w", err)
 	}
@@ -610,7 +680,11 @@ func checkPodStatus(ctx context.Context, cluster UpgradeProvider, options Upgrad
 				continue
 			}
 
-			if pod.Annotations[constants.AnnotationStaticPodConfigVersion] != configVersion {
+			podConfigVersion, err := resource.ParseVersion(pod.Annotations[constants.AnnotationStaticPodConfigVersion])
+			if err != nil || podConfigVersion.Value() < configVersion.Value() {
+				// the config version is a monotonically growing counter, so the pod is up-to-date as soon as it
+				// reaches the expected version: an unrelated config change might have bumped it even further
+				// while the pod was being updated.
 				options.Log(" > %q: %s: waiting, config version mismatch: got %q, expected %q", node, service, pod.Annotations[constants.AnnotationStaticPodConfigVersion], configVersion)
 
 				continue
@@ -619,11 +693,11 @@ func checkPodStatus(ctx context.Context, cluster UpgradeProvider, options Upgrad
 			ready := false
 
 			for _, condition := range pod.Status.Conditions {
-				if condition.Type != v1.PodReady {
+				if condition.Type != corev1.PodReady {
 					continue
 				}
 
-				if condition.Status == v1.ConditionTrue {
+				if condition.Status == corev1.ConditionTrue {
 					ready = true
 
 					break
