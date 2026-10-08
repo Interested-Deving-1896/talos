@@ -94,8 +94,8 @@ Direct commits to OSP or OOC are detected and opened as PRs back to `Interested-
 | [@smira](https://github.com/smira) | 2734 |
 | [@andrewrynhard](https://github.com/andrewrynhard) | 1105 |
 | [@frezbo](https://github.com/frezbo) | 522 |
+| [@Interested-Deving-1896](https://github.com/Interested-Deving-1896) | 262 |
 | [@rsmitty](https://github.com/rsmitty) | 243 |
-| [@Interested-Deving-1896](https://github.com/Interested-Deving-1896) | 185 |
 | [@Unix4ever](https://github.com/Unix4ever) | 175 |
 | [@bradbeam](https://github.com/bradbeam) | 159 |
 | [@AlekSi](https://github.com/AlekSi) | 113 |
