@@ -89,36 +89,38 @@ Direct commits to OSP or OOC are detected and opened as PRs back to `Interested-
 ## Contributors
 
 <!-- AI:start:contributors -->
-[@smira](https://github.com/smira) - 2734 commits
-[@andrewrynhard](https://github.com/andrewrynhard) - 1105 commits
-[@frezbo](https://github.com/frezbo) - 522 commits
-[@rsmitty](https://github.com/rsmitty) - 243 commits
-[@Unix4ever](https://github.com/Unix4ever) - 175 commits
-[@Interested-Deving-1896](https://github.com/Interested-Deving-1896) - 162 commits
-[@bradbeam](https://github.com/bradbeam) - 159 commits
-[@AlekSi](https://github.com/AlekSi) - 113 commits
-[@shanduur](https://github.com/shanduur) - 96 commits
-[@utkuozdemir](https://github.com/utkuozdemir) - 91 commits
-[@sergelogvinov](https://github.com/sergelogvinov) - 85 commits
-[@dsseng](https://github.com/dsseng) - 74 commits
-[@Ulexus](https://github.com/Ulexus) - 68 commits
-[@Orzelius](https://github.com/Orzelius) - 49 commits
-[@TimJones](https://github.com/TimJones) - 42 commits
-[@steverfrancis](https://github.com/steverfrancis) - 40 commits
-[@rothgar](https://github.com/rothgar) - 23 commits
-[@tgerla](https://github.com/tgerla) - 23 commits
-[@Iheanacho-ai](https://github.com/Iheanacho-ai) - 19 commits
-[@mcanevet](https://github.com/mcanevet) - 15 commits
-[@nberlee](https://github.com/nberlee) - 15 commits
-[@laurazard](https://github.com/laurazard) - 13 commits
-[@jnohlgard](https://github.com/jnohlgard) - 12 commits
-[@jonkerj](https://github.com/jonkerj) - 10 commits
-[@salkin](https://github.com/salkin) - 9 commits
-[@oscr](https://github.com/oscr) - 9 commits
-[@patatman](https://github.com/patatman) - 8 commits
-[@oguzkilcan](https://github.com/oguzkilcan) - 8 commits
-[@flokli](https://github.com/flokli) - 6 commits
-[@alongwill](https://github.com/alongwill) - 5 commits
+| Contributor | Commits |
+|---|---|
+| [@smira](https://github.com/smira) | 2734 |
+| [@andrewrynhard](https://github.com/andrewrynhard) | 1105 |
+| [@frezbo](https://github.com/frezbo) | 522 |
+| [@rsmitty](https://github.com/rsmitty) | 243 |
+| [@Interested-Deving-1896](https://github.com/Interested-Deving-1896) | 185 |
+| [@Unix4ever](https://github.com/Unix4ever) | 175 |
+| [@bradbeam](https://github.com/bradbeam) | 159 |
+| [@AlekSi](https://github.com/AlekSi) | 113 |
+| [@shanduur](https://github.com/shanduur) | 96 |
+| [@utkuozdemir](https://github.com/utkuozdemir) | 91 |
+| [@sergelogvinov](https://github.com/sergelogvinov) | 85 |
+| [@dsseng](https://github.com/dsseng) | 74 |
+| [@Ulexus](https://github.com/Ulexus) | 68 |
+| [@Orzelius](https://github.com/Orzelius) | 49 |
+| [@TimJones](https://github.com/TimJones) | 42 |
+| [@steverfrancis](https://github.com/steverfrancis) | 40 |
+| [@rothgar](https://github.com/rothgar) | 23 |
+| [@tgerla](https://github.com/tgerla) | 23 |
+| [@Iheanacho-ai](https://github.com/Iheanacho-ai) | 19 |
+| [@mcanevet](https://github.com/mcanevet) | 15 |
+| [@nberlee](https://github.com/nberlee) | 15 |
+| [@laurazard](https://github.com/laurazard) | 13 |
+| [@jnohlgard](https://github.com/jnohlgard) | 12 |
+| [@jonkerj](https://github.com/jonkerj) | 10 |
+| [@salkin](https://github.com/salkin) | 9 |
+| [@oscr](https://github.com/oscr) | 9 |
+| [@patatman](https://github.com/patatman) | 8 |
+| [@oguzkilcan](https://github.com/oguzkilcan) | 8 |
+| [@flokli](https://github.com/flokli) | 6 |
+| [@alongwill](https://github.com/alongwill) | 5 |
 <!-- AI:end:contributors -->
 
 ## Origins
