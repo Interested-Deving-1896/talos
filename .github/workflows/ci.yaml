@@ -255,7 +255,7 @@ jobs:
         run: |
           find _out -type f -executable > _out/executable-artifacts
       - name: save artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-artifacts
           path: |
@@ -338,7 +338,7 @@ jobs:
           make e2e-docker
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-e2e-docker-short
           path: |-
@@ -406,7 +406,7 @@ jobs:
           sudo -E make e2e-iso
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-e2e-iso
           path: |-
@@ -477,7 +477,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-e2e-qemu-short
           path: |-
@@ -550,7 +550,7 @@ jobs:
           make target-grype-validate
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-grype-scan-result
           path: |
@@ -651,7 +651,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-airgapped-${{ matrix.test }}
           path: |-
@@ -1930,7 +1930,7 @@ jobs:
         run: |
           find _out -type f -executable > _out/executable-artifacts
       - name: save artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-aws-artifacts
           path: |
@@ -2010,7 +2010,7 @@ jobs:
         run: |
           find _out -type f -executable > _out/executable-artifacts
       - name: save artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-enforcing-artifacts
           path: |
@@ -2088,7 +2088,7 @@ jobs:
         run: |
           find _out -type f -executable > _out/executable-artifacts
       - name: save artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-image-cache-artifacts
           path: |
@@ -2182,7 +2182,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-cilium-${{ matrix.test }}
           path: |-
@@ -2339,7 +2339,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-conformance-default
           path: |-
@@ -2423,7 +2423,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-conformance-enforcing
           path: |-
@@ -2498,7 +2498,7 @@ jobs:
           sudo -E make e2e-embedded
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-embedded
           path: |-
@@ -2604,7 +2604,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-extensions
           path: |-
@@ -2805,7 +2805,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-image-cache-${{ matrix.test }}
           path: |-
@@ -2944,7 +2944,7 @@ jobs:
           sudo -E make e2e-image-factory
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-image-factory-${{ matrix.test }}
           path: |-
@@ -3128,7 +3128,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-misc-0-${{ matrix.test }}
           path: |-
@@ -3265,7 +3265,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-misc-1-${{ matrix.test }}-${{ matrix.variant }}
           path: |-
@@ -3383,7 +3383,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-misc-2-${{ matrix.test }}
           path: |-
@@ -3499,7 +3499,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-misc-3-${{ matrix.test }}-${{ matrix.variant }}
           path: |-
@@ -3634,7 +3634,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-misc-4-${{ matrix.test }}-${{ matrix.variant }}
           path: |-
@@ -3718,7 +3718,7 @@ jobs:
           sudo -E make provision-tests-track-0
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-provision-0
           path: |-
@@ -3806,7 +3806,7 @@ jobs:
           sudo -E make provision-tests-track-1
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-provision-1
           path: |-
@@ -3893,7 +3893,7 @@ jobs:
           sudo -E make provision-tests-track-2
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-provision-2
           path: |-
@@ -3972,7 +3972,7 @@ jobs:
           sudo -E make provision-tests-track-3
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-provision-3
           path: |-
@@ -4094,7 +4094,7 @@ jobs:
         run: |
           sudo -E make e2e-qemu
       - name: save artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: fio-integration-qemu-csi-longhorn-${{ matrix.csi }}
           path: |
@@ -4102,7 +4102,7 @@ jobs:
           retention-days: "180"
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-qemu-csi-longhorn-${{ matrix.csi }}
           path: |-
@@ -4186,7 +4186,7 @@ jobs:
         run: |
           sudo -E make e2e-qemu
       - name: save artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: fio-integration-qemu-csi-openebs
           path: |
@@ -4194,7 +4194,7 @@ jobs:
           retention-days: "180"
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-qemu-csi-openebs
           path: |-
@@ -4277,7 +4277,7 @@ jobs:
         run: |
           sudo -E make e2e-qemu
       - name: save artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: fio-integration-qemu-csi-rook-ceph
           path: |
@@ -4285,7 +4285,7 @@ jobs:
           retention-days: "180"
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-qemu-csi-rook-ceph
           path: |-
@@ -4369,7 +4369,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-qemu-default
           path: |-
@@ -4454,7 +4454,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-qemu-encrypted-vip
           path: |-
@@ -4540,7 +4540,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-qemu-enforcing
           path: |-
@@ -4634,7 +4634,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-qemu-race
           path: |-
@@ -4781,7 +4781,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-trusted-boot-default
           path: |-
@@ -4869,7 +4869,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-trusted-boot-disk-image
           path: |-
@@ -4959,7 +4959,7 @@ jobs:
           sudo -E make e2e-qemu
       - name: save artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # version: v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # version: v7.0.2
         with:
           name: talos-logs-integration-trusted-boot-enforcing
           path: |-
