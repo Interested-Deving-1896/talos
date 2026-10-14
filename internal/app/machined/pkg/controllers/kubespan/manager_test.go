@@ -136,9 +136,7 @@ func (suite *ManagerSuite) TestReconcile() {
 				constants.KubeSpanDefaultRoutingTable,
 				nethelpers.FamilyInet4,
 				netip.Prefix{},
-				netip.Addr{},
 				1,
-				"kubespan",
 			),
 		),
 		func(res *network.RouteSpec, asrt *assert.Assertions) {},
@@ -153,9 +151,7 @@ func (suite *ManagerSuite) TestReconcile() {
 				constants.KubeSpanDefaultRoutingTable,
 				nethelpers.FamilyInet6,
 				netip.Prefix{},
-				netip.Addr{},
 				1,
-				"kubespan",
 			),
 		),
 		func(res *network.RouteSpec, asrt *assert.Assertions) {},
@@ -459,16 +455,14 @@ func TestManagerSuite(t *testing.T) {
 
 	suite.Run(t, &ManagerSuite{
 		mockWireguard: mockWireguard,
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 5 * time.Second,
-			AfterSetup: func(s *ctest.DefaultSuite) {
-				s.Require().NoError(s.Runtime().RegisterController(&kubespanctrl.ManagerController{
-					WireguardClientFactory: func() (kubespanctrl.WireguardClient, error) {
-						return mockWireguard, nil
-					},
-					PeerReconcileInterval: time.Second,
-				}))
-			},
+		Timeout:       5 * time.Second,
+		AfterSetup: func(s *ctest.DefaultSuite) {
+			s.Require().NoError(s.Runtime().RegisterController(&kubespanctrl.ManagerController{
+				WireguardClientFactory: func() (kubespanctrl.WireguardClient, error) {
+					return mockWireguard, nil
+				},
+				PeerReconcileInterval: time.Second,
+			}))
 		},
 	})
 }

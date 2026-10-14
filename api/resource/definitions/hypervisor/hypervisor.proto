@@ -1,0 +1,284 @@
+syntax = "proto3";
+
+package talos.resource.definitions.hypervisor;
+
+option go_package = "github.com/siderolabs/talos/pkg/machinery/api/resource/definitions/hypervisor";
+option java_package = "dev.talos.api.resource.definitions.hypervisor";
+
+import "common/common.proto";
+import "resource/definitions/enums/enums.proto";
+
+// CloudInitSpecSpec carries opaque payload bytes (strings preserve verbatim content).
+message CloudInitSpecSpec {
+  string library = 1;
+  string meta_data = 2;
+  string user_data = 3;
+  string network_config = 4;
+}
+
+// CloudInitStatusSpec never contains the raw guest seed.
+message CloudInitStatusSpec {
+  string virtual_machine = 1;
+  string library = 2;
+  string name = 3;
+  // Path and VolumeID pin the backing identity and prevent stale readiness across remounts.
+  string path = 4;
+  string volume_id = 5;
+  string digest = 6;
+  uint64 size_bytes = 7;
+  string input_digest = 8;
+  string observed_generation = 9;
+  talos.resource.definitions.enums.HypervisorCloudInitPhase phase = 10;
+  string error = 11;
+}
+
+// ContentLibraryStatusSpec is the spec for ContentLibraryStatus.
+message ContentLibraryStatusSpec {
+  // VolumeID is the ID of the volume backing the library.
+  string volume_id = 1;
+  // Path is the absolute path of the library's contents, the target the backing volume is mounted at.
+  //
+  // Only meaningful when Ready.
+  string path = 2;
+  // Phase is Ready once the backing volume is mounted.
+  talos.resource.definitions.enums.HypervisorContentLibraryPhase phase = 3;
+  // Error describes why the library is not ready.
+  string error = 4;
+  // Fingerprint changes whenever the files in the library do (name, size, modification time).
+  string fingerprint = 5;
+}
+
+// VirtualMachineAgentSpec describes the qemu-guest-agent channel attached to the guest.
+message VirtualMachineAgentSpec {
+  // Enabled attaches the org.qemu.guest_agent.0 virtio-serial channel to the domain.
+  bool enabled = 1;
+}
+
+// VirtualMachineCPUPlacementSpec is the spec for VirtualMachineCPUPlacement.
+message VirtualMachineCPUPlacementSpec {
+  string partition = 1;
+  string slice = 2;
+  bool exclusive = 3;
+}
+
+// VirtualMachineCPUSpec describes the desired virtual CPUs and the host CPU time they may consume.
+message VirtualMachineCPUSpec {
+  uint32 count = 1;
+  // Limit is the whole-domain host CPU ceiling in millicores; zero means unlimited.
+  uint64 limit = 2;
+  // Pins are the per-vCPU host CPU pins; an unlisted vCPU is unpinned.
+  repeated VirtualMachineVCPUPinSpec pins = 3;
+  // EmulatorPin is the host CPU list the emulator threads are pinned to; empty means unpinned.
+  string emulator_pin = 4;
+  // Topology is the guest-visible CPU geometry; nil leaves it to libvirt.
+  VirtualMachineCPUTopologySpec topology = 5;
+  string slice = 6;
+}
+
+// VirtualMachineCPUTopologySpec describes the sockets, cores and threads presented to the guest.
+message VirtualMachineCPUTopologySpec {
+  uint32 sockets = 1;
+  uint32 cores = 2;
+  uint32 threads = 3;
+}
+
+// VirtualMachineCloudInitSpec is backend-neutral guest seed intent.
+message VirtualMachineCloudInitSpec {
+  string library = 1;
+  string meta_data = 2;
+  string user_data = 3;
+  string network_config = 4;
+}
+
+// VirtualMachineConsoleSpec describes requested guest consoles.
+message VirtualMachineConsoleSpec {
+  bool serial = 1;
+  bool vnc = 2;
+}
+
+// VirtualMachineDiskFromImageSpec identifies an image in a content library.
+message VirtualMachineDiskFromImageSpec {
+  string library = 1;
+  string file = 2;
+  string digest = 3;
+  string mode = 4;
+}
+
+// VirtualMachineDiskProvisionSpec names exactly one volume-content source.
+message VirtualMachineDiskProvisionSpec {
+  bool blank = 1;
+  VirtualMachineDiskFromImageSpec from_image = 2;
+}
+
+// VirtualMachineDiskSpec describes a disk before its volume has a host source.
+message VirtualMachineDiskSpec {
+  string name = 1;
+  string pool = 2;
+  uint64 size = 3;
+  string format = 4;
+  string bus = 5;
+  string type = 6;
+  uint32 boot_order = 7;
+  VirtualMachineDiskProvisionSpec provision = 8;
+}
+
+// VirtualMachineDiskStatusSpec is the spec for VirtualMachineDiskStatus.
+message VirtualMachineDiskStatusSpec {
+  // VirtualMachine is the name of the virtual machine the disk belongs to.
+  string virtual_machine = 1;
+  // Name is the disk's name within that virtual machine.
+  string name = 2;
+  // SourcePath is the absolute host path libvirt opens.
+  //
+  // Only meaningful when Ready.
+  string source_path = 3;
+  // Format is the on-host format of SourcePath, as libvirt's disk driver type.
+  //
+  // Only meaningful when Ready.
+  string format = 4;
+  // ReadOnly is true when the guest must not write to the source.
+  bool read_only = 5;
+  // Phase reports whether the source may be attached or observation is unavailable.
+  talos.resource.definitions.enums.HypervisorVirtualMachineDiskPhase phase = 6;
+  // Error describes why the disk is not ready.
+  string error = 7;
+  // Image is the content library image this status resolved.
+  VirtualMachineDiskFromImageSpec image = 8;
+  // Pool is the storage pool the disk's volume lives in, for a disk provisioned into one.
+  //
+  // Stamped whether or not the disk resolved, so a failed one still names what it was for. That
+  // is what lets a pool a running guest is reading from be recognized as in use: a status which
+  // did not resolve has no SourcePath to go on.
+  string pool = 9;
+  // Volume is the name of that volume within the pool.
+  //
+  // Stamped whether or not the disk resolved, for the same reason as Pool.
+  string volume = 10;
+  // Size is the volume's actual logical capacity in bytes.
+  //
+  // It may exceed the size configured: a volume is never shrunk.
+  uint64 size = 11;
+  // Blank is true when the disk was provisioned as an empty volume.
+  bool blank = 12;
+}
+
+// VirtualMachineDomainSpecSpec is the spec for VirtualMachineDomainSpec.
+message VirtualMachineDomainSpecSpec {
+  // DomainXML is the libvirt domain description used to start the guest.
+  string domain_xml = 1;
+  // PowerState selects running or stopped transient-domain behavior.
+  string power_state = 2;
+  // Disks lists the IDs of the VirtualMachineDiskStatus resources DomainXML attaches.
+  //
+  // It is what the controller which starts the domain holds against, rather than the virtual
+  // machine's configuration, which moves ahead of the definition libvirt is running.
+  repeated string disks = 3;
+  // CloudInit identifies the seed status this domain has attached and must hold.
+  string cloud_init = 4;
+  // ObservedGeneration identifies the VM intent used to render this definition.
+  string observed_generation = 5;
+}
+
+// VirtualMachineDomainStatusSpec describes a domain as observed in libvirt.
+message VirtualMachineDomainStatusSpec {
+  string uuid = 1;
+  talos.resource.definitions.enums.HypervisorVirtualMachinePowerState power_state = 2;
+  string error = 3;
+  uint32 state = 4;
+  uint64 max_memory_ki_b = 5;
+  uint64 memory_ki_b = 6;
+  uint32 vcp_us = 7;
+  repeated VirtualMachineGuestInterfaceSpec interfaces = 8;
+}
+
+// VirtualMachineFirmwareSpec describes firmware selection without host firmware paths.
+message VirtualMachineFirmwareSpec {
+  string type = 1;
+  bool secure_boot = 2;
+}
+
+// VirtualMachineGuestInterfaceSpec is one guest interface reported by the qemu-guest-agent.
+message VirtualMachineGuestInterfaceSpec {
+  string name = 1;
+  string hardware_addr = 2;
+  repeated common.NetIPPrefix ip_addresses = 3;
+}
+
+// VirtualMachineGuestSpec describes guest-side features that need host-side plumbing.
+message VirtualMachineGuestSpec {
+  VirtualMachineAgentSpec agent = 1;
+}
+
+// VirtualMachineInterfaceSpec describes a network interface attached to a host link.
+message VirtualMachineInterfaceSpec {
+  // Name of the virtual machine interface config (not reflected in the guest)
+  string name = 1;
+  // Link identifier, as seen from the host
+  string link = 2;
+  // HardwareAddr is the address presented to the guest.
+  //
+  // Empty when it is to be derived from the virtual machine and interface names.
+  string hardware_addr = 3;
+}
+
+// VirtualMachineMemoryBallooningSpec describes the desired memory ballooning state.
+message VirtualMachineMemoryBallooningSpec {
+  bool enabled = 1;
+}
+
+// VirtualMachineMemoryNUMASpec places the guest memory on host NUMA nodes.
+message VirtualMachineMemoryNUMASpec {
+  string mode = 1;
+  string nodes = 2;
+}
+
+// VirtualMachineMemorySpec describes the desired guest memory.
+message VirtualMachineMemorySpec {
+  // Size is the guest memory size in bytes.
+  uint64 size = 1;
+  VirtualMachineMemoryBallooningSpec ballooning = 2;
+  // NUMA is the host NUMA placement of the guest memory; nil leaves placement to the host.
+  VirtualMachineMemoryNUMASpec numa = 3;
+}
+
+// VirtualMachineSpecSpec is the spec for VirtualMachineSpec.
+message VirtualMachineSpecSpec {
+  VirtualMachineCPUSpec cpu = 1;
+  VirtualMachineMemorySpec memory = 2;
+  string power_state = 3;
+  VirtualMachineFirmwareSpec firmware = 4;
+  VirtualMachineConsoleSpec console = 5;
+  repeated VirtualMachineDiskSpec disks = 6;
+  repeated VirtualMachineInterfaceSpec interfaces = 7;
+  VirtualMachineCloudInitSpec cloud_init = 8;
+  VirtualMachineGuestSpec guest = 9;
+  // Video is the graphics device presented when a VNC console is enabled.
+  VirtualMachineVideoSpec video = 10;
+}
+
+// VirtualMachineStatusSpec describes observed power state and reconciliation stage.
+message VirtualMachineStatusSpec {
+  // PowerState is the matched domain's observed power, or unknown when no domain was observed.
+  talos.resource.definitions.enums.HypervisorVirtualMachinePowerState power_state = 1;
+  // Stage distinguishes unknown observation, convergence, readiness, and observed obstacles.
+  talos.resource.definitions.enums.HypervisorVirtualMachineStage stage = 2;
+  // Error describes an observation failure or obstacle, when known.
+  string error = 3;
+  // Addresses is the flat list of guest IP addresses in CIDR form, as reported by qemu-guest-agent.
+  repeated string addresses = 4;
+  // Interfaces is the per-interface view returned by qemu-guest-agent.
+  repeated VirtualMachineGuestInterfaceSpec interfaces = 5;
+}
+
+// VirtualMachineVCPUPinSpec pins one guest vCPU to a host CPU list.
+message VirtualMachineVCPUPinSpec {
+  uint32 vcpu = 1;
+  string cp_us = 2;
+}
+
+// VirtualMachineVideoSpec describes the virtual graphics device.
+message VirtualMachineVideoSpec {
+  string model = 1;
+  uint32 vram_mi_b = 2;
+}
+

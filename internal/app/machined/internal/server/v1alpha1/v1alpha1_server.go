@@ -22,6 +22,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/cosi-project/runtime/pkg/state/protobuf/server"
 	"github.com/google/uuid"
+	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/afpacket"
 	multierror "github.com/hashicorp/go-multierror"
 	"github.com/nberlee/go-netstat/netstat"
@@ -52,24 +54,32 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 
+	"github.com/siderolabs/talos/internal/app/contentlibrary"
 	"github.com/siderolabs/talos/internal/app/debug"
+	"github.com/siderolabs/talos/internal/app/hypervisord"
 	"github.com/siderolabs/talos/internal/app/images"
 	"github.com/siderolabs/talos/internal/app/internal/machinehelper"
 	"github.com/siderolabs/talos/internal/app/lifecycle"
+	"github.com/siderolabs/talos/internal/app/lvmd"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime/v1alpha1/bootloader"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime/v1alpha1/bootloader/options"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/system"
+	"github.com/siderolabs/talos/internal/app/mdd"
 	"github.com/siderolabs/talos/internal/app/resources"
+	machinestorage "github.com/siderolabs/talos/internal/app/storage"
 	storaged "github.com/siderolabs/talos/internal/app/storaged"
 	"github.com/siderolabs/talos/internal/pkg/containers"
 	taloscontainerd "github.com/siderolabs/talos/internal/pkg/containers/containerd"
 	"github.com/siderolabs/talos/internal/pkg/containers/cri"
 	"github.com/siderolabs/talos/internal/pkg/etcd"
 	"github.com/siderolabs/talos/internal/pkg/install"
+	"github.com/siderolabs/talos/internal/pkg/libvirt"
+	"github.com/siderolabs/talos/internal/pkg/libvirt/domain"
 	"github.com/siderolabs/talos/internal/pkg/miniprocfs"
 	"github.com/siderolabs/talos/internal/pkg/partition"
 	"github.com/siderolabs/talos/internal/pkg/pcap"
+	"github.com/siderolabs/talos/internal/pkg/seriallogs"
 	"github.com/siderolabs/talos/pkg/archiver"
 	"github.com/siderolabs/talos/pkg/chunker"
 	"github.com/siderolabs/talos/pkg/chunker/stream"
@@ -83,16 +93,19 @@ import (
 	timeapi "github.com/siderolabs/talos/pkg/machinery/api/time"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	"github.com/siderolabs/talos/pkg/machinery/config"
+	configconfig "github.com/siderolabs/talos/pkg/machinery/config/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/configdiff"
 	"github.com/siderolabs/talos/pkg/machinery/config/configloader"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 	machinetype "github.com/siderolabs/talos/pkg/machinery/config/machine"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
+	"github.com/siderolabs/talos/pkg/machinery/hypervisorhelpers"
 	"github.com/siderolabs/talos/pkg/machinery/meta"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
 	"github.com/siderolabs/talos/pkg/machinery/resources/block"
 	crires "github.com/siderolabs/talos/pkg/machinery/resources/cri"
 	etcdresource "github.com/siderolabs/talos/pkg/machinery/resources/etcd"
+	"github.com/siderolabs/talos/pkg/machinery/resources/hardware"
 	"github.com/siderolabs/talos/pkg/machinery/resources/network"
 	timeresource "github.com/siderolabs/talos/pkg/machinery/resources/time"
 	"github.com/siderolabs/talos/pkg/machinery/role"
@@ -125,6 +138,8 @@ type Server struct {
 	Logger *zap.Logger
 
 	server *grpc.Server
+
+	applyConfigMu sync.Mutex
 }
 
 func (s *Server) checkSupported(feature runtime.ModeCapability) error {
@@ -142,17 +157,25 @@ func (s *Server) Register(obj *grpc.Server) {
 	s.server = obj
 
 	// wrap resources with access filter
-	resourceState := s.Controller.Runtime().State().V1Alpha2().Resources()
-	resourceState = state.WrapCore(state.Filter(resourceState, resources.AccessPolicy(resourceState)))
+	rawResourceState := s.Controller.Runtime().State().V1Alpha2().Resources()
+	resourceState := state.WrapCore(state.Filter(rawResourceState, resources.AccessPolicy(rawResourceState)))
 
 	machine.RegisterMachineServiceServer(obj, s)
 	machine.RegisterImageServiceServer(obj, images.NewService(s.Controller, s.Logger))
+	machine.RegisterStorageServiceServer(obj, machinestorage.NewService())
 	machine.RegisterDebugServiceServer(obj, &debug.Service{})
+
+	connector := libvirt.New().DomainConnector()
+	machine.RegisterHypervisorServiceServer(obj, hypervisord.NewService(resourceState, connector.OpenConsole,
+		hypervisord.WithVNCConnector(connector.OpenVNC)))
 	machine.RegisterLifecycleServiceServer(obj, lifecycle.NewService(s.Controller.Runtime(), s.Logger))
+	machine.RegisterContentLibraryServiceServer(obj, contentlibrary.NewService(rawResourceState, s.Logger))
 	cluster.RegisterClusterServiceServer(obj, s)
 	cosiv1alpha1.RegisterStateServer(obj, server.NewState(resourceState))
 	inspect.RegisterInspectServiceServer(obj, &InspectServer{server: s})
 	storage.RegisterStorageServiceServer(obj, &storaged.Server{Controller: s.Controller})
+	machine.RegisterLVMServiceServer(obj, lvmd.NewService(s.Controller, s.Logger))
+	machine.RegisterMDServiceServer(obj, mdd.NewService(s.Controller, s.Logger))
 	timeapi.RegisterTimeServiceServer(obj, &TimeServer{ConfigProvider: s.Controller.Runtime()})
 }
 
@@ -175,6 +198,11 @@ func (s *Server) ApplyConfiguration(ctx context.Context, in *machine.ApplyConfig
 		return nil, status.Error(codes.Unimplemented, "API is not implemented in agent mode")
 	}
 
+	if !s.applyConfigMu.TryLock() {
+		return nil, status.Error(codes.FailedPrecondition, "another apply configuration is already in progress")
+	}
+	defer s.applyConfigMu.Unlock()
+
 	roles := authz.GetRoles(ctx)
 	inMaintenance := !s.Controller.Runtime().ConfigCompleteForBoot()
 
@@ -183,12 +211,8 @@ func (s *Server) ApplyConfiguration(ctx context.Context, in *machine.ApplyConfig
 	}
 
 	mode := in.Mode.String()
-	modeDetails := "Applied configuration with a reboot"
-	modeErr := ""
 
-	if in.Mode != machine.ApplyConfigurationRequest_TRY {
-		s.Controller.Runtime().CancelConfigRollbackTimeout()
-	}
+	var modeDetails string
 
 	cfgProvider, err := configloader.NewFromBytes(in.GetData())
 	if err != nil {
@@ -202,6 +226,14 @@ func (s *Server) ApplyConfiguration(ctx context.Context, in *machine.ApplyConfig
 		return nil, status.Error(codes.InvalidArgument, "the applied machine configuration doesn't contain v1alpha1 config, did you mean to patch the machine config instead?")
 	}
 
+	if in.Mode == machine.ApplyConfigurationRequest_REBOOT { //nolint:staticcheck // backwards compatibility
+		if inMaintenance {
+			in.Mode = machine.ApplyConfigurationRequest_NO_REBOOT
+		} else {
+			return nil, status.Error(codes.Unimplemented, "the REBOOT mode is not supported, please use AUTO or NO_REBOOT modes instead")
+		}
+	}
+
 	validationMode := modeWrapper{
 		Mode:      s.Controller.Runtime().State().Platform().Mode(),
 		installed: s.Controller.Runtime().State().Machine().Installed(),
@@ -212,37 +244,25 @@ func (s *Server) ApplyConfiguration(ctx context.Context, in *machine.ApplyConfig
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
-	if inMaintenance && in.Mode == machine.ApplyConfigurationRequest_REBOOT {
-		in.Mode = machine.ApplyConfigurationRequest_NO_REBOOT
-	}
-
 	//nolint:exhaustive
 	switch in.Mode {
+	// --mode=auto
+	case machine.ApplyConfigurationRequest_AUTO:
+		in.Mode = machine.ApplyConfigurationRequest_NO_REBOOT
+		mode = fmt.Sprintf("%s(%s)", mode, in.Mode)
+
+		fallthrough
 	// --mode=try
 	case machine.ApplyConfigurationRequest_TRY:
 		fallthrough
 	// --mode=no-reboot
 	case machine.ApplyConfigurationRequest_NO_REBOOT:
-		if err = s.Controller.Runtime().CanApplyImmediate(cfgProvider); err != nil && !inMaintenance {
-			return nil, status.Error(codes.InvalidArgument, err.Error())
-		}
-
 		modeDetails = "Applied configuration without a reboot"
 	// --mode=staged
 	case machine.ApplyConfigurationRequest_STAGED:
 		modeDetails = "Staged configuration to be applied after the next reboot"
-	// --mode=auto detect actual update mode
-	case machine.ApplyConfigurationRequest_AUTO:
-		if err = s.Controller.Runtime().CanApplyImmediate(cfgProvider); err != nil && !inMaintenance {
-			in.Mode = machine.ApplyConfigurationRequest_REBOOT
-			modeDetails = "Applied configuration with a reboot"
-			modeErr = ": " + err.Error()
-		} else {
-			in.Mode = machine.ApplyConfigurationRequest_NO_REBOOT
-			modeDetails = "Applied configuration without a reboot"
-		}
-
-		mode = fmt.Sprintf("%s(%s)", mode, in.Mode)
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "incorrect mode '%s' specified for the apply config call", in.Mode.String())
 	}
 
 	if in.DryRun {
@@ -261,6 +281,10 @@ func (s *Server) ApplyConfiguration(ctx context.Context, in *machine.ApplyConfig
 				},
 			},
 		}, nil
+	}
+
+	if in.Mode != machine.ApplyConfigurationRequest_TRY {
+		s.Controller.Runtime().CancelConfigRollbackTimeout()
 	}
 
 	log.Printf("apply config request: mode %s", strings.ToLower(mode))
@@ -297,21 +321,6 @@ func (s *Server) ApplyConfiguration(ctx context.Context, in *machine.ApplyConfig
 		if err := s.Controller.Runtime().SetPersistedConfig(cfgProvider); err != nil {
 			return nil, err
 		}
-	// --mode=reboot
-	case machine.ApplyConfigurationRequest_REBOOT:
-		if err := s.Controller.Runtime().SetPersistedConfig(cfgProvider); err != nil {
-			return nil, err
-		}
-
-		go func() {
-			if err := s.Controller.Run(context.Background(), runtime.SequenceReboot, nil, runtime.WithTakeover()); err != nil {
-				if !runtime.IsRebootError(err) {
-					log.Println("apply configuration failed:", err)
-				}
-			}
-		}()
-	default:
-		return nil, fmt.Errorf("incorrect mode '%s' specified for the apply config call", in.Mode.String())
 	}
 
 	return &machine.ApplyConfigurationResponse{
@@ -319,7 +328,7 @@ func (s *Server) ApplyConfiguration(ctx context.Context, in *machine.ApplyConfig
 			{
 				Mode:        in.Mode,
 				Warnings:    warnings,
-				ModeDetails: modeDetails + modeErr,
+				ModeDetails: modeDetails,
 			},
 		},
 	}, nil
@@ -424,6 +433,13 @@ func (s *Server) Bootstrap(ctx context.Context, in *machine.BootstrapRequest) (r
 		return nil, err
 	}
 
+	hasEtcdCA := s.Controller.Runtime().Config() != nil && s.Controller.Runtime().Config().Cluster() != nil && s.Controller.Runtime().Config().Cluster().Etcd().CA() != nil
+	if !hasEtcdCA {
+		// there is no etcd CA in the machine config, but we already have machine type (previous check),
+		// so reject the bootstrap as a terminal error
+		return nil, status.Error(codes.InvalidArgument, "etcd is not configured, bootstrap is not possible")
+	}
+
 	timeCtx, timeCtxCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer timeCtxCancel()
 
@@ -513,11 +529,13 @@ func (s *Server) Upgrade(ctx context.Context, in *machine.UpgradeRequest) (*mach
 		return nil, fmt.Errorf("error validating installer image %q: %w", in.GetImage(), err)
 	}
 
-	if !inMaintenance && s.Controller.Runtime().Config().Machine().Type() != machinetype.TypeWorker && !in.GetForce() {
+	if !inMaintenance && s.Controller.Runtime().Config().Machine().Type() != machinetype.TypeWorker && !in.GetForce() && !in.GetPreserve() {
 		etcdClient, err := etcd.NewClientFromControlPlaneIPs(ctx, s.Controller.Runtime().State().V1Alpha2().Resources())
 		if err != nil {
 			return nil, fmt.Errorf("failed to create etcd client: %w", err)
 		}
+
+		defer etcdClient.Close() //nolint:errcheck
 
 		// acquire the upgrade mutex
 		unlocker, err := tryLockUpgradeMutex(ctx, etcdClient)
@@ -656,10 +674,12 @@ func (s *Server) Reset(ctx context.Context, in *machine.ResetRequest) (reply *ma
 			},
 		)
 
-		systemDisk, err := block.GetSystemDisk(ctx, s.Controller.Runtime().State().V1Alpha2().Resources())
+		systemDiskPaths, err := block.GetSystemDiskDevicePaths(ctx, s.Controller.Runtime().State().V1Alpha2().Resources())
 		if err != nil {
-			return nil, fmt.Errorf("system disk lookup failed: %w", err)
+			return nil, fmt.Errorf("system disk devices lookup failed: %w", err)
 		}
+
+		systemDisks := xslices.ToSet(systemDiskPaths)
 
 		// validate input
 		for _, deviceName := range in.GetUserDisksToWipe() {
@@ -672,7 +692,7 @@ func (s *Server) Reset(ctx context.Context, in *machine.ResetRequest) (reply *ma
 				return nil, fmt.Errorf("reset user disk failed: device %s is readonly", deviceName)
 			}
 
-			if systemDisk != nil && deviceName == systemDisk.DevPath {
+			if _, isSystemDisk := systemDisks[deviceName]; isSystemDisk {
 				return nil, fmt.Errorf("reset user disk failed: device %s is the system disk", deviceName)
 			}
 		}
@@ -683,19 +703,45 @@ func (s *Server) Reset(ctx context.Context, in *machine.ResetRequest) (reply *ma
 			return nil, errors.New("reset failed: invalid input, wipe mode USER_DISKS doesn't support SystemPartitionsToWipe parameter")
 		}
 
-		for _, spec := range in.GetSystemPartitionsToWipe() {
-			volumeStatus, err := safe.ReaderGetByID[*block.VolumeStatus](ctx, s.Controller.Runtime().State().V1Alpha2().Resources(), spec.Label)
+		st := s.Controller.Runtime().State().V1Alpha2().Resources()
+
+		// the set of volumes requested to be wiped, so that a volume which resides on another volume
+		// can be matched against it regardless of the order of the entries
+		wipeRequested := xslices.ToSetFunc(
+			xslices.Filter(in.GetSystemPartitionsToWipe(), func(spec *machine.ResetPartitionSpec) bool { return spec.GetWipe() }),
+			func(spec *machine.ResetPartitionSpec) string { return spec.GetLabel() },
+		)
+
+		for _, resetPartitionSpec := range in.GetSystemPartitionsToWipe() {
+			volumeStatus, err := safe.ReaderGetByID[*block.VolumeStatus](ctx, st, resetPartitionSpec.Label)
 			if err != nil {
-				return nil, fmt.Errorf("failed to get volume status with label %q: %w", spec.Label, err)
+				return nil, fmt.Errorf("failed to get volume status with label %q: %w", resetPartitionSpec.Label, err)
 			}
 
 			if volumeStatus.TypedSpec().Location == "" {
-				return nil, fmt.Errorf("failed to reset: volume %q is not located", spec.Label)
+				// the volume has no block device of its own (e.g. a directory-backed system volume
+				// nested under EPHEMERAL): it has no wipe target, and it is only wiped as a side effect
+				// of wiping the volume it resides on, so require that volume to be wiped as well
+				backingVolume, err := system.FindBackingVolume(ctx, st, resetPartitionSpec.Label)
+				if err != nil {
+					return nil, fmt.Errorf("failed to reset: %w", err)
+				}
+
+				if _, ok := wipeRequested[backingVolume]; !ok {
+					return nil, fmt.Errorf(
+						"failed to reset: volume %q resides on volume %q, and therefore %q cannot be wiped without wiping %q",
+						resetPartitionSpec.Label, backingVolume, resetPartitionSpec.Label, backingVolume,
+					)
+				}
+
+				log.Printf("reset: volume %q (%s) is wiped as part of wiping volume %q", resetPartitionSpec.Label, volumeStatus.TypedSpec().Type, backingVolume)
+
+				continue
 			}
 
 			target := partition.VolumeWipeTargetFromVolumeStatus(volumeStatus)
 
-			if spec.Wipe {
+			if resetPartitionSpec.Wipe {
 				opts.systemDiskTargets = append(opts.systemDiskTargets, target)
 			}
 		}
@@ -831,16 +877,7 @@ func (s *Server) Copy(req *machine.CopyRequest, obj machine.MachineService_CopyS
 		}
 	}
 
-	archiveErr := <-errCh
-	if archiveErr != nil {
-		return obj.SendMsg(&common.Data{
-			Metadata: &common.Metadata{
-				Error: archiveErr.Error(),
-			},
-		})
-	}
-
-	return nil
+	return <-errCh
 }
 
 // List implements the machine.MachineServer interface.
@@ -1239,7 +1276,28 @@ func (s *Server) Kubeconfig(empty *emptypb.Empty, obj machine.MachineService_Kub
 
 	var b bytes.Buffer
 
-	if err := kubeconfig.GenerateAdmin(s.Controller.Runtime().Config().Cluster(), &b); err != nil {
+	k8sCAConfig := s.Controller.Runtime().Config().K8sAPIServerCAConfig()
+	if k8sCAConfig == nil {
+		return status.Error(codes.FailedPrecondition, "k8s API server CA config is not set")
+	}
+
+	k8sClusterConfig := s.Controller.Runtime().Config().K8sClusterConfig()
+	if k8sClusterConfig == nil {
+		return status.Error(codes.FailedPrecondition, "cluster name and endpoint are not configured (.cluster.controlPlane.endpoint or KubeClusterConfig document)")
+	}
+
+	if err := kubeconfig.GenerateAdmin(
+		struct {
+			configconfig.ClusterConfig
+			configconfig.K8sAPIServerCAConfig
+			configconfig.K8sClusterConfig
+		}{
+			ClusterConfig:        s.Controller.Runtime().Config().Cluster(),
+			K8sAPIServerCAConfig: k8sCAConfig,
+			K8sClusterConfig:     k8sClusterConfig,
+		},
+		&b,
+	); err != nil {
 		return err
 	}
 
@@ -1275,43 +1333,23 @@ func (s *Server) Kubeconfig(empty *emptypb.Empty, obj machine.MachineService_Kub
 	})
 }
 
-// Logs provides a service or container logs can be requested and the contents of the
-// log file are streamed in chunks.
+// Logs streams service, container, or virtual machine logs in chunks.
 func (s *Server) Logs(req *machine.LogsRequest, l machine.MachineService_LogsServer) (err error) {
-	var chunk chunker.Chunker
-
-	switch {
-	case req.Namespace == constants.SystemContainerdNamespace || req.Id == "kubelet":
-		var options []runtime.LogOption
-
-		if req.Follow {
-			options = append(options, runtime.WithFollow())
-		}
-
-		if req.TailLines >= 0 {
-			options = append(options, runtime.WithTailLines(int(req.TailLines)))
-		}
-
-		var logR io.ReadCloser
-
-		logR, err = s.Controller.Runtime().Logging().ServiceLog(req.Id).Reader(options...)
-		if err != nil {
-			return err
-		}
-
-		//nolint:errcheck
-		defer logR.Close()
-
-		chunk = stream.NewChunker(l.Context(), logR)
-	default:
-		var file io.Closer
-
-		if chunk, file, err = k8slogs(l.Context(), req); err != nil {
-			return err
-		}
-		//nolint:errcheck
-		defer file.Close()
+	if err = validateLogKind(req); err != nil {
+		return err
 	}
+
+	if req.Kind == machine.LogKind_LOG_KIND_VM {
+		return s.vmLogs(req, l)
+	}
+
+	chunk, file, err := s.logsChunker(l.Context(), req)
+	if err != nil {
+		return err
+	}
+
+	//nolint:errcheck
+	defer file.Close()
 
 	for data := range chunk.Read() {
 		if err = l.Send(&common.Data{Bytes: data}); err != nil {
@@ -1320,6 +1358,100 @@ func (s *Server) Logs(req *machine.LogsRequest, l machine.MachineService_LogsSer
 	}
 
 	return nil
+}
+
+func (s *Server) vmLogs(req *machine.LogsRequest, stream machine.MachineService_LogsServer) error {
+	ctx := stream.Context()
+
+	path, err := s.vmSerialLogPath(ctx, req.Id)
+	if err != nil {
+		return err
+	}
+
+	return seriallogs.Stream(ctx, path, req.TailLines, req.Follow, func(data []byte) error {
+		return stream.Send(&common.Data{
+			Bytes: data,
+		})
+	})
+}
+
+func (s *Server) vmSerialLogPath(ctx context.Context, name string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", status.FromContextError(err).Err()
+	}
+
+	if err := hypervisorhelpers.ValidateName(name); err != nil {
+		return "", status.Errorf(codes.InvalidArgument, "invalid virtual machine name: %v", err)
+	}
+
+	resources := s.Controller.Runtime().State().V1Alpha2().Resources()
+
+	system, err := safe.StateGetByID[*hardware.SystemInformation](ctx, resources, hardware.SystemInformationID)
+	if err != nil {
+		return "", status.Errorf(codes.FailedPrecondition, "read machine identity: %v", err)
+	}
+
+	machineUUID, err := uuid.Parse(system.TypedSpec().UUID)
+	if err != nil || machineUUID == uuid.Nil {
+		return "", status.Error(codes.FailedPrecondition, "invalid machine UUID")
+	}
+
+	// Resolve the log path independently of VM configuration or live libvirt state.
+	// Retained logs remain readable after a VM is no longer managed.
+	return filepath.Join(constants.LogMountPoint, fmt.Sprintf("vm-%s-serial0.log", domain.UUID(machineUUID, name))), nil
+}
+
+func (s *Server) logsChunker(ctx context.Context, req *machine.LogsRequest) (chunker.Chunker, io.Closer, error) {
+	switch {
+	case req.Kind == machine.LogKind_LOG_KIND_SERVICE ||
+		(req.Kind == machine.LogKind_LOG_KIND_UNSPECIFIED && (req.Namespace == constants.SystemContainerdNamespace || req.Id == "kubelet")):
+		return s.serviceLogChunker(ctx, req, req.Id)
+	case req.Namespace == constants.TalosContainersContainerdNamespace:
+		// Declared containers log by config name so restart history outlives instances.
+		return s.serviceLogChunker(ctx, req, constants.TalosContainersLogPrefix+req.Id)
+	default:
+		return k8slogs(ctx, req)
+	}
+}
+
+// validateLogKind rejects unknown selectors and incompatible namespaces before routing.
+func validateLogKind(req *machine.LogsRequest) error {
+	switch req.Kind {
+	case machine.LogKind_LOG_KIND_UNSPECIFIED:
+		return nil
+	case machine.LogKind_LOG_KIND_VM, machine.LogKind_LOG_KIND_SERVICE:
+		if req.Namespace != constants.SystemContainerdNamespace {
+			return status.Errorf(codes.InvalidArgument, "log kind %s requires the system namespace", req.Kind)
+		}
+	case machine.LogKind_LOG_KIND_CONTAINER:
+		if req.Namespace == "" {
+			return status.Error(codes.InvalidArgument, "container log namespace can't be empty")
+		}
+	default:
+		return status.Errorf(codes.InvalidArgument, "unsupported log kind %d", req.Kind)
+	}
+
+	return nil
+}
+
+// serviceLogChunker opens the named entry in the in-memory service log buffer for streaming.
+func (s *Server) serviceLogChunker(ctx context.Context, req *machine.LogsRequest, id string) (chunker.Chunker, io.Closer, error) {
+	var options []runtime.LogOption
+
+	if req.Follow {
+		options = append(options, runtime.WithFollow())
+	}
+
+	if req.TailLines >= 0 {
+		options = append(options, runtime.WithTailLines(int(req.TailLines)))
+	}
+
+	logR, err := s.Controller.Runtime().Logging().ServiceLog(id).Reader(options...)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return stream.NewChunker(ctx, logR), logR, nil
 }
 
 // LogsContainers provide a list of registered log containers.
@@ -1662,18 +1794,14 @@ func (s *Server) Dmesg(req *machine.DmesgRequest, srv machine.MachineService_Dme
 			}
 
 			if packet.Err != nil {
-				err = srv.Send(&common.Data{
-					Metadata: &common.Metadata{
-						Error: packet.Err.Error(),
-					},
-				})
-			} else {
-				msg := packet.Message
-				err = srv.Send(&common.Data{
-					Bytes: fmt.Appendf(nil, "%s: %7s: [%s]: %s", msg.Facility, msg.Priority, msg.Timestamp.Format(time.RFC3339Nano), msg.Message),
-				})
+				return packet.Err
 			}
 
+			msg := packet.Message
+
+			err = srv.Send(&common.Data{
+				Bytes: fmt.Appendf(nil, "%s: %7s: [%s]: %s", msg.Facility, msg.Priority, msg.Timestamp.Format(time.RFC3339Nano), msg.Message),
+			})
 			if err != nil {
 				return err
 			}
@@ -1980,7 +2108,10 @@ func (s *Server) EtcdRecover(srv machine.MachineService_EtcdRecoverServer) error
 		return err
 	}
 
-	snapshot, err := os.OpenFile(constants.EtcdRecoverySnapshotPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o700)
+	// The snapshot is written to a temporary file and moved into place only once it is complete,
+	// so that the recovery running in the etcd service keeps reading the snapshot it started with:
+	// a repeated upload never truncates or removes the file under an in-progress recovery.
+	snapshot, err := os.CreateTemp(filepath.Dir(constants.EtcdRecoverySnapshotPath), filepath.Base(constants.EtcdRecoverySnapshotPath)+".*")
 	if err != nil {
 		return fmt.Errorf("error creating etcd recovery snapshot: %w", err)
 	}
@@ -2019,6 +2150,10 @@ func (s *Server) EtcdRecover(srv machine.MachineService_EtcdRecoverServer) error
 
 	if err = snapshot.Close(); err != nil {
 		return fmt.Errorf("error closing snapshot: %w", err)
+	}
+
+	if err = os.Rename(snapshot.Name(), constants.EtcdRecoverySnapshotPath); err != nil {
+		return fmt.Errorf("error moving snapshot into place: %w", err)
 	}
 
 	successfulUpload = true
@@ -2358,8 +2493,13 @@ func (s *Server) GenerateClientConfiguration(ctx context.Context, in *machine.Ge
 		return nil, err
 	}
 
-	// make a nice context name
-	contextName := s.Controller.Runtime().Config().Cluster().Name()
+	// make a nice context name if we have cluster config
+	contextName := "talos"
+
+	if k8sClusterConfig := s.Controller.Runtime().Config().K8sClusterConfig(); k8sClusterConfig != nil {
+		contextName = k8sClusterConfig.ClusterName()
+	}
+
 	if r := roles.Strings(); len(r) == 1 {
 		contextName = strings.TrimPrefix(r[0], role.Prefix) + "@" + contextName
 	}
@@ -2444,6 +2584,9 @@ func (s *Server) PacketCapture(in *machine.PacketCaptureRequest, srv machine.Mac
 		afpacket.OptInterface(in.Interface),
 		afpacket.OptPollTimeout(100*time.Millisecond),
 		afpacket.OptSocketType(unix.SOCK_RAW|unix.SOCK_CLOEXEC),
+		// the kernel strips the VLAN header off the ingress frames and reports the tag out-of-band,
+		// so ask afpacket to re-insert it into the packet data, the same way libpcap/tcpdump do
+		afpacket.OptAddVLANHeader(true),
 	)
 	if err != nil {
 		return fmt.Errorf("error creating afpacket handle: %w", err)
@@ -2463,11 +2606,21 @@ func (s *Server) PacketCapture(in *machine.PacketCaptureRequest, srv machine.Mac
 		return fmt.Errorf("error setting promiscuous mode %v: %w", in.Promiscuous, err)
 	}
 
-	return capturePackets(srv.Context(), &packetStreamWriter{srv}, handle, in.SnapLen, linkType)
+	return CapturePackets(srv.Context(), &packetStreamWriter{srv}, handle, in.SnapLen, linkType)
 }
 
+// PacketCaptureHandle is a subset of [afpacket.TPacket] used for packet capture.
+type PacketCaptureHandle interface {
+	ZeroCopyReadPacketData() ([]byte, gopacket.CaptureInfo, error)
+	Stats() (afpacket.Stats, error)
+	SocketStats() (afpacket.SocketStats, afpacket.SocketStatsV3, error)
+	Close()
+}
+
+// CapturePackets handles the packet capture loop and writes packets to the provided writer in pcap format.
+//
 //nolint:gocyclo,cyclop
-func capturePackets(ctx context.Context, w io.Writer, handle *afpacket.TPacket, snapLen uint32, linkType pcap.LinkType) error {
+func CapturePackets(ctx context.Context, w io.Writer, handle PacketCaptureHandle, snapLen uint32, linkType pcap.LinkType) error {
 	defer handle.Close()
 
 	pcapw := pcap.NewWriter(w)
@@ -2501,6 +2654,11 @@ func capturePackets(ctx context.Context, w io.Writer, handle *afpacket.TPacket, 
 
 		data, captureData, err := handle.ZeroCopyReadPacketData()
 		if err == nil {
+			// afpacket re-inserts the VLAN header stripped by the kernel into the packet data (which bumps the
+			// capture length), but, unlike libpcap, it doesn't adjust the original wire length reported by the
+			// kernel, so compensate here: otherwise the pcap writer rejects the packet as capture length > length.
+			captureData.Length = max(captureData.Length, captureData.CaptureLength)
+
 			if err = pcapw.WritePacket(captureData, data); err != nil {
 				return err
 			}

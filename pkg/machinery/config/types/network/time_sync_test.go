@@ -174,6 +174,44 @@ func TestTimeSyncValidate(t *testing.T) {
 			},
 			expectedError: `NTS requires hostnames, not IP addresses: "192.0.2.1"`,
 		},
+		{
+			name: "valid PTP config",
+			cfg: func() *network.TimeSyncConfigV1Alpha1 {
+				cfg := network.NewTimeSyncConfigV1Alpha1()
+				cfg.TimePTP = &network.PTPConfig{
+					Devices: []string{"/dev/ptp0", "/dev/ptp_kvm"},
+				}
+
+				return cfg
+			},
+		},
+		{
+			name: "PTP device as NTP server",
+			cfg: func() *network.TimeSyncConfigV1Alpha1 {
+				cfg := network.NewTimeSyncConfigV1Alpha1()
+				cfg.TimeNTP = &network.NTPConfig{
+					Servers: []string{"/dev/ptp0"},
+				}
+
+				return cfg
+			},
+			expectedError: `PTP devices should be specified in the ptp section, not as NTP servers: "/dev/ptp0"`,
+		},
+		{
+			name: "invalid PTP devices",
+			cfg: func() *network.TimeSyncConfigV1Alpha1 {
+				cfg := network.NewTimeSyncConfigV1Alpha1()
+				cfg.TimePTP = &network.PTPConfig{
+					Devices: []string{"ptp0", "/dev/../dev/watchdog", "/dev/watchdog", "/dev/foo/ptp0"},
+				}
+
+				return cfg
+			},
+			expectedError: `PTP device should be a path under /dev/: "ptp0"` + "\n" +
+				`PTP device path "/dev/../dev/watchdog" is not clean` + "\n" +
+				`PTP device path "/dev/watchdog" should have a name starting with 'ptp'` + "\n" +
+				`PTP device path "/dev/foo/ptp0" should be directly under /dev/`,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
@@ -210,7 +248,7 @@ func TestTimeSyncV1Alpha1Validate(t *testing.T) {
 			name: "v1alpha1 timeservers set",
 			v1alpha1Cfg: &v1alpha1.Config{
 				MachineConfig: &v1alpha1.MachineConfig{
-					MachineTime: &v1alpha1.TimeConfig{
+					MachineTime: &v1alpha1.TimeConfig{ //nolint:staticcheck // legacy config
 						TimeServers: []string{"za.pool.ntp.org"},
 					},
 				},
@@ -223,7 +261,7 @@ func TestTimeSyncV1Alpha1Validate(t *testing.T) {
 			name: "v1alpha1 boot timeout set",
 			v1alpha1Cfg: &v1alpha1.Config{
 				MachineConfig: &v1alpha1.MachineConfig{
-					MachineTime: &v1alpha1.TimeConfig{
+					MachineTime: &v1alpha1.TimeConfig{ //nolint:staticcheck // legacy config
 						TimeBootTimeout: time.Second,
 					},
 				},
@@ -236,7 +274,7 @@ func TestTimeSyncV1Alpha1Validate(t *testing.T) {
 			name: "v1alpha1 disable set",
 			v1alpha1Cfg: &v1alpha1.Config{
 				MachineConfig: &v1alpha1.MachineConfig{
-					MachineTime: &v1alpha1.TimeConfig{
+					MachineTime: &v1alpha1.TimeConfig{ //nolint:staticcheck // legacy config
 						TimeDisabled: new(true),
 					},
 				},

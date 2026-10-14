@@ -105,7 +105,7 @@ func (ctrl *KmsgLogDeliveryController) Run(ctx context.Context, r controller.Run
 			continue
 		}
 
-		if err = ctrl.deliverLogs(ctx, r, logger, kmsgCh, cfg.TypedSpec().Destinations); err != nil {
+		if err = ctrl.deliverLogs(ctx, r, logger, kmsgCh, cfg.TypedSpec().TaggedDestinations); err != nil {
 			return fmt.Errorf("error delivering logs: %w", err)
 		}
 
@@ -114,7 +114,8 @@ func (ctrl *KmsgLogDeliveryController) Run(ctx context.Context, r controller.Run
 }
 
 type logConfig struct {
-	endpoint *url.URL
+	endpoint  *url.URL
+	extraTags map[string]string
 }
 
 func (c logConfig) Format() string {
@@ -126,19 +127,25 @@ func (c logConfig) Endpoint() *url.URL {
 }
 
 func (c logConfig) ExtraTags() map[string]string {
-	return nil
+	return c.extraTags
 }
 
 //nolint:gocyclo
-func (ctrl *KmsgLogDeliveryController) deliverLogs(ctx context.Context, r controller.Runtime, logger *zap.Logger, kmsgCh <-chan kmsg.Packet, destURLs []*url.URL) error {
+func (ctrl *KmsgLogDeliveryController) deliverLogs(
+	ctx context.Context,
+	r controller.Runtime,
+	logger *zap.Logger,
+	kmsgCh <-chan kmsg.Packet,
+	taggedDestinations []runtime.KmsgLogDestination,
+) error {
 	if ctrl.drainSub == nil {
 		ctrl.drainSub = ctrl.Drainer.Subscribe()
 	}
 
-	// initialize all log senders
-	destLogConfigs := xslices.Map(destURLs, func(u *url.URL) config.LoggingDestination {
-		return logConfig{endpoint: u}
+	destLogConfigs := xslices.Map(taggedDestinations, func(destination runtime.KmsgLogDestination) config.LoggingDestination {
+		return logConfig{endpoint: destination.Endpoint, extraTags: destination.ExtraTags}
 	})
+
 	senders := xslices.Map(destLogConfigs, logging.NewJSONLines)
 
 	defer func() {
@@ -167,9 +174,11 @@ func (ctrl *KmsgLogDeliveryController) deliverLogs(ctx context.Context, r contro
 			return nil
 		case <-r.EventCh():
 			// config changed, restart the loop
+			r.QueueReconcile()
+
 			return nil
 		case <-ctrl.drainSub.EventCh():
-			// drain started, assume that ksmg is drained if there're no new messages in drainTimeout
+			// drain started, assume that kmsg is drained if there're no new messages in drainTimeout
 			drainTimer = time.NewTimer(drainTimeout)
 			drainTimerCh = drainTimer.C
 

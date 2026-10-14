@@ -59,11 +59,11 @@ func (c *Config) Upgrade(opts options.InstallOptions) (*options.InstallResult, e
 		opts.BootDisk,
 		mountSpecs,
 		func() error {
-			if err := c.flip(); err != nil {
+			if err := c.SelectUpgradeTarget(opts.Printf); err != nil {
 				return err
 			}
 
-			if err := c.generateAssets(opts); err != nil {
+			if err := c.copyAssets(opts); err != nil {
 				return err
 			}
 

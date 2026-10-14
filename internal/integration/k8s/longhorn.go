@@ -30,11 +30,6 @@ var (
 )
 
 // LongHornSuite tests deploying Longhorn with the v2 (SPDK) data engine.
-//
-// The v1 engine relies on exec'ing engine binaries the engine-image DaemonSet
-// drops under /var/lib/longhorn/engine-binaries/, which is incompatible with
-// noexec on /var (see LongHornV1Suite for the v1 path that opts out via the
-// ephemeral-insecure VolumeConfig patch).
 type LongHornSuite struct {
 	base.K8sSuite
 }
@@ -130,6 +125,8 @@ func (suite *LongHornSuite) TestDeploy() {
 	})
 
 	suite.Run("fio-v2-ublk", func() {
+		suite.T().Skip("fio-v2-ublk is broken: https://github.com/longhorn/longhorn/issues/13273")
+
 		suite.Require().NoError(suite.RunFIOTest(ctx, "longhorn-v2-ublk", "10G"))
 	})
 }

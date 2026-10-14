@@ -5,10 +5,14 @@
 package k8s
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
+	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +20,7 @@ import (
 	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/hashicorp/go-multierror"
+	"github.com/siderolabs/gen/maps"
 	"github.com/siderolabs/gen/optional"
 	"github.com/siderolabs/gen/xslices"
 	"github.com/siderolabs/go-kubernetes/kubernetes/compatibility"
@@ -31,6 +36,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/kubelet"
+	"github.com/siderolabs/talos/pkg/machinery/labels"
 	"github.com/siderolabs/talos/pkg/machinery/resources/config"
 	"github.com/siderolabs/talos/pkg/machinery/resources/k8s"
 )
@@ -38,6 +44,9 @@ import (
 // KubeletSpecController renders manifests based on templates and config/secrets.
 type KubeletSpecController struct {
 	V1Alpha1Mode v1alpha1runtime.Mode
+
+	// MemoryCapacity is read at render time while a kubepods memory limit is active; defaults to ProcMemoryCapacity.
+	MemoryCapacity MemoryCapacityReader
 }
 
 // Name implements controller.Controller interface.
@@ -194,7 +203,7 @@ func (ctrl *KubeletSpecController) Run(ctx context.Context, r controller.Runtime
 			args["image-credential-provider-config"] = argsbuilder.Value{constants.KubeletCredentialProviderConfig}
 		}
 
-		kubeletConfig, err := NewKubeletConfiguration(cfgSpec, kubeletVersion, machineType.MachineType())
+		kubeletConfig, err := NewKubeletConfiguration(cfgSpec, kubeletVersion, machineType.MachineType(), ctrl.kubeletConfigurationOptions(cfgSpec)...)
 		if err != nil {
 			return fmt.Errorf("error creating kubelet configuration: %w", err)
 		}
@@ -235,6 +244,26 @@ func (ctrl *KubeletSpecController) Run(ctx context.Context, r controller.Runtime
 	}
 }
 
+// kubeletConfigurationOptions wires the host memory reader in when a kubepods memory limit is active outside container mode.
+//
+// In container mode the kubelet does not own the host cgroup hierarchy, so the limit leaves its configuration unchanged.
+func (ctrl *KubeletSpecController) kubeletConfigurationOptions(cfgSpec *k8s.KubeletConfigSpec) []KubeletConfigurationOption {
+	if cfgSpec.KubepodsMemoryLimit == 0 {
+		return nil
+	}
+
+	if ctrl.V1Alpha1Mode == v1alpha1runtime.ModeContainer {
+		return []KubeletConfigurationOption{IgnoringKubepodsMemoryLimit()}
+	}
+
+	readCapacity := ctrl.MemoryCapacity
+	if readCapacity == nil {
+		readCapacity = ProcMemoryCapacity
+	}
+
+	return []KubeletConfigurationOption{WithHostMemory(readCapacity, os.Getpagesize())}
+}
+
 func prepareExtraConfig(extraConfig map[string]any) (*kubeletconfig.KubeletConfiguration, error) {
 	// check for fields that can't be overridden via extraConfig
 	var multiErr *multierror.Error
@@ -262,8 +291,36 @@ func prepareExtraConfig(extraConfig map[string]any) (*kubeletconfig.KubeletConfi
 
 // NewKubeletConfiguration builds kubelet configuration with defaults and overrides from extraConfig.
 //
+// A kubepods memory limit requires WithHostMemory unless IgnoringKubepodsMemoryLimit is given;
+// the conflicting raw settings are rejected before the Talos defaults are applied.
+//
 //nolint:gocyclo,cyclop
-func NewKubeletConfiguration(cfgSpec *k8s.KubeletConfigSpec, kubeletVersion compatibility.Version, machineType machine.Type) (*kubeletconfig.KubeletConfiguration, error) {
+func NewKubeletConfiguration(
+	cfgSpec *k8s.KubeletConfigSpec, kubeletVersion compatibility.Version, machineType machine.Type, opts ...KubeletConfigurationOption,
+) (*kubeletconfig.KubeletConfiguration, error) {
+	var options kubeletConfigurationOptions
+
+	for _, opt := range opts {
+		opt(&options)
+	}
+
+	kubepodsMemoryLimit := cfgSpec.KubepodsMemoryLimit
+	if options.ignoreKubepodsMemoryLimit {
+		kubepodsMemoryLimit = 0
+	}
+
+	if kubepodsMemoryLimit > 0 {
+		if options.hostMemory == nil {
+			return nil, errors.New("kubepods memory limit requires the host memory capacity")
+		}
+
+		extraArgs := maps.Map(cfgSpec.ExtraArgs, func(flag string, v k8s.ArgValues) (string, []string) { return flag, v.Values })
+
+		if err := kubelet.ValidateMemoryLimitConfiguration(cfgSpec.ExtraConfig, extraArgs); err != nil {
+			return nil, err
+		}
+	}
+
 	config, err := prepareExtraConfig(cfgSpec.ExtraConfig)
 	if err != nil {
 		return nil, err
@@ -324,22 +381,30 @@ func NewKubeletConfiguration(cfgSpec *k8s.KubeletConfigSpec, kubeletVersion comp
 	if cfgSpec.SkipNodeRegistration {
 		config.Authentication.Webhook.Enabled = new(false)
 		config.Authorization.Mode = kubeletconfig.KubeletAuthorizationModeAlwaysAllow
-	} else if machineType.IsControlPlane() && !cfgSpec.AllowSchedulingOnControlPlane {
+	} else if cfgSpec.ExtraArgs["register-with-taints"].Values == nil { // / don't clash with taints provided via extraArgs, it is deprecated on kubelet side
 		// register with taint to prevent scheduling on control plane nodes race with NodeApplyController applying the initial taint
 		// NodeApplyController will take ownership of the taint after the first successful apply
-		if slices.IndexFunc(config.RegisterWithTaints, func(t corev1.Taint) bool {
-			return t.Key == constants.LabelNodeRoleControlPlane
-		}) == -1 { // don't add the taint if it's already in the config
-			if cfgSpec.ExtraArgs["register-with-taints"].Values == nil { // don't clash with taints provided via extraArgs, it is deprecated on kubelet side
+		for key, taint := range cfgSpec.RegisterWithTaints {
+			value, effect := labels.ParseTaint(taint)
+
+			if slices.IndexFunc(config.RegisterWithTaints, func(t corev1.Taint) bool {
+				return t.Key == key
+			}) == -1 { // don't add the taint if it's already in the config
 				config.RegisterWithTaints = append(
 					config.RegisterWithTaints,
 					corev1.Taint{
-						Key:    constants.LabelNodeRoleControlPlane,
-						Effect: corev1.TaintEffectNoSchedule,
+						Key:    key,
+						Effect: corev1.TaintEffect(effect),
+						Value:  value,
 					},
 				)
 			}
 		}
+
+		// sort the taints to establish stable order
+		slices.SortFunc(config.RegisterWithTaints, func(a, b corev1.Taint) int {
+			return cmp.Compare(a.Key, b.Key)
+		})
 	}
 
 	// fields which can be overridden
@@ -367,6 +432,12 @@ func NewKubeletConfiguration(cfgSpec *k8s.KubeletConfigSpec, kubeletVersion comp
 		config.FailSwapOn = new(false)
 	}
 
+	// kubelet requires low < high, so only default both if neither is overridden
+	if config.ImageGCHighThresholdPercent == nil && config.ImageGCLowThresholdPercent == nil {
+		config.ImageGCHighThresholdPercent = new(int32(constants.KubeletImageGCHighThresholdPercent))
+		config.ImageGCLowThresholdPercent = new(int32(constants.KubeletImageGCLowThresholdPercent))
+	}
+
 	if len(config.SystemReserved) == 0 {
 		config.SystemReserved = map[string]string{
 			"cpu":               constants.KubeletSystemReservedCPU,
@@ -379,6 +450,15 @@ func NewKubeletConfiguration(cfgSpec *k8s.KubeletConfigSpec, kubeletVersion comp
 		} else {
 			config.SystemReserved["memory"] = constants.KubeletSystemReservedMemoryWorker
 		}
+	}
+
+	if kubepodsMemoryLimit > 0 {
+		reservation, err := kubepodsMemoryReservation(config, kubepodsMemoryLimit, *options.hostMemory)
+		if err != nil {
+			return nil, err
+		}
+
+		config.SystemReserved["memory"] = strconv.FormatUint(reservation, 10)
 	}
 
 	if config.Logging.Format == "" {

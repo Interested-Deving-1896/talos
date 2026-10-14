@@ -25,6 +25,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/resources/k8s"
 	"github.com/siderolabs/talos/pkg/machinery/resources/network"
 	"github.com/siderolabs/talos/pkg/machinery/resources/runtime"
+	"github.com/siderolabs/talos/pkg/machinery/resources/secrets"
 	timeres "github.com/siderolabs/talos/pkg/machinery/resources/time"
 	"github.com/siderolabs/talos/pkg/machinery/resources/v1alpha1"
 )
@@ -34,13 +35,11 @@ func TestMachineStatusSuite(t *testing.T) {
 
 	suite.Run(t, &MachineStatusSuite{
 		eventCh: eventCh,
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 5 * time.Second,
-			AfterSetup: func(suite *ctest.DefaultSuite) {
-				suite.Require().NoError(suite.Runtime().RegisterController(&runtimectrl.MachineStatusController{
-					V1Alpha1Events: &mockWatcher{eventCh: eventCh},
-				}))
-			},
+		Timeout: 5 * time.Second,
+		AfterSetup: func(suite *ctest.DefaultSuite) {
+			suite.Require().NoError(suite.Runtime().RegisterController(&runtimectrl.MachineStatusController{
+				V1Alpha1Events: &mockWatcher{eventCh: eventCh},
+			}))
 		},
 	})
 }
@@ -76,41 +75,37 @@ func (suite *MachineStatusSuite) TestReconcile() {
 	suite.assertMachineStatus(runtime.MachineStageUnknown, true, nil)
 
 	suite.eventCh <- v1alpha1runtime.EventInfo{
-		Event: v1alpha1runtime.Event{
-			Payload: &machineapi.SequenceEvent{
-				Sequence: v1alpha1runtime.SequenceInitialize.String(),
-				Action:   machineapi.SequenceEvent_START,
-			},
+		Payload: &machineapi.SequenceEvent{
+			Sequence: v1alpha1runtime.SequenceInitialize.String(),
+			Action:   machineapi.SequenceEvent_START,
 		},
 	}
 
 	suite.assertMachineStatus(runtime.MachineStageBooting, false, []string{"time", "network", "services"})
 
+	suite.Create(secrets.NewKubelet(secrets.KubeletID))
+
 	machineType := config.NewMachineType()
 	machineType.SetMachineType(machine.TypeControlPlane)
-	suite.Require().NoError(suite.State().Create(suite.Ctx(), machineType))
+	suite.Create(machineType)
 
 	timeStatus := timeres.NewStatus()
 	timeStatus.TypedSpec().Synced = true
-	suite.Require().NoError(suite.State().Create(suite.Ctx(), timeStatus))
+	suite.Create(timeStatus)
 
 	suite.eventCh <- v1alpha1runtime.EventInfo{
-		Event: v1alpha1runtime.Event{
-			Payload: &machineapi.SequenceEvent{
-				Sequence: v1alpha1runtime.SequenceBoot.String(),
-				Action:   machineapi.SequenceEvent_START,
-			},
+		Payload: &machineapi.SequenceEvent{
+			Sequence: v1alpha1runtime.SequenceBoot.String(),
+			Action:   machineapi.SequenceEvent_START,
 		},
 	}
 
 	suite.assertMachineStatus(runtime.MachineStageBooting, false, []string{"network", "services"})
 
 	suite.eventCh <- v1alpha1runtime.EventInfo{
-		Event: v1alpha1runtime.Event{
-			Payload: &machineapi.SequenceEvent{
-				Sequence: v1alpha1runtime.SequenceBoot.String(),
-				Action:   machineapi.SequenceEvent_STOP,
-			},
+		Payload: &machineapi.SequenceEvent{
+			Sequence: v1alpha1runtime.SequenceBoot.String(),
+			Action:   machineapi.SequenceEvent_STOP,
 		},
 	}
 
@@ -119,7 +114,7 @@ func (suite *MachineStatusSuite) TestReconcile() {
 	networkStatus.TypedSpec().ConnectivityReady = true
 	networkStatus.TypedSpec().EtcFilesReady = true
 	networkStatus.TypedSpec().HostnameReady = true
-	suite.Require().NoError(suite.State().Create(suite.Ctx(), networkStatus))
+	suite.Create(networkStatus)
 
 	suite.assertMachineStatus(runtime.MachineStageRunning, false, []string{"services"})
 
@@ -127,33 +122,31 @@ func (suite *MachineStatusSuite) TestReconcile() {
 		serviceStatus := v1alpha1.NewService(service)
 		serviceStatus.TypedSpec().Running = true
 		serviceStatus.TypedSpec().Healthy = true
-		suite.Require().NoError(suite.State().Create(suite.Ctx(), serviceStatus))
+		suite.Create(serviceStatus)
 	}
 
 	suite.assertMachineStatus(runtime.MachineStageRunning, true, nil)
 
 	nodename := k8s.NewNodename(k8s.NamespaceName, k8s.NodenameID)
 	nodename.TypedSpec().Nodename = "test"
-	suite.Require().NoError(suite.State().Create(suite.Ctx(), nodename))
+	suite.Create(nodename)
 
 	suite.assertMachineStatus(runtime.MachineStageRunning, false, []string{"nodeReady"})
 
 	nodeStatus := k8s.NewNodeStatus(k8s.NamespaceName, "test")
-	suite.Require().NoError(suite.State().Create(suite.Ctx(), nodeStatus))
+	suite.Create(nodeStatus)
 
 	suite.assertMachineStatus(runtime.MachineStageRunning, false, []string{"nodeReady"})
 
 	nodeStatus.TypedSpec().NodeReady = true
-	suite.Require().NoError(suite.State().Update(suite.Ctx(), nodeStatus))
+	suite.Update(nodeStatus)
 
 	suite.assertMachineStatus(runtime.MachineStageRunning, true, nil)
 
 	suite.eventCh <- v1alpha1runtime.EventInfo{
-		Event: v1alpha1runtime.Event{
-			Payload: &machineapi.SequenceEvent{
-				Sequence: v1alpha1runtime.SequenceReboot.String(),
-				Action:   machineapi.SequenceEvent_START,
-			},
+		Payload: &machineapi.SequenceEvent{
+			Sequence: v1alpha1runtime.SequenceReboot.String(),
+			Action:   machineapi.SequenceEvent_START,
 		},
 	}
 
@@ -163,34 +156,37 @@ func (suite *MachineStatusSuite) TestReconcile() {
 	// sequencer publishes as a NOOP event with Code_FATAL. The stage should stay at "shutting down"
 	// throughout, not flip to "rebooting".
 	suite.eventCh <- v1alpha1runtime.EventInfo{
-		Event: v1alpha1runtime.Event{
-			Payload: &machineapi.SequenceEvent{
-				Sequence: v1alpha1runtime.SequenceShutdown.String(),
-				Action:   machineapi.SequenceEvent_START,
-			},
+		Payload: &machineapi.SequenceEvent{
+			Sequence: v1alpha1runtime.SequenceShutdown.String(),
+			Action:   machineapi.SequenceEvent_START,
 		},
 	}
 
 	suite.assertMachineStatus(runtime.MachineStageShuttingDown, true, nil)
 
 	suite.eventCh <- v1alpha1runtime.EventInfo{
-		Event: v1alpha1runtime.Event{
-			Payload: &machineapi.SequenceEvent{
-				Sequence: v1alpha1runtime.SequenceShutdown.String(),
-				Action:   machineapi.SequenceEvent_NOOP,
-				Error: &common.Error{
-					Code:    common.Code_FATAL,
-					Message: "sequence failed: unix.Reboot(4321fedc)",
-				},
+		Payload: &machineapi.SequenceEvent{
+			Sequence: v1alpha1runtime.SequenceShutdown.String(),
+			Action:   machineapi.SequenceEvent_NOOP,
+			Error: &common.Error{
+				Code:    common.Code_FATAL,
+				Message: "sequence failed: unix.Reboot(4321fedc)",
 			},
 		},
 	}
 
+	// Capture ctx/state in locals: Never leaks its last condition goroutine past
+	// return, and reading suite.Ctx()/suite.State() there races the next test's
+	// SetupTest overwriting those fields.
+	ctx, st := suite.Ctx(), suite.State()
+
 	// Poll over a short window to verify the stage never flips to "rebooting" or any other stage after the NOOP event.
 	suite.Require().Never(
 		func() bool {
-			status, err := safe.StateGetByID[*runtime.MachineStatus](suite.Ctx(), suite.State(), runtime.MachineStatusID)
-			suite.NoError(err, "status should exist")
+			status, err := safe.StateGetByID[*runtime.MachineStatus](ctx, st, runtime.MachineStatusID)
+			if err != nil {
+				return false
+			}
 
 			return status.TypedSpec().Stage != runtime.MachineStageShuttingDown
 		},
