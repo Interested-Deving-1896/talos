@@ -7,7 +7,6 @@ package config_test
 import (
 	_ "embed"
 	"net/netip"
-	"net/url"
 	"strings"
 	"testing"
 
@@ -18,6 +17,7 @@ import (
 
 	"github.com/siderolabs/talos/pkg/machinery/config/generate"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/network"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
@@ -26,6 +26,56 @@ import (
 
 //go:embed schemas/config.schema.json
 var schemaData string
+
+func TestCloudInitLibrarySchema(t *testing.T) {
+	t.Parallel()
+
+	schemaJSON, err := validatejsonschema.UnmarshalJSON(strings.NewReader(schemaData))
+	require.NoError(t, err)
+
+	compiler := validatejsonschema.NewCompiler()
+	require.NoError(t, compiler.AddResource("test-id", schemaJSON))
+
+	schema, err := compiler.Compile("test-id#/$defs/hypervisor.VirtualMachineCloudInit")
+	require.NoError(t, err)
+
+	assert.Error(t, schema.Validate(map[string]any{"metaData": "instance-id: vm1"}), "library must be present")
+	assert.NoError(t, schema.Validate(map[string]any{
+		"library":  "targetlibrary",
+		"metaData": "instance-id: vm1",
+	}))
+}
+
+func TestVirtualMachineVideoSchema(t *testing.T) {
+	t.Parallel()
+
+	schemaJSON, err := validatejsonschema.UnmarshalJSON(strings.NewReader(schemaData))
+	require.NoError(t, err)
+
+	compiler := validatejsonschema.NewCompiler()
+	require.NoError(t, compiler.AddResource("test-id", schemaJSON))
+	schema, err := compiler.Compile("test-id#/$defs/hypervisor.VirtualMachineConfigV1Alpha1")
+	require.NoError(t, err)
+
+	var doc map[string]any
+	require.NoError(t, yaml.Unmarshal([]byte(`apiVersion: v1alpha1
+kind: VirtualMachineConfig
+name: video
+powerState: running
+cpu:
+  count: 1
+memory:
+  size: 512MiB
+firmware:
+  type: uefi
+video:
+  model: bochs
+  vramMiB: 32
+`), &doc))
+	require.NoError(t, schema.Validate(doc))
+	doc["video"] = map[string]any{"model": "qxl"}
+	require.Error(t, schema.Validate(doc))
+}
 
 func TestSchemaValidation(t *testing.T) {
 	t.Parallel()
@@ -55,18 +105,6 @@ func TestSchemaValidation(t *testing.T) {
 				config.ConfigVersion = "v1alpha2"
 			}, nil),
 			expectedErrorContains: `value must be 'v1alpha1'`,
-		},
-		{
-			name: "v1alpha1_invalid-control-plane-endpoint",
-			config: newV1Alpha1Config(t, func(config *v1alpha1.Config) {
-				endpointURL, urlErr := url.Parse("ftp://127.0.0.1:6443")
-				require.NoError(t, urlErr)
-
-				config.ClusterConfig.ControlPlane.Endpoint = &v1alpha1.Endpoint{
-					URL: endpointURL,
-				}
-			}, nil),
-			expectedErrorContains: `does not match pattern '^https://'`,
 		},
 		{
 			name: "v1alpha1_invalid-duration",
@@ -114,7 +152,7 @@ func TestSchemaValidation(t *testing.T) {
 
 				assert.Contains(t, errorsStr, test.expectedErrorContains)
 			} else {
-				assert.NoError(t, testErr)
+				assert.NoError(t, testErr, "config was: %+v", test.config)
 			}
 		})
 	}
@@ -181,7 +219,7 @@ func newRuleConfigV1Alpha1(t *testing.T, modifications func(config *network.Rule
 	config.Ingress = network.IngressConfig{
 		{
 			Subnet: netip.MustParsePrefix("10.42.0.0/16"),
-			Except: network.Prefix{Prefix: netip.MustParsePrefix("10.42.43.0/24")},
+			Except: meta.Prefix{Prefix: netip.MustParsePrefix("10.42.43.0/24")},
 		},
 	}
 

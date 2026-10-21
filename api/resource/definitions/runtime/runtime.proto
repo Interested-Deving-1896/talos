@@ -17,9 +17,66 @@ message APIServiceConfigSpec {
   bool skip_verifying_client_cert = 4;
 }
 
+// BootIDSpec presents the kernel boot ID (contents of /proc/sys/kernel/random/boot_id).
+message BootIDSpec {
+  string boot_id = 1;
+}
+
+// BootPartitionStatusSpec describes the partition the machine was booted from.
+message BootPartitionStatusSpec {
+  // PartitionUUID is the GPT partition UUID of the boot partition.
+  string partition_uuid = 1;
+}
+
 // BootedEntrySpec describes the booted entry resource properties.
 message BootedEntrySpec {
   string booted_entry = 1;
+}
+
+// CPUPartitionBlock names one reason the desired policy is not applied.
+message CPUPartitionBlock {
+  string reason = 1;
+  repeated string virtual_machines = 2;
+  string cp_us = 3;
+}
+
+// CPUPartitionSliceSpec is one named subset of the virtual machine root.
+message CPUPartitionSliceSpec {
+  string name = 1;
+  string cp_us = 2;
+  bool exclusive = 3;
+}
+
+// CPUPartitionSpecSpec describes the desired CPU partition policy.
+message CPUPartitionSpecSpec {
+  bool enabled = 1;
+  // Omitted roots are unrestricted.
+  map<string, string> roots = 2;
+  repeated CPUPartitionSliceSpec slices = 3;
+}
+
+// CPUPartitionStatusSpec describes the applied CPU partition policy.
+message CPUPartitionStatusSpec {
+  talos.resource.definitions.enums.RuntimeCPUPartitionPhase phase = 1;
+  // Sorted by key.
+  repeated CPUPartitionTargetStatus targets = 2;
+  repeated string exclusive = 3;
+  repeated CPUPartitionBlock blocked = 4;
+  // Closes admission without stopping running VMs.
+  repeated string enforcement_loss = 5;
+  string error = 6;
+  repeated CPUPartitionBlock admission_errors = 7;
+  string waiting = 8;
+}
+
+// CPUPartitionTargetStatus is what the coordinator did to one cgroup.
+message CPUPartitionTargetStatus {
+  string key = 1;
+  // Restore only if the current mask still matches LastApplied.
+  string initial = 2;
+  string last_applied = 3;
+  // Persisted before the kernel write; a mismatch with LastApplied requires recovery.
+  string intended = 4;
 }
 
 // DevicesStatusSpec is the spec for devices status.
@@ -61,6 +118,13 @@ message ExtensionServiceConfigSpec {
 // ExtensionServiceConfigStatusSpec describes status of rendered extensions service config files.
 message ExtensionServiceConfigStatusSpec {
   string spec_version = 1;
+}
+
+// ImageFactorySchematicSpec describes Image Factory schematic information.
+message ImageFactorySchematicSpec {
+  string schematic_id = 1;
+  string flavor = 2;
+  string apiurl = 3;
 }
 
 // KernelCmdlineSpec presents kernel command line (contents of /proc/cmdline).
@@ -105,11 +169,23 @@ message KernelParamStatusSpec {
 
 // KmsgLogConfigSpec describes configuration for kmsg log streaming.
 message KmsgLogConfigSpec {
+  // Destinations is retained for compatibility with clients which do not support tagged destinations.
   repeated common.URL destinations = 1;
+  // TaggedDestinations associates each endpoint with its dedicated extra tags.
+  repeated KmsgLogDestination tagged_destinations = 2;
+}
+
+// KmsgLogDestination configures a destination for kernel message logs.
+message KmsgLogDestination {
+  common.URL endpoint = 1;
+  map<string, string> extra_tags = 2;
 }
 
 // LoadedKernelModuleSpec describes loaded Linux kernel modules.
+//
+// Deprecated: use KernelModuleStatus instead.
 message LoadedKernelModuleSpec {
+  option deprecated = true;
   int64 size = 1;
   int64 reference_count = 2;
   repeated string dependencies = 3;
@@ -196,6 +272,10 @@ message SecurityStateSpec {
   bool booted_with_uki = 5;
   talos.resource.definitions.enums.RuntimeFIPSState fips_state = 6;
   bool module_signature_enforced = 7;
+  talos.resource.definitions.enums.RuntimeLockdownState lockdown_state = 8;
+  // SecureBootAuthorityFingerprints are the fingerprints of the `db` certificates which the
+  // firmware used to authorize the images loaded in this boot, as recorded in PCR 7.
+  repeated string secure_boot_authority_fingerprints = 9;
 }
 
 // ServicePIDSpec is the spec for the service PID.
@@ -204,6 +284,13 @@ message ServicePIDSpec {
   int32 pid = 1;
   // MountNamespace is the mount namespace of the service.
   string mount_namespace = 2;
+}
+
+// UnattendedInstallStatusSpec describes the unattended install status.
+message UnattendedInstallStatusSpec {
+  string image = 1;
+  talos.resource.definitions.enums.RuntimeUnattendedInstallPhase phase = 2;
+  string error = 3;
 }
 
 // UniqueMachineTokenSpec is the spec for the machine unique token. Token can be empty if machine wasn't assigned any.
@@ -234,5 +321,13 @@ message WatchdogTimerStatusSpec {
   string device = 1;
   google.protobuf.Duration timeout = 2;
   google.protobuf.Duration feed_interval = 3;
+}
+
+// WorkloadMemorySpecSpec describes the desired memory.max for each Talos-owned workload root, in bytes.
+//
+// Zero means no limit is configured for that root; roots are independent.
+message WorkloadMemorySpecSpec {
+  uint64 talos_containers_limit = 1;
+  uint64 virtual_machines_limit = 2;
 }
 

@@ -34,15 +34,25 @@ type DiskSpec struct {
 	Readonly bool `yaml:"readonly" protobuf:"4"`
 	CDROM    bool `yaml:"cdrom" protobuf:"13"`
 
-	Model      string `yaml:"model,omitempty" protobuf:"5"`
-	Serial     string `yaml:"serial,omitempty" protobuf:"6"`
-	Modalias   string `yaml:"modalias,omitempty" protobuf:"7"`
-	WWID       string `yaml:"wwid,omitempty" protobuf:"8"`
-	UUID       string `yaml:"uuid,omitempty" protobuf:"17"`
-	BusPath    string `yaml:"bus_path,omitempty" protobuf:"9"`
-	SubSystem  string `yaml:"sub_system,omitempty" protobuf:"10"`
-	Transport  string `yaml:"transport,omitempty" protobuf:"11"`
-	Rotational bool   `yaml:"rotational,omitempty" protobuf:"12"`
+	Model           string `yaml:"model,omitempty" protobuf:"5"`
+	FirmwareVersion string `yaml:"firmware_version,omitempty" protobuf:"19"`
+	Serial          string `yaml:"serial,omitempty" protobuf:"6"`
+	Modalias        string `yaml:"modalias,omitempty" protobuf:"7"`
+	WWID            string `yaml:"wwid,omitempty" protobuf:"8"`
+	UUID            string `yaml:"uuid,omitempty" protobuf:"17"`
+	BusPath         string `yaml:"bus_path,omitempty" protobuf:"9"`
+	SubSystem       string `yaml:"sub_system,omitempty" protobuf:"10"`
+	Transport       string `yaml:"transport,omitempty" protobuf:"11"`
+	Rotational      bool   `yaml:"rotational,omitempty" protobuf:"12"`
+
+	// DeviceMapperName, DeviceMapperUUID and DeviceMapperKind identify a device-mapper disk, and
+	// are empty for any other disk.
+	//
+	// DeviceMapperKind is one of mpath, lvm, crypt or dm, so that a selector can pick out, say,
+	// multipath disks without matching every device-mapper device.
+	DeviceMapperName string `yaml:"device_mapper_name,omitempty" protobuf:"20"`
+	DeviceMapperUUID string `yaml:"device_mapper_uuid,omitempty" protobuf:"21"`
+	DeviceMapperKind string `yaml:"device_mapper_kind,omitempty" protobuf:"22"`
 
 	// SecondaryDisks (if set) specifies the secondary disk IDs.
 	//

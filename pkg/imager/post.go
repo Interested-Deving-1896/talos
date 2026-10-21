@@ -11,8 +11,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"time"
 
+	"github.com/siderolabs/gen/xerrors"
 	"github.com/siderolabs/go-cmd/pkg/cmd"
 
 	"github.com/siderolabs/talos/pkg/imager/utils"
@@ -27,23 +27,19 @@ func (i *Imager) postProcessTar(ctx context.Context, filename string, report *re
 	src := "disk.raw"
 
 	if err := os.Rename(filename, filepath.Join(dir, src)); err != nil {
-		return "", err
+		return "", xerrors.NewTaggedf[IOTag]("%w", err)
 	}
 
 	outPath := filename + ".tar.gz"
 
 	pipeR, pipeW, err := os.Pipe()
 	if err != nil {
-		return "", err
+		return "", xerrors.NewTaggedf[IOTag]("%w", err)
 	}
 
-	timestamp, ok, err := utils.SourceDateEpoch()
+	timestamp, err := utils.SourceDateEpochTime()
 	if err != nil {
-		return "", fmt.Errorf("failed to get SOURCE_DATE_EPOCH: %w", err)
-	}
-
-	if !ok {
-		timestamp = time.Now().Unix()
+		return "", xerrors.NewTaggedf[InvalidInputTag]("failed to get SOURCE_DATE_EPOCH: %w", err)
 	}
 
 	cmd1 := exec.CommandContext(
@@ -58,7 +54,7 @@ func (i *Imager) postProcessTar(ctx context.Context, filename string, report *re
 		"--owner=0",
 		"--group=0",
 		"--numeric-owner",
-		"--mtime=@"+strconv.FormatInt(timestamp, 10),
+		"--mtime=@"+strconv.FormatInt(timestamp.Unix(), 10),
 		src,
 	)
 
@@ -66,16 +62,16 @@ func (i *Imager) postProcessTar(ctx context.Context, filename string, report *re
 	cmd1.Stderr = os.Stderr
 
 	if err := cmd1.Start(); err != nil {
-		return "", err
+		return "", xerrors.NewTaggedf[DependencyTag]("%w", err)
 	}
 
 	if err = pipeW.Close(); err != nil {
-		return "", err
+		return "", xerrors.NewTaggedf[IOTag]("%w", err)
 	}
 
 	destination, err := os.OpenFile(outPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
-		return "", err
+		return "", xerrors.NewTaggedf[IOTag]("%w", err)
 	}
 
 	defer destination.Close() //nolint:errcheck
@@ -86,11 +82,11 @@ func (i *Imager) postProcessTar(ctx context.Context, filename string, report *re
 	cmd2.Stderr = os.Stderr
 
 	if err := cmd2.Start(); err != nil {
-		return "", err
+		return "", xerrors.NewTaggedf[DependencyTag]("%w", err)
 	}
 
 	if err = pipeR.Close(); err != nil {
-		return "", err
+		return "", xerrors.NewTaggedf[IOTag]("%w", err)
 	}
 
 	errCh := make(chan error, 1)
@@ -105,16 +101,16 @@ func (i *Imager) postProcessTar(ctx context.Context, filename string, report *re
 
 	for range 2 {
 		if err = <-errCh; err != nil {
-			return "", err
+			return "", xerrors.NewTaggedf[DependencyTag]("%w", err)
 		}
 	}
 
 	if err := destination.Sync(); err != nil {
-		return "", err
+		return "", xerrors.NewTaggedf[IOTag]("%w", err)
 	}
 
 	if err := os.Remove(filepath.Join(dir, src)); err != nil {
-		return "", err
+		return "", xerrors.NewTaggedf[IOTag]("%w", err)
 	}
 
 	report.Report(reporter.Update{Message: fmt.Sprintf("archive is ready: %s", outPath), Status: reporter.StatusSucceeded})
@@ -126,7 +122,7 @@ func (i *Imager) postProcessGz(ctx context.Context, filename string, report *rep
 	report.Report(reporter.Update{Message: "compressing .gz", Status: reporter.StatusRunning})
 
 	if _, err := cmd.RunWithOptions(ctx, "pigz", []string{"-6", "--no-time", "-f", filename}); err != nil {
-		return "", err
+		return "", xerrors.NewTaggedf[DependencyTag]("%w", err)
 	}
 
 	report.Report(reporter.Update{Message: fmt.Sprintf("compression done: %s.gz", filename), Status: reporter.StatusSucceeded})
@@ -138,7 +134,7 @@ func (i *Imager) postProcessXz(ctx context.Context, filename string, report *rep
 	report.Report(reporter.Update{Message: "compressing .xz", Status: reporter.StatusRunning})
 
 	if _, err := cmd.RunWithOptions(ctx, "xz", []string{"-0", "-f", "-T", "0", filename}); err != nil {
-		return "", err
+		return "", xerrors.NewTaggedf[DependencyTag]("%w", err)
 	}
 
 	report.Report(reporter.Update{Message: fmt.Sprintf("compression done: %s.xz", filename), Status: reporter.StatusSucceeded})
@@ -152,7 +148,7 @@ func (i *Imager) postProcessZstd(ctx context.Context, filename string, report *r
 	out := filename + ".zst"
 
 	if _, err := cmd.RunWithOptions(ctx, "zstd", []string{"-T0", "--rm", "-18", "--quiet", "--force", "-o", out, filename}); err != nil {
-		return "", err
+		return "", xerrors.NewTaggedf[DependencyTag]("%w", err)
 	}
 
 	report.Report(reporter.Update{Message: fmt.Sprintf("compression done: %s", out), Status: reporter.StatusSucceeded})

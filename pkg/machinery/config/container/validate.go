@@ -7,15 +7,24 @@ package container
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"slices"
+	"strings"
 
+	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/hashicorp/go-multierror"
+	"github.com/siderolabs/gen/xslices"
 
 	"github.com/siderolabs/talos/pkg/machinery/config"
+	configconfig "github.com/siderolabs/talos/pkg/machinery/config/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 	"github.com/siderolabs/talos/pkg/machinery/config/validation"
+	"github.com/siderolabs/talos/pkg/machinery/constants"
+	"github.com/siderolabs/talos/pkg/machinery/kubelet"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
+	"github.com/siderolabs/talos/pkg/machinery/resources/block"
+	"github.com/siderolabs/talos/pkg/machinery/resources/network"
 )
 
 // ValidateAsClient validates the config in the client context (outside of Talos).
@@ -102,8 +111,12 @@ func (container *Container) validate(mode validation.RuntimeMode, opt ...validat
 		}
 	}
 
-	if err := container.validateContainer(mode); err != nil {
-		multiErr = multierror.Append(multiErr, err)
+	containerWarnings, containerErr := container.validateContainer(mode)
+
+	warnings = append(warnings, containerWarnings...)
+
+	if containerErr != nil {
+		multiErr = multierror.Append(multiErr, containerErr)
 	}
 
 	return warnings, multiErr.ErrorOrNil()
@@ -143,16 +156,84 @@ func (container *Container) runtimeValidate(ctx context.Context, st state.State,
 		}
 	}
 
+	if err := container.runtimeValidateContainer(ctx, st); err != nil {
+		multiErr = multierror.Append(multiErr, err)
+	}
+
 	return warnings, multiErr.ErrorOrNil()
+}
+
+// runtimeValidateContainer validates the full configuration container in the runtime context.
+//
+// This is the runtime-context counterpart to validateContainer: it performs validation which only
+// makes sense for the whole configuration (vs. individual documents) and which requires runtime
+// state. In particular, it detects a promotable system volume (ETCD, CRI, KUBELET, LOG) whose backing
+// VolumeConfig document has been removed while the volume is still backed by a live dedicated
+// partition. The per-document VolumeConfig.RuntimeValidate cannot catch this because a removed
+// document is no longer part of the container.
+func (container *Container) runtimeValidateContainer(ctx context.Context, st state.State) error {
+	var errs *multierror.Error
+
+	volumes := container.Volumes()
+
+	for _, name := range configconfig.PromotableSystemVolumeNames {
+		if _, present := volumes.ByName(name); present {
+			// the document is still present: VolumeConfig.RuntimeValidate handles any backing conflict.
+			continue
+		}
+
+		volumeStatus, err := safe.StateGetByID[*block.VolumeStatus](ctx, st, name)
+		if err != nil {
+			if state.IsNotFoundError(err) {
+				// the volume was never established (cluster creation / boot): nothing to conflict with.
+				continue
+			}
+
+			return err
+		}
+
+		// only compare against a settled volume; an in-flight volume is not yet established.
+		if volumeStatus.TypedSpec().Phase != block.VolumePhaseReady {
+			continue
+		}
+
+		if volumeStatus.TypedSpec().Type == block.VolumeTypePartition {
+			errs = multierror.Append(errs, fmt.Errorf(
+				"the %q system volume is backed by a dedicated partition and its VolumeConfig cannot be removed; "+
+					"migrating a system volume off a dedicated partition is not supported",
+				name,
+			))
+		}
+	}
+
+	return errs.ErrorOrNil()
 }
 
 // validateContainer validates the full configuration container.
 //
 // This validation is used to do validation which only makes sense for the full configuration (vs. individual documents).
 //
-//nolint:gocyclo
-func (container *Container) validateContainer(mode validation.RuntimeMode) error {
-	var errs error
+// The method returns warnings and fatal errors (as multierror).
+//
+//nolint:gocyclo,cyclop
+func (container *Container) validateContainer(mode validation.RuntimeMode) ([]string, error) {
+	var (
+		warnings []string
+		errs     error
+	)
+
+	// A cpufreq attribute set both by CPUScalingConfig and through sysfs has two controllers writing
+	// it, each reverting the other on every reconcile. Reject that rather than let the machine flap.
+	if len(container.CPUScalingConfigs()) > 0 {
+		for key := range container.SysfsConfig() {
+			if strings.HasPrefix(key, "devices.system.cpu.") && strings.Contains(key, ".cpufreq.") {
+				errs = multierror.Append(errs, fmt.Errorf(
+					"sysfs key %q conflicts with CPUScalingConfig: configure CPU frequency scaling through one of them, not both",
+					key,
+				))
+			}
+		}
+	}
 
 	if mode.InContainer() {
 		// in container mode, HostDNS must be enabled and forward KubeDNS to host must be enabled as well
@@ -189,24 +270,174 @@ func (container *Container) validateContainer(mode validation.RuntimeMode) error
 		}
 	}
 
+	// Discovery requires a cluster identity
+	if discoveryConfigs := container.DiscoveryServiceConfigs(); len(discoveryConfigs) > 0 {
+		identity := container.DiscoveryIdentityConfig()
+
+		if identity == nil || identity.ClusterID() == "" {
+			errs = multierror.Append(errs, fmt.Errorf("cluster ID (.cluster.id or DiscoveryIdentityConfig) should be set when cluster discovery (DiscoveryServiceConfig) is enabled"))
+		}
+
+		if identity == nil || identity.ClusterSecret() == "" {
+			errs = multierror.Append(errs, fmt.Errorf("cluster secret (.cluster.secret or DiscoveryIdentityConfig) should be set when cluster discovery (DiscoveryServiceConfig) is enabled"))
+		}
+	}
+
+	// The kernel keeps a single route per table, family, destination and metric, so routes sharing that key
+	// (e.g. default routes on two links without distinct metrics) can't be installed together.
+	// A per-document Validate() cannot see the other documents, so this is a container-level check.
+	warnings = append(warnings, container.validateRouteKeys()...)
+
+	// Container dependencies must form a DAG, and must only reference containers that exist.
+	// A per-document Validate() cannot see the other documents, so this is a container-level check.
+	if err := validateContainerDependencies(container.ContainerConfigs()); err != nil {
+		errs = multierror.Append(errs, err)
+	}
+
+	// A volume backs a single content library, and must not be read-only. A per-document Validate()
+	// cannot see the other documents, so this is a container-level check.
+	if err := validateContentLibraryBackingVolumes(container); err != nil {
+		errs = multierror.Append(errs, err)
+	}
+
+	if err := container.validateStoragePools(); err != nil {
+		errs = multierror.Append(errs, err)
+	}
+
+	// Talos owns the container and VM roots even without workload limits; kubelet must not write their memory.max.
+	if err := container.validateWorkloadResourceKubelet(mode); err != nil {
+		errs = multierror.Append(errs, err)
+	}
+
+	// A virtual machine disk provisioned from an image names the content library holding it, which
+	// only the rest of the configuration can resolve.
+	if err := validateVirtualMachineImageReferences(container); err != nil {
+		errs = multierror.Append(errs, err)
+	}
+
+	// A virtual machine disk's volume lives in a storage pool declared elsewhere in the
+	// configuration, which only the rest of the configuration can resolve.
+	if err := validateVirtualMachinePoolReferences(container); err != nil {
+		errs = multierror.Append(errs, err)
+	}
+
+	// KubeSpan requires a cluster identity, provided either by the deprecated .cluster.id/.cluster.secret
+	// or by a DiscoveryIdentityConfig document. The identity may live in a separate document, so this
+	// cross-document check is done at the container level.
+	if kubeSpanConfig := container.NetworkKubeSpanConfig(); kubeSpanConfig != nil && kubeSpanConfig.Enabled() {
+		discoveryEnabled := len(container.DiscoveryServiceConfigs()) > 0
+
+		if !discoveryEnabled {
+			errs = multierror.Append(errs, fmt.Errorf("KubeSpan requires cluster discovery to be enabled"))
+		}
+	}
+
+	// machine type specific checks
+	var machineType machine.Type
+
+	if container.Machine() != nil {
+		machineType = container.Machine().Type()
+	}
+
 	// control plane specific checks
-	if container.Machine() != nil && container.Machine().Type().IsControlPlane() {
-		hasLegacyEtcdEncryptionConfig := container.Cluster() != nil && (container.Cluster().SecretboxEncryptionSecret() != "" || container.Cluster().AESCBCEncryptionSecret() != "")
-		hasKubeEtcdEncryptionConfig := container.K8sEtcdEncryptionConfig() != nil
+	if machineType.IsControlPlane() {
+		// switching here on api-server CA config instead of api-server config,
+		// as due to backwards compatibility reasons, the empty legacy `.cluster.apiServer` config
+		// resolves to "default api-server".
+		if container.K8sAPIServerCAConfig() != nil {
+			hasLegacyEtcdEncryptionConfig := container.Cluster() != nil && (container.Cluster().SecretboxEncryptionSecret() != "" || container.Cluster().AESCBCEncryptionSecret() != "")
+			hasKubeEtcdEncryptionConfig := container.K8sEtcdEncryptionConfig() != nil
 
-		if !hasLegacyEtcdEncryptionConfig && !hasKubeEtcdEncryptionConfig {
-			errs = multierror.Append(errs, fmt.Errorf("etcd encryption config is required for control plane machines"))
+			if !hasLegacyEtcdEncryptionConfig && !hasKubeEtcdEncryptionConfig {
+				errs = multierror.Append(errs, fmt.Errorf("etcd encryption config is required for control plane machines running kube-apiserver"))
+			}
+		}
+
+		// the legacy .machine.nodeLabels/.machine.nodeTaints are amended with the control plane role
+		// label and taint for control plane machines, while the KubeNodeConfig document is used as-is,
+		// so warn if the control plane role label is missing after the migration
+		//
+		// the taint is not checked, as skipping it is a valid way to allow scheduling on control planes
+		if nodeConfigs := findMatchingDocs[configconfig.K8sNodeConfig](container.documents); len(nodeConfigs) > 0 {
+			nodeConfig := nodeConfigs[0]
+
+			_, hasControlPlaneLabel := nodeConfig.Labels()[constants.LabelNodeRoleControlPlane]
+
+			// if the node is not registered in Kubernetes, the labels and taints are not used at all
+			if !hasControlPlaneLabel && !nodeConfig.SkipNodeRegistration() {
+				warnings = append(warnings, fmt.Sprintf(
+					"KubeNodeConfig document should set the %q node label on control plane machines "+
+						"(and, unless scheduling on control planes is allowed, the %q taint): "+
+						"unlike .machine.nodeLabels/.machine.nodeTaints, the document contents are used as-is",
+					constants.LabelNodeRoleControlPlane,
+					constants.LabelNodeRoleControlPlane+": "+constants.TaintEffectNoSchedule,
+				))
+			}
 		}
 	}
 
-	// worker specific checks
-	if container.Machine() != nil && container.Machine().Type() == machine.TypeWorker {
-		if container.K8sEtcdEncryptionConfig() != nil {
-			errs = multierror.Append(errs, fmt.Errorf("etcd encryption config is not supported for worker machines"))
-		}
+	// if Kubernetes is configured for this machine (there is a Kubernetes CA), the cluster name and
+	// endpoint are required: they might be provided either by the legacy .cluster.controlPlane.endpoint
+	// or by the KubeClusterConfig document, so this is a cross-document check
+	//
+	// configs generated with Kubernetes disabled have neither, so they are not affected
+	if container.K8sAPIServerCAConfig() != nil && container.K8sClusterConfig() == nil {
+		errs = multierror.Append(errs, fmt.Errorf("cluster name and endpoint are required when Kubernetes is configured: "+
+			"either .cluster.clusterName/.cluster.controlPlane.endpoint or the KubeClusterConfig document"))
 	}
 
-	return errs
+	controlplaneDocs := findMatchingDocs[ControlplaneOnlyConfig](container.documents)
+
+	if len(controlplaneDocs) > 0 && !machineType.IsControlPlane() {
+		kinds := xslices.Map(controlplaneDocs, func(d ControlplaneOnlyConfig) string {
+			return d.Kind()
+		})
+		slices.Sort(kinds)
+		kinds = slices.Compact(kinds)
+
+		errs = multierror.Append(
+			errs,
+			fmt.Errorf(
+				"the following document kinds are only allowed on control plane machines: %v",
+				kinds,
+			),
+		)
+	}
+
+	return warnings, errs
+}
+
+// validateWorkloadResourceKubelet protects Talos-managed roots and active workload limits from competing kubelet writers.
+func (container *Container) validateWorkloadResourceKubelet(mode validation.RuntimeMode) error {
+	if mode.InContainer() || !container.kubeletEligible() {
+		return nil
+	}
+
+	kubeletConfig := container.K8sKubeletConfig()
+	workloadResources := container.WorkloadResourceConfig()
+
+	if workloadResources == nil ||
+		(workloadResources.KubepodsMemoryLimit() == 0 && workloadResources.TalosContainersMemoryLimit() == 0 && workloadResources.VirtualMachinesMemoryLimit() == 0) {
+		return kubelet.ValidateWorkloadRootReservations(kubeletConfig.ExtraConfig(), kubeletConfig.ExtraArgs())
+	}
+
+	kubepodsLimit := workloadResources.KubepodsMemoryLimit()
+
+	var multiErr *multierror.Error
+
+	if kubepodsLimit > 0 {
+		multiErr = multierror.Append(multiErr, kubelet.ValidateMemoryLimitConfiguration(kubeletConfig.ExtraConfig(), kubeletConfig.ExtraArgs()))
+	}
+
+	multiErr = multierror.Append(multiErr, kubelet.ValidateWorkloadRootConfiguration(kubeletConfig.ExtraConfig(), kubeletConfig.ExtraArgs()))
+
+	return multiErr.ErrorOrNil()
+}
+
+// kubeletEligible mirrors the inputs the kubelet configuration controller requires before it renders anything.
+func (container *Container) kubeletEligible() bool {
+	return container.Cluster() != nil && container.Machine() != nil &&
+		container.K8sNetworkConfig() != nil && container.K8sNodeConfig() != nil && container.K8sKubeletConfig() != nil
 }
 
 // Validate is the legacy validation method.
@@ -221,4 +452,82 @@ func (container *Container) Validate(mode validation.RuntimeMode, opt ...validat
 // Deprecated: use ValidateAtRuntime instead for runtime validation (inside Talos).
 func (container *Container) RuntimeValidate(ctx context.Context, st state.State, mode validation.RuntimeMode, opt ...validation.Option) ([]string, error) {
 	return container.runtimeValidate(ctx, st, mode, opt...)
+}
+
+// validateRouteKeys warns about the routes which resolve to the same kernel route.
+//
+// The kernel keeps a single route per table, family, destination and metric: when several routes in the
+// configuration share that key, only one of them is going to be installed, so the configuration is ambiguous.
+//
+//nolint:gocyclo
+func (container *Container) validateRouteKeys() []string {
+	var warnings []string
+
+	owners := map[string]string{}
+
+	check := func(table nethelpers.RoutingTable, family nethelpers.Family, destination netip.Prefix, metric uint32, owner string) {
+		key := network.RouteID(table, family, destination, metric)
+
+		destinationStr := "default"
+
+		if destination.Bits() > 0 {
+			destinationStr = destination.Masked().String()
+		}
+
+		if previous, ok := owners[key]; ok {
+			warnings = append(warnings, fmt.Sprintf(
+				"%s and %s both configure the %s route to %s with metric %d in table %s, only one of them is going to be installed",
+				previous, owner, family, destinationStr, metric, table,
+			))
+
+			return
+		}
+
+		owners[key] = owner
+	}
+
+	for _, linkConfig := range container.NetworkCommonLinkConfigs() {
+		for i, route := range linkConfig.Routes() {
+			destination := route.Destination().ValueOrZero()
+			gateway := route.Gateway().ValueOrZero()
+
+			family := nethelpers.FamilyInet4
+
+			if (gateway.IsValid() && gateway.Is6()) || (destination.IsValid() && destination.Addr().Is6()) {
+				family = nethelpers.FamilyInet6
+			}
+
+			check(
+				route.Table().ValueOr(nethelpers.TableMain),
+				family,
+				destination,
+				route.Metric().ValueOr(network.DefaultRouteMetric),
+				fmt.Sprintf("link %q route %d", linkConfig.Name(), i),
+			)
+		}
+	}
+
+	for _, blackholeRouteConfig := range container.NetworkBlackholeRouteConfigs() {
+		destination, err := netip.ParsePrefix(blackholeRouteConfig.Name())
+		if err != nil {
+			// validated by the document itself
+			continue
+		}
+
+		family := nethelpers.FamilyInet4
+
+		if destination.Addr().Is6() {
+			family = nethelpers.FamilyInet6
+		}
+
+		check(
+			nethelpers.TableMain,
+			family,
+			destination,
+			blackholeRouteConfig.Metric().ValueOr(network.DefaultRouteMetric),
+			fmt.Sprintf("blackhole route %q", blackholeRouteConfig.Name()),
+		)
+	}
+
+	return warnings
 }

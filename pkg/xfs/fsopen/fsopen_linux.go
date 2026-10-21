@@ -9,6 +9,7 @@
 package fsopen
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -34,9 +35,18 @@ type FS struct {
 	boolParams   map[string]struct{}
 	stringParams map[string][]string
 	binaryParams map[string][][]byte
+	fdParams     []fdParam
 
 	mntfd    int
 	mntflags int
+}
+
+// fdParam is an ordered fsconfig FSCONFIG_SET_FD parameter (e.g. an overlayfs
+// "lowerdir+" layer passed by file descriptor). Order is preserved as the relative
+// priority of repeated keys (e.g. lowerdir+) is significant.
+type fdParam struct {
+	key string
+	fd  int
 }
 
 // Interface guard.
@@ -102,10 +112,12 @@ func (fs *FS) new() (err error) {
 		}
 	}()
 
-	if fs.source != "" {
-		if err := unix.FsconfigSetString(fsfd, "source", fs.source); err != nil {
-			return fmt.Errorf("FSCONFIG_SET_STRING failed: %w: key=%q value=%q", err, "source", fs.source)
-		}
+	// default the source to the filesystem type (as `mount -t tmpfs tmpfs` does),
+	// otherwise the kernel reports the source as "none"
+	source := cmp.Or(fs.source, fs.fstype)
+
+	if err := unix.FsconfigSetString(fsfd, "source", source); err != nil {
+		return fmt.Errorf("FSCONFIG_SET_STRING failed: %w: key=%q value=%q", err, "source", source)
 	}
 
 	for key := range fs.boolParams {
@@ -127,6 +139,12 @@ func (fs *FS) new() (err error) {
 			if err := unix.FsconfigSetString(fsfd, key, value); err != nil {
 				return fmt.Errorf("FSCONFIG_SET_BINARY failed: %w: key=%q", err, key)
 			}
+		}
+	}
+
+	for _, p := range fs.fdParams {
+		if err := unix.FsconfigSetFd(fsfd, p.key, p.fd); err != nil {
+			return fmt.Errorf("FSCONFIG_SET_FD failed: %w: key=%q fd=%d", err, p.key, p.fd)
 		}
 	}
 
@@ -166,6 +184,9 @@ func (fs *FS) Repair(ctx context.Context) error {
 		repairFunc = makefs.Ext4Repair
 	case makefs.FilesystemTypeXFS:
 		repairFunc = makefs.XFSRepair
+	case makefs.FilesystemTypeBTRFS:
+		// disable repair for btrfs, as it is dangerous and can make things worse
+		fallthrough
 	default:
 		return fmt.Errorf("%w: %s", ErrRepairUnsupported, fs.fstype)
 	}

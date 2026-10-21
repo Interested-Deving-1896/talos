@@ -11,8 +11,248 @@ import (
 	"time"
 
 	"github.com/siderolabs/talos/pkg/machinery/config/encoder"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
 )
+
+func (BGPInstanceConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "BGPInstanceConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "BGPInstanceConfig configures a native BGP routing instance on the host." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "BGPInstanceConfig configures a native BGP routing instance on the host.",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "name",
+				Type:        "string",
+				Note:        "",
+				Description: "Name of the BGP routing instance.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Name of the BGP routing instance." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "vrf",
+				Type:        "string",
+				Note:        "",
+				Description: "Linux VRF link used by this routing instance. If unset, the default routing domain is used.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Linux VRF link used by this routing instance. If unset, the default routing domain is used." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "localASN",
+				Type:        "uint32",
+				Note:        "",
+				Description: "Local autonomous system number for the BGP instance.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Local autonomous system number for the BGP instance." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "routerID",
+				Type:        "Addr",
+				Note:        "",
+				Description: "BGP router-id. If not set, it is derived from the first advertised address.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "BGP router-id. If not set, it is derived from the first advertised address." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "routeSource",
+				Type:        "Addr",
+				Note:        "",
+				Description: "Preferred source address set on routes installed from BGP (the kernel route `src` / RTA_PREFSRC,\nequivalent to FRR's `ip protocol bgp route-map SETSRC`). If not set, the kernel selects the source address.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Preferred source address set on routes installed from BGP (the kernel route `src` / RTA_PREFSRC," /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "advertise",
+				Type:        "[]string",
+				Note:        "",
+				Description: "Names or aliases of the links whose addresses are originated into BGP as connected networks using their configured prefix lengths.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Names or aliases of the links whose addresses are originated into BGP as connected networks using their configured prefix lengths." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "multipath",
+				Type:        "bool",
+				Note:        "",
+				Description: "Enable ECMP (multipath) for routes learned from multiple neighbors. Defaults to false.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Enable ECMP (multipath) for routes learned from multiple neighbors. Defaults to false." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "maxPaths",
+				Type:        "uint8",
+				Note:        "",
+				Description: "Maximum number of ECMP next-hops to install. Zero uses the implementation default.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Maximum number of ECMP next-hops to install. Zero uses the implementation default." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "installRoutes",
+				Type:        "bool",
+				Note:        "",
+				Description: "Install routes learned from BGP neighbors into the Linux routing table. Defaults to true.\nWhen false, learned routes remain in this instance's BGP RIB and can still be selected by\n`importRoutes`, but Talos does not install them into the Linux FIB.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Install routes learned from BGP neighbors into the Linux routing table. Defaults to true." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "importRoutes",
+				Type:        "[]BGPImportRoute",
+				Note:        "",
+				Description: "Selected routes to import from other BGP instances. Imports are one-way: matching best paths\nlearned from each source instance are preserved and advertised by this instance with its own\nnext hop. Locally originated and previously imported paths are not recursively imported.\nSelectors in a single target instance must not overlap, giving each imported prefix one source.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Selected routes to import from other BGP instances. Imports are one-way: matching best paths" /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "neighbors",
+				Type:        "[]BGPNeighborConfig",
+				Note:        "",
+				Description: "BGP neighbors in this routing instance.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "BGP neighbors in this routing instance." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.AddExample("", exampleBGPInstanceConfigV1Alpha1())
+
+	doc.Fields[1].AddExample("", "fabric")
+	doc.Fields[3].AddExample("", uint32(65001))
+	doc.Fields[4].AddExample("", meta.Addr{Addr: netip.MustParseAddr("10.0.0.1")})
+	doc.Fields[5].AddExample("", meta.Addr{Addr: netip.MustParseAddr("10.0.0.1")})
+	doc.Fields[6].AddExample("", []string{"dummy0"})
+
+	return doc
+}
+
+func (BGPImportRoute) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "BGPImportRoute",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "BGPImportRoute selects routes learned by another BGP instance for one-way import." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "BGPImportRoute selects routes learned by another BGP instance for one-way import.",
+		AppearsIn: []encoder.Appearance{
+			{
+				TypeName:  "BGPInstanceConfigV1Alpha1",
+				FieldName: "importRoutes",
+			},
+		},
+		Fields: []encoder.Doc{
+			{
+				Name:        "bgpInstance",
+				Type:        "string",
+				Note:        "",
+				Description: "Name of the source BGP instance.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Name of the source BGP instance." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "prefixes",
+				Type:        "[]Prefix",
+				Note:        "",
+				Description: "CIDR selectors. A learned route matches when it is contained by one of these prefixes.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "CIDR selectors. A learned route matches when it is contained by one of these prefixes." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	return doc
+}
+
+func (BGPNeighborConfig) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "BGPNeighborConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "BGPNeighborConfig configures a concrete BGP neighbor." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "BGPNeighborConfig configures a concrete BGP neighbor.",
+		AppearsIn: []encoder.Appearance{
+			{
+				TypeName:  "BGPInstanceConfigV1Alpha1",
+				FieldName: "neighbors",
+			},
+		},
+		Fields: []encoder.Doc{
+			{
+				Name:        "address",
+				Type:        "Addr",
+				Note:        "",
+				Description: "Neighbor IP address for a numbered session. Mutually exclusive with `link`.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Neighbor IP address for a numbered session. Mutually exclusive with `link`." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "link",
+				Type:        "string",
+				Note:        "",
+				Description: "Link name or alias for an unnumbered (IPv6 link-local) session. Mutually exclusive with `address`.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Link name or alias for an unnumbered (IPv6 link-local) session. Mutually exclusive with `address`." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "peerASN",
+				Type:        "uint32",
+				Note:        "",
+				Description: "Expected peer ASN. Zero accepts any ASN advertised by the peer (eBGP \"external\").",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Expected peer ASN. Zero accepts any ASN advertised by the peer (eBGP \"external\")." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "localASN",
+				Type:        "uint32",
+				Note:        "",
+				Description: "Local ASN override for this neighbor. Zero uses the instance local ASN.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Local ASN override for this neighbor. Zero uses the instance local ASN." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "passive",
+				Type:        "bool",
+				Note:        "",
+				Description: "Wait for the neighbor to establish the connection instead of initiating it.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Wait for the neighbor to establish the connection instead of initiating it." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "holdTime",
+				Type:        "Duration",
+				Note:        "",
+				Description: "BGP hold time for this neighbor. Zero uses the implementation default.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "BGP hold time for this neighbor. Zero uses the implementation default." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "bfd",
+				Type:        "BGPBFDConfig",
+				Note:        "",
+				Description: "BFD (Bidirectional Forwarding Detection) settings for this neighbor.\nThe presence of this block enables BFD; an empty block uses the implementation defaults.\nBFD is supported only when the BGP instance uses the default routing domain, not a VRF.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "BFD (Bidirectional Forwarding Detection) settings for this neighbor." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	return doc
+}
+
+func (BGPBFDConfig) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "BGPBFDConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "BGPBFDConfig configures BFD for a BGP neighbor." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "BGPBFDConfig configures BFD for a BGP neighbor.",
+		AppearsIn: []encoder.Appearance{
+			{
+				TypeName:  "BGPNeighborConfig",
+				FieldName: "bfd",
+			},
+		},
+		Fields: []encoder.Doc{
+			{
+				Name:        "transmitInterval",
+				Type:        "Duration",
+				Note:        "",
+				Description: "Desired minimum transmit interval. Zero uses the implementation default.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Desired minimum transmit interval. Zero uses the implementation default." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "receiveInterval",
+				Type:        "Duration",
+				Note:        "",
+				Description: "Required minimum receive interval. Zero uses the implementation default.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Required minimum receive interval. Zero uses the implementation default." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "detectMultiplier",
+				Type:        "uint8",
+				Note:        "",
+				Description: "BFD detection multiplier. Zero uses the implementation default.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "BFD detection multiplier. Zero uses the implementation default." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	return doc
+}
 
 func (BlackholeRouteConfigV1Alpha1) Doc() *encoder.Doc {
 	doc := &encoder.Doc{
@@ -246,10 +486,17 @@ func (BondConfigV1Alpha1) Doc() *encoder.Doc {
 				},
 			},
 			{
+				Name:        "primary",
+				Type:        "string",
+				Note:        "",
+				Description: "Name of the link (interface) which should be used as the primary slave of the bond.\n\nThe primary link, when up, is always the active one; the other links are only used when the\nprimary is down. Only meaningful for the \"active-backup\", \"balance-tlb\" and \"balance-alb\" modes.\n\nMust be one of the links listed in `links`.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Name of the link (interface) which should be used as the primary slave of the bond." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
 				Name:        "primaryReselect",
 				Type:        "PrimaryReselect",
 				Note:        "",
-				Description: "Policy under which the primary slave should be reselected.",
+				Description: "Policy under which the primary slave should be reselected.\n\nHas no effect unless `primary` is set.",
 				Comments:    [3]string{"" /* encoder.HeadComment */, "Policy under which the primary slave should be reselected." /* encoder.LineComment */, "" /* encoder.FootComment */},
 				Values: []string{
 					"always",
@@ -348,9 +595,10 @@ func (BondConfigV1Alpha1) Doc() *encoder.Doc {
 	doc.Fields[18].AddExample("", 65535)
 	doc.Fields[19].AddExample("", 0)
 	doc.Fields[20].AddExample("", "on")
-	doc.Fields[21].AddExample("", "always")
-	doc.Fields[27].AddExample("", 1)
-	doc.Fields[28].AddExample("", 0)
+	doc.Fields[21].AddExample("", "enp1s2")
+	doc.Fields[22].AddExample("", "always")
+	doc.Fields[28].AddExample("", 1)
+	doc.Fields[29].AddExample("", 0)
 
 	return doc
 }
@@ -525,6 +773,155 @@ func (VRFConfigV1Alpha1) Doc() *encoder.Doc {
 	return doc
 }
 
+func (MacVLANConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "MacVLANConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "MacVLANConfig is a config document to create a MACVLAN link over a parent link." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "MacVLANConfig is a config document to create a MACVLAN link over a parent link.",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "name",
+				Type:        "string",
+				Note:        "",
+				Description: "Name of the macvlan link (interface) to be created.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Name of the macvlan link (interface) to be created." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "mode",
+				Type:        "MacvlanMode",
+				Note:        "",
+				Description: "MACVLAN mode to use for the link.\nIf not set, defaults to bridge.\n\nThe `source` mode requires a list of source MAC addresses, which is\nnot supported yet, so it can't be used.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "MACVLAN mode to use for the link." /* encoder.LineComment */, "" /* encoder.FootComment */},
+				Values: []string{
+					"private",
+					"vepa",
+					"bridge",
+					"passthru",
+					"source",
+				},
+			},
+			{
+				Name:        "parent",
+				Type:        "string",
+				Note:        "",
+				Description: "Name of the parent link (interface) the macvlan link is created on.\nLink aliases can be used here as well.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Name of the parent link (interface) the macvlan link is created on." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "hardwareAddr",
+				Type:        "HardwareAddr",
+				Note:        "",
+				Description: "Override the hardware (MAC) address of the link.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Override the hardware (MAC) address of the link." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Type:   "CommonLinkConfig",
+				Inline: true,
+			},
+		},
+	}
+
+	doc.AddExample("", exampleMacVLANConfigV1Alpha1())
+
+	doc.Fields[1].AddExample("", "eth0.macvlan")
+	doc.Fields[2].AddExample("", "bridge")
+	doc.Fields[3].AddExample("", "eth0")
+	doc.Fields[4].AddExample("", "2e:3c:4d:5e:6f:70")
+
+	return doc
+}
+
+func (VXLANConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "VXLANConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "VXLANConfig is a config document to create a VXLAN (Virtual eXtensible LAN) link over a parent link." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "VXLANConfig is a config document to create a VXLAN (Virtual eXtensible LAN) link over a parent link.",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "name",
+				Type:        "string",
+				Note:        "",
+				Description: "Name of the vxlan link (interface) to be created.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Name of the vxlan link (interface) to be created." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "id",
+				Type:        "uint32",
+				Note:        "",
+				Description: "VXLAN network identifier (VNI) to be used for the vxlan link.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "VXLAN network identifier (VNI) to be used for the vxlan link." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "local",
+				Type:        "Addr",
+				Note:        "",
+				Description: "Source IP address (IPv4 or IPv6) to use in outgoing packets for the tunnel endpoint.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Source IP address (IPv4 or IPv6) to use in outgoing packets for the tunnel endpoint." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "group",
+				Type:        "Addr",
+				Note:        "",
+				Description: "Multicast group IP address (IPv4 or IPv6) to join for the tunnel.\nEither the group or the local address should be set, not both.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Multicast group IP address (IPv4 or IPv6) to join for the tunnel." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "parent",
+				Type:        "string",
+				Note:        "",
+				Description: "Name of the parent link (interface) used as the physical device for the tunnel endpoint.\nLink aliases can be used here as well.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Name of the parent link (interface) used as the physical device for the tunnel endpoint." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "port",
+				Type:        "uint16",
+				Note:        "",
+				Description: "Destination UDP port for VXLAN traffic.\nIf not set, defaults to 4789.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Destination UDP port for VXLAN traffic." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "learning",
+				Type:        "bool",
+				Note:        "",
+				Description: "Enable learning of source link addresses (MAC learning).\nIf not set, defaults to true.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Enable learning of source link addresses (MAC learning)." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "hardwareAddr",
+				Type:        "HardwareAddr",
+				Note:        "",
+				Description: "Override the hardware (MAC) address of the link.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Override the hardware (MAC) address of the link." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Type:   "CommonLinkConfig",
+				Inline: true,
+			},
+		},
+	}
+
+	doc.AddExample("", exampleVXLANConfigV1Alpha1())
+
+	doc.Fields[1].AddExample("", "vxlan900")
+	doc.Fields[2].AddExample("", 100)
+	doc.Fields[3].AddExample("", "10.255.0.1")
+	doc.Fields[4].AddExample("", "239.1.1.1")
+	doc.Fields[5].AddExample("", "vtep0")
+	doc.Fields[6].AddExample("", 4789)
+	doc.Fields[7].AddExample("", false)
+	doc.Fields[8].AddExample("", "2e:3c:4d:5e:6f:70")
+
+	return doc
+}
+
 func (DefaultActionConfigV1Alpha1) Doc() *encoder.Doc {
 	doc := &encoder.Doc{
 		Type:        "NetworkDefaultActionConfig",
@@ -586,6 +983,13 @@ func (DHCPv4ConfigV1Alpha1) Doc() *encoder.Doc {
 				Comments:    [3]string{"" /* encoder.HeadComment */, "Ignore hostname received from the DHCP server." /* encoder.LineComment */, "" /* encoder.FootComment */},
 			},
 			{
+				Name:        "ignoreRoutes",
+				Type:        "bool",
+				Note:        "",
+				Description: "Ignore routes received from the DHCP server (the default gateway and classless static routes).\n\nThe connected route for the leased address is still configured.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Ignore routes received from the DHCP server (the default gateway and classless static routes)." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
 				Name:        "clientIdentifier",
 				Type:        "ClientIdentifier",
 				Note:        "",
@@ -610,7 +1014,7 @@ func (DHCPv4ConfigV1Alpha1) Doc() *encoder.Doc {
 	doc.AddExample("", exampleDHCPv4ConfigV1Alpha1())
 
 	doc.Fields[1].AddExample("", "enp0s2")
-	doc.Fields[5].AddExample("", "00:01:00:01:23:45:67:89:ab:cd:ef:01:23:45")
+	doc.Fields[6].AddExample("", "00:01:00:01:23:45:67:89:ab:cd:ef:01:23:45")
 
 	return doc
 }
@@ -1058,7 +1462,7 @@ func (KubeSpanConfigV1Alpha1) Doc() *encoder.Doc {
 				Name:        "enabled",
 				Type:        "bool",
 				Note:        "",
-				Description: "Enable the KubeSpan feature.\nCluster discovery should be enabled with cluster.discovery.enabled for KubeSpan to be enabled.",
+				Description: "Enable the KubeSpan feature.\nRequires cluster discovery to be enabled through a DiscoveryServiceConfig document.",
 				Comments:    [3]string{"" /* encoder.HeadComment */, "Enable the KubeSpan feature." /* encoder.LineComment */, "" /* encoder.FootComment */},
 			},
 			{
@@ -1124,6 +1528,13 @@ func (KubeSpanFiltersConfig) Doc() *encoder.Doc {
 				Comments:    [3]string{"" /* encoder.HeadComment */, "Filter node addresses which will be advertised as KubeSpan endpoints for peer-to-peer Wireguard connections." /* encoder.LineComment */, "" /* encoder.FootComment */},
 			},
 			{
+				Name:        "peerEndpoints",
+				Type:        "[]string",
+				Note:        "",
+				Description: "Filter endpoints received from other KubeSpan peers before this node attempts to connect to them.\n\nThis filter is the opposite of the `endpoints` filter: `endpoints` filters the addresses this node\nadvertises to the whole cluster, affecting how every peer connects to this node, while `peerEndpoints`\nfilters the endpoints received from other peers, affecting only outgoing connections of this node.\n\nUse it to exclude endpoints which are known to be unreachable from this node\n(e.g., addresses of a private network this node is not connected to), so they are never attempted.\n\nDefault value: no filtering.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Filter endpoints received from other KubeSpan peers before this node attempts to connect to them." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
 				Name:        "excludeAdvertisedNetworks",
 				Type:        "[]Prefix",
 				Note:        "",
@@ -1134,7 +1545,8 @@ func (KubeSpanFiltersConfig) Doc() *encoder.Doc {
 	}
 
 	doc.Fields[0].AddExample("Exclude addresses in 192.168.0.0/16 subnet.", []string{"0.0.0.0/0", "!192.168.0.0/16", "::/0"})
-	doc.Fields[1].AddExample("Exclude private networks from being advertised.", []Prefix{{netip.MustParsePrefix("192.168.1.0/24")}})
+	doc.Fields[1].AddExample("Exclude peer endpoints in the 192.168.0.0/16 subnet.", []string{"0.0.0.0/0", "!192.168.0.0/16", "::/0"})
+	doc.Fields[2].AddExample("Exclude private networks from being advertised.", []meta.Prefix{{netip.MustParsePrefix("192.168.1.0/24")}})
 
 	return doc
 }
@@ -1250,11 +1662,27 @@ func (CommonLinkConfig) Doc() *encoder.Doc {
 				FieldName: "",
 			},
 			{
+				TypeName:  "MacVLANConfigV1Alpha1",
+				FieldName: "",
+			},
+			{
+				TypeName:  "VXLANConfigV1Alpha1",
+				FieldName: "",
+			},
+			{
 				TypeName:  "DummyLinkConfigV1Alpha1",
 				FieldName: "",
 			},
 			{
 				TypeName:  "LinkConfigV1Alpha1",
+				FieldName: "",
+			},
+			{
+				TypeName:  "VethConfigV1Alpha1",
+				FieldName: "",
+			},
+			{
+				TypeName:  "VethPeerConfig",
 				FieldName: "",
 			},
 			{
@@ -1400,8 +1828,8 @@ func (RouteConfig) Doc() *encoder.Doc {
 		},
 	}
 
-	doc.Fields[0].AddExample("", Prefix{netip.MustParsePrefix("10.0.0.0/8")})
-	doc.Fields[1].AddExample("", Addr{netip.MustParseAddr("10.0.0.1")})
+	doc.Fields[0].AddExample("", meta.Prefix{netip.MustParsePrefix("10.0.0.0/8")})
+	doc.Fields[1].AddExample("", meta.Addr{netip.MustParseAddr("10.0.0.1")})
 
 	return doc
 }
@@ -1561,7 +1989,7 @@ func (NameserverConfig) Doc() *encoder.Doc {
 		},
 	}
 
-	doc.Fields[0].AddExample("", Addr{netip.MustParseAddr("10.0.0.1")})
+	doc.Fields[0].AddExample("", meta.Addr{netip.MustParseAddr("10.0.0.1")})
 	doc.Fields[2].AddExample("", "dns1.example.com")
 
 	return doc
@@ -1581,9 +2009,9 @@ func (SearchDomainsConfig) Doc() *encoder.Doc {
 		Fields: []encoder.Doc{
 			{
 				Name:        "domains",
-				Type:        "[]string",
+				Type:        "SearchDomainList",
 				Note:        "",
-				Description: "A list of search domains to be used for DNS resolution.\n\nSearch domains are appended to unqualified domain names during DNS resolution.\nFor example, if \"example.com\" is a search domain and a user tries to resolve\n\"host\", the system will attempt to resolve \"host.example.com\".\n\nThis overrides any search domains obtained via DHCP or platform configuration.\nThe default configuration derives the search domain from the hostname FQDN.",
+				Description: "A list of search domains to be used for DNS resolution.\n\nSearch domains are appended to unqualified domain names during DNS resolution.\nFor example, if \"example.com\" is a search domain and a user tries to resolve\n\"host\", the system will attempt to resolve \"host.example.com\".\n\nIf set, this overrides any search domains obtained via DHCP or platform configuration.\nAn empty list (`domains: []`) clears search domains obtained from DHCP or platform,\nwhile leaving this field unset inherits them.\nThe default configuration derives the search domain from the hostname FQDN.",
 				Comments:    [3]string{"" /* encoder.HeadComment */, "A list of search domains to be used for DNS resolution." /* encoder.LineComment */, "" /* encoder.FootComment */},
 			},
 			{
@@ -2073,6 +2501,75 @@ func (PTPConfig) Doc() *encoder.Doc {
 	return doc
 }
 
+func (VethConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "VethConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "VethConfig is a config document to create a virtual Ethernet device pair." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "VethConfig is a config document to create a virtual Ethernet device pair.",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "name",
+				Type:        "string",
+				Note:        "",
+				Description: "Name of this end of the veth pair.\n\nThis is a literal kernel interface name. Link aliases are not supported here because\nthe interface is created by this document rather than selected from existing physical links.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Name of this end of the veth pair." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "peer",
+				Type:        "VethPeerConfig",
+				Note:        "",
+				Description: "Configuration for the peer end of the veth pair.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Configuration for the peer end of the veth pair." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Type:   "CommonLinkConfig",
+				Inline: true,
+			},
+		},
+	}
+
+	doc.AddExample("", exampleVethConfigV1Alpha1())
+
+	doc.Fields[1].AddExample("", "veth0")
+
+	return doc
+}
+
+func (VethPeerConfig) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "VethPeerConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "VethPeerConfig is the configuration for the peer end of a veth pair." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "VethPeerConfig is the configuration for the peer end of a veth pair.",
+		AppearsIn: []encoder.Appearance{
+			{
+				TypeName:  "VethConfigV1Alpha1",
+				FieldName: "peer",
+			},
+		},
+		Fields: []encoder.Doc{
+			{
+				Name:        "name",
+				Type:        "string",
+				Note:        "",
+				Description: "Name of the peer end of the veth pair.\n\nThis is a literal kernel interface name. Link aliases are not supported here because\nthe interface is created by this document rather than selected from existing physical links.\n\nBoth endpoints are created in the host network namespace. This name can be listed in a\nVRFConfig document's `links` field to attach the peer endpoint to that VRF.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Name of the peer end of the veth pair." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Type:   "CommonLinkConfig",
+				Inline: true,
+			},
+		},
+	}
+
+	doc.Fields[0].AddExample("", "veth-router")
+
+	return doc
+}
+
 func (VLANConfigV1Alpha1) Doc() *encoder.Doc {
 	doc := &encoder.Doc{
 		Type:        "VLANConfig",
@@ -2250,12 +2747,18 @@ func GetFileDoc() *encoder.FileDoc {
 		Name:        "network",
 		Description: "Package network provides network machine configuration documents.\n",
 		Structs: []*encoder.Doc{
+			BGPInstanceConfigV1Alpha1{}.Doc(),
+			BGPImportRoute{}.Doc(),
+			BGPNeighborConfig{}.Doc(),
+			BGPBFDConfig{}.Doc(),
 			BlackholeRouteConfigV1Alpha1{}.Doc(),
 			BondConfigV1Alpha1{}.Doc(),
 			BridgeConfigV1Alpha1{}.Doc(),
 			BridgeSTPConfig{}.Doc(),
 			BridgeVLANConfig{}.Doc(),
 			VRFConfigV1Alpha1{}.Doc(),
+			MacVLANConfigV1Alpha1{}.Doc(),
+			VXLANConfigV1Alpha1{}.Doc(),
 			DefaultActionConfigV1Alpha1{}.Doc(),
 			DHCPv4ConfigV1Alpha1{}.Doc(),
 			DHCPv6ConfigV1Alpha1{}.Doc(),
@@ -2290,6 +2793,8 @@ func GetFileDoc() *encoder.FileDoc {
 			TimeSyncConfigV1Alpha1{}.Doc(),
 			NTPConfig{}.Doc(),
 			PTPConfig{}.Doc(),
+			VethConfigV1Alpha1{}.Doc(),
+			VethPeerConfig{}.Doc(),
 			VLANConfigV1Alpha1{}.Doc(),
 			WireguardConfigV1Alpha1{}.Doc(),
 			WireguardPeer{}.Doc(),

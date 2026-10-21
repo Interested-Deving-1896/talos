@@ -83,6 +83,12 @@ func (ctrl *OperatorSpecController) Outputs() []controller.Output {
 			Type: network.TimeServerSpecType,
 			Kind: controller.OutputShared,
 		},
+		// LLDP neighbors are an observation of the link, not a configuration layer, so they are
+		// published directly to the network namespace without a merge step.
+		{
+			Type: network.LLDPNeighborStatusType,
+			Kind: controller.OutputExclusive,
+		},
 	}
 }
 
@@ -176,7 +182,7 @@ func (ctrl *OperatorSpecController) Run(ctx context.Context, r controller.Runtim
 				return err
 			}
 		case <-notifyCh:
-			if err := ctrl.reconcileOperatorOutputs(ctx, r); err != nil {
+			if err := ctrl.reconcileOperatorOutputs(ctx, r, logger); err != nil {
 				return err
 			}
 		}
@@ -255,14 +261,16 @@ func (ctrl *OperatorSpecController) reconcileOperators(ctx context.Context, r co
 	}
 
 	// now reconcile outputs as the operators might have changed
-	return ctrl.reconcileOperatorOutputs(ctx, r)
+	return ctrl.reconcileOperatorOutputs(ctx, r, logger)
 }
 
 //nolint:gocyclo,cyclop
-func (ctrl *OperatorSpecController) reconcileOperatorOutputs(ctx context.Context, r controller.Runtime) error {
+func (ctrl *OperatorSpecController) reconcileOperatorOutputs(ctx context.Context, r controller.Runtime, logger *zap.Logger) error {
 	r.StartTrackingOutputs()
 
 	for _, op := range ctrl.operators {
+		seenRoutes := map[resource.ID]struct{}{}
+
 		for _, addressSpec := range op.Operator.AddressSpecs() {
 			if err := safe.WriterModify(
 				ctx, r,
@@ -281,16 +289,29 @@ func (ctrl *OperatorSpecController) reconcileOperatorOutputs(ctx context.Context
 		}
 
 		for _, routeSpec := range op.Operator.RouteSpecs() {
+			id := fmt.Sprintf(
+				"%s/%s",
+				op.Operator.Prefix(),
+				network.RouteID(routeSpec.Table, routeSpec.Family, routeSpec.Destination, routeSpec.Priority),
+			)
+
+			// the kernel keeps a single route per key, so only the first route with the same key is used
+			if _, duplicate := seenRoutes[id]; duplicate {
+				logger.Warn(
+					"ignoring route with the same key as a previous route",
+					zap.String("route", id),
+					zap.String("gateway", routeSpecGatewayString(&routeSpec)),
+					zap.String("link", routeSpec.OutLinkName),
+				)
+
+				continue
+			}
+
+			seenRoutes[id] = struct{}{}
+
 			if err := safe.WriterModify(
 				ctx, r,
-				network.NewRouteSpec(
-					network.ConfigNamespaceName,
-					fmt.Sprintf(
-						"%s/%s",
-						op.Operator.Prefix(),
-						network.RouteID(routeSpec.Table, routeSpec.Family, routeSpec.Destination, routeSpec.Gateway, routeSpec.Priority, routeSpec.OutLinkName),
-					),
-				),
+				network.NewRouteSpec(network.ConfigNamespaceName, id),
 				func(r *network.RouteSpec) error {
 					*r.TypedSpec() = routeSpec
 
@@ -369,21 +390,38 @@ func (ctrl *OperatorSpecController) reconcileOperatorOutputs(ctx context.Context
 				return fmt.Errorf("error applying spec: %w", err)
 			}
 		}
+
+		if neighbors := op.Operator.LLDPNeighborSpecs(); len(neighbors) > 0 {
+			if err := safe.WriterModify(
+				ctx, r,
+				network.NewLLDPNeighborStatus(network.NamespaceName, op.Spec.LinkName),
+				func(r *network.LLDPNeighborStatus) error {
+					r.TypedSpec().Neighbors = neighbors
+
+					return nil
+				},
+			); err != nil {
+				return fmt.Errorf("error applying spec: %w", err)
+			}
+		}
 	}
 
 	// clean up not touched specs
 	if err := r.CleanupOutputs(
 		ctx,
-		xslices.Map([]resource.Type{
-			network.AddressSpecType,
-			network.LinkSpecType,
-			network.RouteSpecType,
-			network.HostnameSpecType,
-			network.ResolverSpecType,
-			network.TimeServerSpecType,
-		}, func(t resource.Type) resource.Kind {
-			return resource.NewMetadata(network.ConfigNamespaceName, t, "", resource.VersionUndefined)
-		})...,
+		append(
+			xslices.Map([]resource.Type{
+				network.AddressSpecType,
+				network.LinkSpecType,
+				network.RouteSpecType,
+				network.HostnameSpecType,
+				network.ResolverSpecType,
+				network.TimeServerSpecType,
+			}, func(t resource.Type) resource.Kind {
+				return resource.NewMetadata(network.ConfigNamespaceName, t, "", resource.VersionUndefined)
+			}),
+			resource.NewMetadata(network.NamespaceName, network.LLDPNeighborStatusType, "", resource.VersionUndefined),
+		)...,
 	); err != nil {
 		return fmt.Errorf("error during outputs cleanup: %w", err)
 	}
@@ -399,7 +437,7 @@ func (ctrl *OperatorSpecController) newOperator(logger *zap.Logger, spec *networ
 	case network.OperatorDHCP4:
 		logger = logger.With(zap.String("operator", "dhcp4"))
 
-		return operator.NewDHCP4(logger, spec.LinkName, spec.DHCP4, ctrl.V1alpha1Platform, ctrl.State)
+		return operator.NewDHCP4(logger, spec.LinkName, spec.DHCP4, ctrl.V1alpha1Platform, ctrl.State, nil)
 	case network.OperatorDHCP6:
 		logger = logger.With(zap.String("operator", "dhcp6"))
 
@@ -408,6 +446,10 @@ func (ctrl *OperatorSpecController) newOperator(logger *zap.Logger, spec *networ
 		logger = logger.With(zap.String("operator", "vip"))
 
 		return operator.NewVIP(logger, spec.LinkName, spec.VIP, ctrl.State)
+	case network.OperatorLLDP:
+		logger = logger.With(zap.String("operator", "lldp"))
+
+		return operator.NewLLDP(logger, spec.LinkName, spec.LLDP.LinkIndex, nil)
 	default:
 		panic(fmt.Sprintf("unexpected operator %s", spec.Operator))
 	}

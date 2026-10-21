@@ -25,6 +25,7 @@ type OperatorSpec = typed.Resource[OperatorSpecSpec, OperatorSpecExtension]
 // OperatorSpecSpec describes operator specification.
 //
 //gotagsrewrite:gen
+//redactgen:gen
 type OperatorSpecSpec struct {
 	Operator  Operator `yaml:"operator" protobuf:"1"`
 	LinkName  string   `yaml:"linkName" protobuf:"2"`
@@ -33,6 +34,7 @@ type OperatorSpecSpec struct {
 	DHCP4 DHCP4OperatorSpec `yaml:"dhcp4,omitempty" protobuf:"4"`
 	DHCP6 DHCP6OperatorSpec `yaml:"dhcp6,omitempty" protobuf:"5"`
 	VIP   VIPOperatorSpec   `yaml:"vip,omitempty" protobuf:"6"`
+	LLDP  LLDPOperatorSpec  `yaml:"lldp,omitempty" protobuf:"8"`
 
 	ConfigLayer ConfigLayer `yaml:"layer" protobuf:"7"`
 }
@@ -43,6 +45,17 @@ func (spec OperatorSpecSpec) Equal(other OperatorSpecSpec) bool {
 	spec.ConfigLayer = other.ConfigLayer
 
 	return spec == other
+}
+
+// LLDPOperatorSpec describes LLDP operator options.
+//
+//gotagsrewrite:gen
+type LLDPOperatorSpec struct {
+	// LinkIndex is the kernel index of the link the operator listens on.
+	//
+	// The packet socket is bound to the interface when it is opened, so a device replaced under the
+	// same name has to be picked up as a different operator instance.
+	LinkIndex uint32 `yaml:"linkIndex" protobuf:"1"`
 }
 
 // ClientIdentifierSpec is a shared DHCP4/DHCP6 client identifier spec.
@@ -60,6 +73,7 @@ type DHCP4OperatorSpec struct {
 	RouteMetric         uint32               `yaml:"routeMetric" protobuf:"1"`
 	SkipHostnameRequest bool                 `yaml:"skipHostnameRequest,omitempty" protobuf:"2"`
 	ClientIdentifier    ClientIdentifierSpec `yaml:"clientIdentifier,omitempty" protobuf:"3"`
+	SkipRoutes          bool                 `yaml:"skipRoutes,omitempty" protobuf:"4"`
 }
 
 // DHCP6OperatorSpec describes DHCP6 operator options.
@@ -88,7 +102,7 @@ type VIPOperatorSpec struct {
 type VIPEquinixMetalSpec struct {
 	ProjectID string `yaml:"projectID" protobuf:"1"`
 	DeviceID  string `yaml:"deviceID" protobuf:"2"`
-	APIToken  string `yaml:"apiToken" protobuf:"3"`
+	APIToken  string `yaml:"apiToken" protobuf:"3" redact:"replace"`
 }
 
 // VIPHCloudSpec describes virtual (elastic) IP settings for Hetzner Cloud.
@@ -97,7 +111,7 @@ type VIPEquinixMetalSpec struct {
 type VIPHCloudSpec struct {
 	DeviceID  int64  `yaml:"deviceID" protobuf:"1"`
 	NetworkID int64  `yaml:"networkID" protobuf:"2"`
-	APIToken  string `yaml:"apiToken" protobuf:"3"`
+	APIToken  string `yaml:"apiToken" protobuf:"3" redact:"replace"`
 }
 
 // NewOperatorSpec initializes a OperatorSpec resource.

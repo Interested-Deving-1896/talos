@@ -11,22 +11,37 @@ import (
 
 // GuessVersionContractKubelet attempts to guess the version contract for kubelet configuration based on the provided machine configuration.
 func GuessVersionContractKubelet(cfg config.Container) *config.VersionContract {
-	return config.TalosVersionCurrent
+	if cfg.Has(k8s.KubeletConfig) {
+		return config.TalosVersionCurrent
+	}
+
+	// the last before multi-doc k8s config
+	return config.TalosVersion1_13
 }
 
 // GuessVersionContractKubeAPIServer attempts to guess the version contract for kube-apiserver configuration based on the provided machine configuration.
 func GuessVersionContractKubeAPIServer(cfg config.Container) *config.VersionContract {
-	return config.TalosVersionCurrent
+	if cfg.Has(k8s.KubeAPIServerConfig) {
+		return config.TalosVersionCurrent
+	}
+
+	// the last before multi-doc k8s config
+	return config.TalosVersion1_13
 }
 
 // GuessVersionContractKubeControllerManager attempts to guess the version contract for kube-controller-manager configuration based on the provided machine configuration.
 func GuessVersionContractKubeControllerManager(cfg config.Container) *config.VersionContract {
-	return config.TalosVersionCurrent
+	if cfg.Has(k8s.KubeControllerManagerConfig) {
+		return config.TalosVersionCurrent
+	}
+
+	// the last before multi-doc k8s config
+	return config.TalosVersion1_13
 }
 
 // GuessVersionContractKubeScheduler attempts to guess the version contract for kube-scheduler configuration based on the provided machine configuration.
 func GuessVersionContractKubeScheduler(cfg config.Container) *config.VersionContract {
-	if hasDocument(k8s.KubeSchedulerConfig, cfg) {
+	if cfg.Has(k8s.KubeSchedulerConfig) {
 		return config.TalosVersionCurrent
 	}
 
@@ -36,15 +51,10 @@ func GuessVersionContractKubeScheduler(cfg config.Container) *config.VersionCont
 
 // GuessVersionContractKubeProxy attempts to guess the version contract for kube-proxy configuration based on the provided machine configuration.
 func GuessVersionContractKubeProxy(cfg config.Container) *config.VersionContract {
-	return config.TalosVersionCurrent
-}
-
-func hasDocument(kind string, cfg config.Container) bool {
-	for _, doc := range cfg.Documents() {
-		if doc.Kind() == kind {
-			return true
-		}
+	if cfg.Has(k8s.KubeProxyConfig) {
+		return config.TalosVersionCurrent
 	}
 
-	return false
+	// the last before multi-doc k8s config
+	return config.TalosVersion1_13
 }

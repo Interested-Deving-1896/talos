@@ -39,6 +39,7 @@ var (
 	_ config.K8sSchedulerConfig           = &KubeSchedulerConfigV1Alpha1{}
 	_ config.Validator                    = &KubeSchedulerConfigV1Alpha1{}
 	_ container.V1Alpha1ConflictValidator = &KubeSchedulerConfigV1Alpha1{}
+	_ container.ControlplaneOnlyConfig    = &KubeSchedulerConfigV1Alpha1{}
 )
 
 // KubeSchedulerConfigV1Alpha1 configures kube-scheduler controlplane static pod.
@@ -59,6 +60,7 @@ type KubeSchedulerConfigV1Alpha1 struct {
 	//     The container image used to run the kube-scheduler component.
 	//
 	//     The image reference should contain the tag, even if it is pinned by digest.
+	//   schemaRequired: true
 	PodImage string `yaml:"image"`
 	//   description: |
 	//     Provide configuration for the kube-scheduler static pod.
@@ -141,6 +143,8 @@ func (s *KubeSchedulerConfigV1Alpha1) Clone() config.Document {
 }
 
 // Validate implements config.Validator interface.
+//
+//nolint:dupl
 func (s *KubeSchedulerConfigV1Alpha1) Validate(_ validation.RuntimeMode, opts ...validation.Option) ([]string, error) {
 	var (
 		errs     error
@@ -179,7 +183,7 @@ func (s *KubeSchedulerConfigV1Alpha1) V1Alpha1ConflictValidate(v1alpha1Cfg *v1al
 		return errors.New("kube-scheduler config is already set in v1alpha1 config (.cluster.scheduler)")
 	}
 
-	if v1alpha1Cfg.MachineConfig != nil && v1alpha1Cfg.MachineConfig.MachineControlPlane != nil &&
+	if v1alpha1Cfg.MachineConfig != nil && v1alpha1Cfg.MachineConfig.MachineControlPlane != nil && // nolint:staticcheck // testing deprecated field
 		v1alpha1Cfg.MachineConfig.MachineControlPlane.MachineScheduler != nil { //nolint:staticcheck // testing deprecated field
 		return errors.New("kube-scheduler config is already set in v1alpha1 config (.machine.controlplane.scheduler)")
 	}
@@ -228,3 +232,6 @@ func (s *KubeSchedulerConfigV1Alpha1) Config() map[string]any {
 func (s *KubeSchedulerConfigV1Alpha1) ExtraVolumes() []config.VolumeMount {
 	return nil
 }
+
+// ControlplaneOnlyDocument implements container.ControlplaneOnlyConfig interface.
+func (s *KubeSchedulerConfigV1Alpha1) ControlplaneOnlyDocument() {}

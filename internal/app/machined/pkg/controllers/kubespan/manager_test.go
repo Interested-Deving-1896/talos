@@ -136,9 +136,7 @@ func (suite *ManagerSuite) TestReconcile() {
 				constants.KubeSpanDefaultRoutingTable,
 				nethelpers.FamilyInet4,
 				netip.Prefix{},
-				netip.Addr{},
 				1,
-				"kubespan",
 			),
 		),
 		func(res *network.RouteSpec, asrt *assert.Assertions) {},
@@ -153,9 +151,7 @@ func (suite *ManagerSuite) TestReconcile() {
 				constants.KubeSpanDefaultRoutingTable,
 				nethelpers.FamilyInet6,
 				netip.Prefix{},
-				netip.Addr{},
 				1,
-				"kubespan",
 			),
 		),
 		func(res *network.RouteSpec, asrt *assert.Assertions) {},
@@ -229,6 +225,8 @@ func (suite *ManagerSuite) TestReconcile() {
 	peer2.TypedSpec().Label = "worker-2"
 	peer2.TypedSpec().AllowedIPs = []netip.Prefix{
 		netip.MustParsePrefix("10.244.2.0/24"),
+		netip.MustParsePrefix("fd00:0:0:2::/64"),
+		netip.MustParsePrefix("fd8a:4396:731e:e702:9c83:cbff:fed0:f94b/128"),
 	}
 	peer2.TypedSpec().Endpoints = []netip.AddrPort{
 		netip.MustParseAddrPort("172.20.0.4:51280"),
@@ -311,6 +309,7 @@ func (suite *ManagerSuite) TestReconcile() {
 						IncludeSubnets: []netip.Prefix{
 							netip.MustParsePrefix("10.244.1.0/24"),
 							netip.MustParsePrefix("10.244.2.0/24"),
+							netip.MustParsePrefix("fd00:0:0:2::/64"),
 						},
 					},
 					SetMark: &network.NfTablesMark{
@@ -392,6 +391,7 @@ func (suite *ManagerSuite) TestReconcile() {
 						IncludeSubnets: []netip.Prefix{
 							netip.MustParsePrefix("10.244.1.0/24"),
 							netip.MustParsePrefix("10.244.2.0/24"),
+							netip.MustParsePrefix("fd00:0:0:2::/64"),
 						},
 					},
 					SetMark: &network.NfTablesMark{
@@ -459,16 +459,14 @@ func TestManagerSuite(t *testing.T) {
 
 	suite.Run(t, &ManagerSuite{
 		mockWireguard: mockWireguard,
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 5 * time.Second,
-			AfterSetup: func(s *ctest.DefaultSuite) {
-				s.Require().NoError(s.Runtime().RegisterController(&kubespanctrl.ManagerController{
-					WireguardClientFactory: func() (kubespanctrl.WireguardClient, error) {
-						return mockWireguard, nil
-					},
-					PeerReconcileInterval: time.Second,
-				}))
-			},
+		Timeout:       5 * time.Second,
+		AfterSetup: func(s *ctest.DefaultSuite) {
+			s.Require().NoError(s.Runtime().RegisterController(&kubespanctrl.ManagerController{
+				WireguardClientFactory: func() (kubespanctrl.WireguardClient, error) {
+					return mockWireguard, nil
+				},
+				PeerReconcileInterval: time.Second,
+			}))
 		},
 	})
 }
