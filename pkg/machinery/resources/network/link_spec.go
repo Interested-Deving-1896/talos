@@ -14,6 +14,7 @@ import (
 
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
 	"github.com/siderolabs/talos/pkg/machinery/proto"
+	"github.com/siderolabs/talos/pkg/machinery/redactable"
 )
 
 // LinkSpecType is type of LinkSpec resource.
@@ -25,6 +26,7 @@ type LinkSpec = typed.Resource[LinkSpecSpec, LinkSpecExtension]
 // LinkSpecSpec describes spec for the link.
 //
 //gotagsrewrite:gen
+//redactgen:gen
 type LinkSpecSpec struct {
 	// Name defines link name
 	Name string `yaml:"name" protobuf:"1"`
@@ -61,10 +63,13 @@ type LinkSpecSpec struct {
 
 	// These structures are present depending on "Kind" for Logical interfaces.
 	VLAN         VLANSpec         `yaml:"vlan,omitempty" protobuf:"10"`
+	MacVLAN      MacVLANSpec      `yaml:"macvlan,omitempty" protobuf:"20"`
 	BondMaster   BondMasterSpec   `yaml:"bondMaster,omitempty" protobuf:"11"`
 	BridgeMaster BridgeMasterSpec `yaml:"bridgeMaster,omitempty" protobuf:"12"`
 	VRFMaster    VRFMasterSpec    `yaml:"vrfMaster,omitempty" protobuf:"17"`
 	Wireguard    WireguardSpec    `yaml:"wireguard,omitempty" protobuf:"13"`
+	Veth         VethSpec         `yaml:"veth,omitempty" protobuf:"19"`
+	VXLAN        VXLANSpec        `yaml:"vxlan,omitempty" protobuf:"21"`
 
 	// Configuration layer.
 	ConfigLayer ConfigLayer `yaml:"layer" protobuf:"14"`
@@ -99,6 +104,13 @@ type VRFSlave struct {
 	MasterName string `yaml:"masterName,omitempty" protobuf:"1"`
 }
 
+// VethSpec identifies the expected peer of a veth endpoint.
+//
+//gotagsrewrite:gen
+type VethSpec struct {
+	PeerName string `yaml:"peerName,omitempty" protobuf:"1"`
+}
+
 // Merge with other, overwriting fields from other if set.
 func (spec *LinkSpecSpec) Merge(other *LinkSpecSpec) error {
 	// prefer Logical, as it is defined for bonds/vlans, etc.
@@ -110,10 +122,13 @@ func (spec *LinkSpecSpec) Merge(other *LinkSpecSpec) error {
 	updateIfNotZero(&spec.ParentName, other.ParentName)
 	updateIfNotZero(&spec.BondSlave, other.BondSlave)
 	updateIfNotZero(&spec.VLAN, other.VLAN)
+	updateIfNotZero(&spec.MacVLAN, other.MacVLAN)
 	updateIfNotZero(&spec.BridgeMaster, other.BridgeMaster)
 	updateIfNotZero(&spec.BridgeSlave, other.BridgeSlave)
 	updateIfNotZero(&spec.VRFMaster, other.VRFMaster)
 	updateIfNotZero(&spec.VRFSlave, other.VRFSlave)
+	updateIfNotZero(&spec.Veth, other.Veth)
+	updateIfNotZero(&spec.VXLAN, other.VXLAN)
 
 	if !other.BondMaster.IsZero() {
 		spec.BondMaster = other.BondMaster.DeepCopy()
@@ -174,4 +189,7 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+
+	// the spec is sensitive, but it is safe to be read in the redacted form
+	redactable.Register[LinkSpecSpec, LinkSpecExtension]()
 }

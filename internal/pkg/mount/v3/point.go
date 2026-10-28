@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -133,6 +134,7 @@ func (p *Point) Share() error {
 type UnmountOptions struct {
 	Printer   func(string, ...any)
 	Recursive bool
+	Lazy      bool
 }
 
 // Release closes the file descriptor of the underlying mount point.
@@ -155,7 +157,7 @@ func (p *Point) Unmount(opts UnmountOptions) error {
 	}
 
 	err := p.retry(func() error {
-		return SafeUnmount(context.Background(), opts.Printer, p.target, opts.Recursive)
+		return SafeUnmount(context.Background(), opts.Printer, p.target, opts.Recursive, opts.Lazy)
 	}, true)
 	if err != nil {
 		logSubmounts(opts.Printer, p.target)
@@ -248,7 +250,9 @@ func (p *Point) retry(f func() error, isUnmount bool) error {
 func (p *Point) moveMount(target string) error {
 	fd, err := p.root.Fd()
 	if err != nil {
-		if p.Source() != "" {
+		// fall back to moving the mount by path, but only if the source is a path
+		// (pseudo filesystems have sources like "tmpfs" or "cgroup")
+		if filepath.IsAbs(p.Source()) {
 			if err := unix.MoveMount(unix.AT_FDCWD, p.Source(), unix.AT_FDCWD, target, 0); err != nil {
 				return fmt.Errorf("error moving mount from %q to %q: %w", p.Source(), target, err)
 			}
@@ -333,7 +337,7 @@ func (p *Point) SetDisableAccessTime(disable bool) error {
 	}, 0)
 }
 
-// SetSecure sets or clears the nosuid, nodev, and noexec mount attributes.
+// SetSecure sets or clears the nosuid and nodev mount attributes.
 func (p *Point) SetSecure(secure bool) error {
 	if p.detached {
 		return nil
@@ -341,12 +345,29 @@ func (p *Point) SetSecure(secure bool) error {
 
 	if secure {
 		return p.setattr(&unix.MountAttr{
-			Attr_set: unix.MOUNT_ATTR_NOSUID | unix.MOUNT_ATTR_NODEV | unix.MOUNT_ATTR_NOEXEC,
+			Attr_set: unix.MOUNT_ATTR_NOSUID | unix.MOUNT_ATTR_NODEV,
 		}, 0)
 	}
 
 	return p.setattr(&unix.MountAttr{
-		Attr_clr: unix.MOUNT_ATTR_NOSUID | unix.MOUNT_ATTR_NODEV | unix.MOUNT_ATTR_NOEXEC,
+		Attr_clr: unix.MOUNT_ATTR_NOSUID | unix.MOUNT_ATTR_NODEV,
+	}, 0)
+}
+
+// SetNoExec sets or clears the noexec mount attribute.
+func (p *Point) SetNoExec(noExec bool) error {
+	if p.detached {
+		return nil
+	}
+
+	if noExec {
+		return p.setattr(&unix.MountAttr{
+			Attr_set: unix.MOUNT_ATTR_NOEXEC,
+		}, 0)
+	}
+
+	return p.setattr(&unix.MountAttr{
+		Attr_clr: unix.MOUNT_ATTR_NOEXEC,
 	}, 0)
 }
 

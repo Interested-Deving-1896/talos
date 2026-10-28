@@ -1,0 +1,90 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+package hypervisor
+
+import (
+	"github.com/cosi-project/runtime/pkg/resource"
+	"github.com/cosi-project/runtime/pkg/resource/meta"
+	"github.com/cosi-project/runtime/pkg/resource/protobuf"
+	"github.com/cosi-project/runtime/pkg/resource/typed"
+
+	"github.com/siderolabs/talos/pkg/machinery/hypervisorhelpers"
+	"github.com/siderolabs/talos/pkg/machinery/proto"
+)
+
+// VirtualMachineStatusType is the type of the VirtualMachineStatus resource.
+const VirtualMachineStatusType = resource.Type("VirtualMachineStatuses.hypervisor.talos.dev")
+
+// GracefulStopPendingError is the error a virtual machine carries while a graceful stop it was
+// asked for has not been obeyed. Nothing bounds that wait, so the message carries the way out of it.
+const GracefulStopPendingError = "the guest has been asked to power itself off and has not done so yet; " +
+	"stop the virtual machine again with force to power it off without the guest's cooperation. " +
+	"Its disks stay held until it is off"
+
+// VirtualMachineStatus reports the last observed state of a configured virtual machine.
+type VirtualMachineStatus = typed.Resource[VirtualMachineStatusSpec, VirtualMachineStatusExtension]
+
+// VirtualMachineStatusSpec describes observed power state and reconciliation stage.
+//
+//gotagsrewrite:gen
+type VirtualMachineStatusSpec struct {
+	// PowerState is the matched domain's observed power, or unknown when no domain was observed.
+	PowerState hypervisorhelpers.VirtualMachinePowerState `yaml:"powerState" protobuf:"1"`
+	// Stage distinguishes unknown observation, convergence, readiness, and observed obstacles.
+	Stage hypervisorhelpers.VirtualMachineStage `yaml:"stage" protobuf:"2"`
+	// Error describes an observation failure or obstacle, when known.
+	Error string `yaml:"error,omitempty" protobuf:"3"`
+	// Addresses is the flat list of guest IP addresses in CIDR form, as reported by qemu-guest-agent.
+	Addresses []string `yaml:"addresses,omitempty" protobuf:"4"`
+	// Interfaces is the per-interface view returned by qemu-guest-agent.
+	Interfaces []VirtualMachineGuestInterfaceSpec `yaml:"interfaces,omitempty" protobuf:"5"`
+	// ObservedGeneration identifies the effective intent and exact domain incarnation and version this status was composed from.
+	ObservedGeneration string `yaml:"observedGeneration,omitempty" protobuf:"6"`
+}
+
+// NewVirtualMachineStatus initializes a VirtualMachineStatus resource.
+func NewVirtualMachineStatus(namespace resource.Namespace, id resource.ID) *VirtualMachineStatus {
+	return typed.NewResource[VirtualMachineStatusSpec, VirtualMachineStatusExtension](
+		resource.NewMetadata(namespace, VirtualMachineStatusType, id, resource.VersionUndefined),
+		VirtualMachineStatusSpec{},
+	)
+}
+
+// VirtualMachineStatusExtension is auxiliary resource data for VirtualMachineStatus.
+type VirtualMachineStatusExtension struct{}
+
+// ResourceDefinition implements meta.ResourceDefinitionProvider.
+func (VirtualMachineStatusExtension) ResourceDefinition() meta.ResourceDefinitionSpec {
+	return meta.ResourceDefinitionSpec{
+		Type:             VirtualMachineStatusType,
+		DefaultNamespace: NamespaceName,
+		PrintColumns: []meta.PrintColumn{
+			{
+				Name:     "Power",
+				JSONPath: "{.powerState}",
+			},
+			{
+				Name:     "Stage",
+				JSONPath: "{.stage}",
+			},
+			{
+				Name:     "Addresses",
+				JSONPath: "{.addresses}",
+			},
+			{
+				Name:     "Error",
+				JSONPath: "{.error}",
+			},
+		},
+	}
+}
+
+func init() {
+	proto.RegisterDefaultTypes()
+
+	if err := protobuf.RegisterDynamic(VirtualMachineStatusType, &VirtualMachineStatus{}); err != nil {
+		panic(err)
+	}
+}

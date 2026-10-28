@@ -8,6 +8,8 @@ import (
 	"crypto/tls"
 	"fmt"
 
+	"github.com/cosi-project/runtime/pkg/state/protobuf/client"
+	"github.com/siderolabs/crypto/x509"
 	"google.golang.org/grpc"
 
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
@@ -25,6 +27,7 @@ type Options struct {
 	configContext     *clientconfig.Context
 	tlsConfig         *tls.Config
 	grpcDialOptions   []grpc.DialOption
+	stateOptions      []client.AdapterOption
 
 	contextOverride    string
 	contextOverrideSet bool
@@ -81,6 +84,15 @@ func WithDefaultGRPCDialOptions() OptionFunc {
 func WithGRPCDialOptions(opts ...grpc.DialOption) OptionFunc {
 	return func(o *Options) error {
 		o.grpcDialOptions = append(o.grpcDialOptions, opts...)
+
+		return nil
+	}
+}
+
+// WithStateOptions adds the given options to the COSI state of the Client.
+func WithStateOptions(opts ...client.AdapterOption) OptionFunc {
+	return func(o *Options) error {
+		o.stateOptions = append(o.stateOptions, opts...)
 
 		return nil
 	}
@@ -165,6 +177,37 @@ func WithSideroV1KeysDir(keysDir string) OptionFunc {
 func WithServiceAccount(serviceAccountBase64 string) OptionFunc {
 	return func(o *Options) error {
 		o.serviceAccountBase64 = serviceAccountBase64
+
+		return nil
+	}
+}
+
+// WithMaintenanceMode creates a Client which connects to Talos API in maintenance mode.
+//
+// In this mode, the certificate fingerprints might be verified if the list supplied
+// is not empty.
+func WithMaintenanceMode(node string, enforceFingerprints []string) OptionFunc {
+	return func(o *Options) error {
+		o.tlsConfig = &tls.Config{
+			InsecureSkipVerify: true,
+		}
+
+		if len(enforceFingerprints) > 0 {
+			fingerprints := make([]x509.Fingerprint, len(enforceFingerprints))
+
+			for i, stringFingerprint := range enforceFingerprints {
+				var err error
+
+				fingerprints[i], err = x509.ParseFingerprint(stringFingerprint)
+				if err != nil {
+					return fmt.Errorf("error parsing certificate fingerprint %q: %w", stringFingerprint, err)
+				}
+			}
+
+			o.tlsConfig.VerifyConnection = x509.MatchSPKIFingerprints(fingerprints...)
+		}
+
+		o.endpointsOverride = []string{node}
 
 		return nil
 	}

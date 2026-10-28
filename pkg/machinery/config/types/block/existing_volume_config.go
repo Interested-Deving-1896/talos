@@ -48,7 +48,7 @@ var (
 //	description: |
 //	  Existing volumes allow to mount partitions (or whole disks) that were created
 //	  outside of Talos. Volume will be mounted under `/var/mnt/<name>`.
-//	  The existing volume config name should not conflict with user volume names.
+//	  The name must not be taken by a user or external volume.
 //	examples:
 //	  - value: exampleExistingVolumeConfigV1Alpha1()
 //	alias: ExistingVolumeConfig
@@ -69,6 +69,12 @@ type ExistingVolumeConfigV1Alpha1 struct {
 	//   description: |
 	//     The mount describes additional mount options.
 	MountSpec ExistingMountSpec `yaml:"mount,omitempty"`
+	//   description: |
+	//     The trim describes the per-volume filesystem trim (fstrim) configuration.
+	TrimSpec *TrimConfig `yaml:"trim,omitempty"`
+	//   description: |
+	//     The scrub describes the per-volume filesystem scrub configuration.
+	ScrubSpec *ScrubConfig `yaml:"scrub,omitempty"`
 }
 
 // VolumeDiscoverySpec describes how the volume is discovered.
@@ -111,7 +117,7 @@ type ExistingMountSpec struct {
 	//     If true, disable file access time updates.
 	MountDisableAccessTime *bool `yaml:"disableAccessTime,omitempty"`
 	//   description: |
-	//     Enable secure mount options (nosuid, nodev).
+	//     Enable secure mount options (nosuid, nodev, noexec).
 	//
 	//     Defaults to true for better security.
 	MountSecure *bool `yaml:"secure,omitempty"`
@@ -151,7 +157,7 @@ func (s *ExistingVolumeConfigV1Alpha1) Clone() config.Document {
 
 // ConflictsWithKinds implements config.ConflictingDocument interface.
 func (s *ExistingVolumeConfigV1Alpha1) ConflictsWithKinds() []string {
-	return []string{UserVolumeConfigKind}
+	return conflictingVolumeKinds(ExistingVolumeConfigKind)
 }
 
 // Validate implements config.Validator interface.
@@ -189,6 +195,14 @@ func (s *ExistingVolumeConfigV1Alpha1) Validate(validation.RuntimeMode, ...valid
 	warnings = append(warnings, extraWarnings...)
 	validationErrors = errors.Join(validationErrors, extraErrors)
 
+	if err := s.TrimSpec.Validate(); err != nil {
+		validationErrors = errors.Join(validationErrors, err)
+	}
+
+	if err := s.ScrubSpec.Validate(); err != nil {
+		validationErrors = errors.Join(validationErrors, err)
+	}
+
 	return warnings, validationErrors
 }
 
@@ -203,6 +217,24 @@ func (s *ExistingVolumeConfigV1Alpha1) VolumeDiscovery() config.VolumeDiscoveryC
 // Mount implements config.ExistingVolumeConfig interface.
 func (s *ExistingVolumeConfigV1Alpha1) Mount() config.ExistingVolumeMountConfig {
 	return s.MountSpec
+}
+
+// Trim implements config.ExistingVolumeConfig interface.
+func (s *ExistingVolumeConfigV1Alpha1) Trim() config.VolumeTrimConfig {
+	if s.TrimSpec == nil {
+		return nil
+	}
+
+	return s.TrimSpec
+}
+
+// Scrub implements config.ExistingVolumeConfig interface.
+func (s *ExistingVolumeConfigV1Alpha1) Scrub() config.VolumeScrubConfig {
+	if s.ScrubSpec == nil {
+		return nil
+	}
+
+	return s.ScrubSpec
 }
 
 // Validate the provisioning spec.

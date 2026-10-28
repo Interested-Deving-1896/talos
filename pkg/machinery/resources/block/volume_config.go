@@ -7,6 +7,7 @@ package block
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/resource/meta"
@@ -48,6 +49,18 @@ type VolumeConfigSpec struct {
 
 	// Symlink options for the volume.
 	Symlink SymlinkProvisioningSpec `yaml:"symlink,omitempty" protobuf:"7"`
+
+	// TrimEnabled indicates whether the volume should be trimmed (fstrim) on a schedule.
+	TrimEnabled bool `yaml:"trimEnabled,omitempty" protobuf:"8"`
+	// TrimInterval is the resolved interval at which the volume should be trimmed.
+	TrimInterval time.Duration `yaml:"trimInterval,omitempty" protobuf:"9"`
+	// TrimOptions are the resolved options of the trim operation.
+	TrimOptions TrimOptionsSpec `yaml:"trimOptions,omitempty" protobuf:"12"`
+
+	// ScrubEnabled indicates whether the volume filesystem should be scrubbed on a schedule.
+	ScrubEnabled bool `yaml:"scrubEnabled,omitempty" protobuf:"10"`
+	// ScrubInterval is the resolved period at which the volume filesystem should be scrubbed.
+	ScrubInterval time.Duration `yaml:"scrubInterval,omitempty" protobuf:"11"`
 }
 
 // Wave constants.
@@ -56,6 +69,18 @@ const (
 	WaveUserVolumes     = 0
 	WaveLegacyUserDisks = 1000000 // legacy user disks rely on specific order of provisioning
 )
+
+// TrimOptionsSpec is the spec for trim (fstrim) operation options.
+//
+//gotagsrewrite:gen
+type TrimOptionsSpec struct {
+	// ChunkSize is the size of the filesystem range trimmed at once (zero means the whole filesystem).
+	ChunkSize uint64 `yaml:"chunkSize,omitempty" protobuf:"1"`
+	// ChunkDelay is the delay between trimming consecutive chunks.
+	ChunkDelay time.Duration `yaml:"chunkDelay,omitempty" protobuf:"2"`
+	// MinLength is the minimum contiguous free range to discard.
+	MinLength uint64 `yaml:"minLength,omitempty" protobuf:"3"`
+}
 
 // ProvisioningSpec is the spec for volume provisioning.
 //
@@ -150,18 +175,23 @@ type FilesystemSpec struct {
 	Type FilesystemType `yaml:"type" protobuf:"1"`
 	// Filesystem label.
 	Label string `yaml:"label,omitempty" protobuf:"2"`
+	// MinAllocationGroupSize is the minimum XFS allocation group size in bytes.
+	//
+	// Zero leaves the mkfs.xfs defaults alone.
+	MinAllocationGroupSize uint64 `yaml:"minAllocationGroupSize,omitempty" protobuf:"3"`
 }
 
 // EncryptionSpec is the spec for volume encryption.
 //
 //gotagsrewrite:gen
 type EncryptionSpec struct {
-	Provider    EncryptionProviderType `yaml:"provider" protobuf:"1"`
-	Keys        []EncryptionKey        `yaml:"keys" protobuf:"2"`
-	Cipher      string                 `yaml:"cipher,omitempty" protobuf:"3"`
-	KeySize     uint                   `yaml:"keySize,omitempty" protobuf:"4"`
-	BlockSize   uint64                 `yaml:"blockSize,omitempty" protobuf:"5"`
-	PerfOptions []string               `yaml:"perfOptions,omitempty" protobuf:"6"`
+	Provider      EncryptionProviderType `yaml:"provider" protobuf:"1"`
+	Keys          []EncryptionKey        `yaml:"keys" protobuf:"2"`
+	Cipher        string                 `yaml:"cipher,omitempty" protobuf:"3"`
+	KeySize       uint                   `yaml:"keySize,omitempty" protobuf:"4"`
+	BlockSize     uint64                 `yaml:"blockSize,omitempty" protobuf:"5"`
+	PerfOptions   []string               `yaml:"perfOptions,omitempty" protobuf:"6"`
+	AllowDiscards bool                   `yaml:"allowDiscards,omitempty" protobuf:"7"`
 }
 
 // EncryptionKey is the spec for volume encryption key.
@@ -250,9 +280,10 @@ type MountSpec struct {
 	BindTarget *string `yaml:"bindTarget,omitempty" protobuf:"9"`
 	// Parameters are additional filesystem mount options used when mounting the volume.
 	Parameters []ParameterSpec `yaml:"parameters,omitempty" protobuf:"10"`
-	// Secure applies MOUNT_ATTR_NOSUID\|NODEV\|NOEXEC to the mount. Set for
-	// config-only mounts; leave false for mounts hosting executables.
+	// Secure applies MOUNT_ATTR_NOSUID\|NODEV to the mount.
 	Secure bool `yaml:"secure,omitempty" protobuf:"11"`
+	// NoExec applies MOUNT_ATTR_NOEXEC to the mount.
+	NoExec bool `yaml:"noExec,omitempty" protobuf:"12"`
 }
 
 // SymlinkProvisioningSpec is the spec for volume symlink.

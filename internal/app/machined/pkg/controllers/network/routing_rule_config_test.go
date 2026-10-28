@@ -17,6 +17,7 @@ import (
 	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
 	netctrl "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/network"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
 	networkcfg "github.com/siderolabs/talos/pkg/machinery/config/types/network"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
 	"github.com/siderolabs/talos/pkg/machinery/resources/config"
@@ -32,16 +33,16 @@ func (suite *RoutingRuleConfigSuite) TestMachineConfiguration() {
 	suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.RoutingRuleConfigController{}))
 
 	rc1 := networkcfg.NewRoutingRuleConfigV1Alpha1(1100)
-	rc1.RuleSrc = networkcfg.Prefix{Prefix: netip.MustParsePrefix("10.0.0.0/8")}
+	rc1.RuleSrc = meta.Prefix{Prefix: netip.MustParsePrefix("10.0.0.0/8")}
 	rc1.RuleTable = nethelpers.RoutingTable(100)
 	rc1.RuleAction = nethelpers.RoutingRuleActionUnicast
 
 	rc2 := networkcfg.NewRoutingRuleConfigV1Alpha1(1200)
-	rc2.RuleDst = networkcfg.Prefix{Prefix: netip.MustParsePrefix("192.168.0.0/16")}
+	rc2.RuleDst = meta.Prefix{Prefix: netip.MustParsePrefix("192.168.0.0/16")}
 	rc2.RuleTable = nethelpers.RoutingTable(200)
 
 	rc3 := networkcfg.NewRoutingRuleConfigV1Alpha1(1300)
-	rc3.RuleSrc = networkcfg.Prefix{Prefix: netip.MustParsePrefix("2001:db8::/32")}
+	rc3.RuleSrc = meta.Prefix{Prefix: netip.MustParsePrefix("2001:db8::/32")}
 	rc3.RuleTable = nethelpers.RoutingTable(100)
 
 	rc4 := networkcfg.NewRoutingRuleConfigV1Alpha1(1400)
@@ -145,6 +146,43 @@ func (suite *RoutingRuleConfigSuite) TestMachineConfigurationWithFwMark() {
 	)
 }
 
+func (suite *RoutingRuleConfigSuite) TestMachineConfigurationWithLinkAlias() {
+	suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.RoutingRuleConfigController{}))
+
+	for _, link := range []struct {
+		name  string
+		alias string
+	}{
+		{name: "enp0s3", alias: "net0"},
+		{name: "enp0s4", alias: "net1"},
+	} {
+		status := network.NewLinkStatus(network.NamespaceName, link.name)
+		status.TypedSpec().Alias = link.alias
+		suite.Create(status)
+	}
+
+	rc1 := networkcfg.NewRoutingRuleConfigV1Alpha1(500)
+	rc1.RuleSrc = meta.Prefix{Prefix: netip.MustParsePrefix("10.0.0.0/8")}
+	rc1.RuleTable = nethelpers.RoutingTable(100)
+	rc1.RuleIIFName = "net0"
+	rc1.RuleOIFName = "net1"
+
+	ctr, err := container.New(rc1)
+	suite.Require().NoError(err)
+
+	suite.Create(config.NewMachineConfig(ctr))
+
+	ctest.AssertResource(
+		suite,
+		"configuration/inet4/00500",
+		func(r *network.RoutingRuleSpec, asrt *assert.Assertions) {
+			asrt.Equal("enp0s3", r.TypedSpec().IIFName)
+			asrt.Equal("enp0s4", r.TypedSpec().OIFName)
+		},
+		rtestutils.WithNamespace(network.ConfigNamespaceName),
+	)
+}
+
 // TestReservedPrioritySkipped verifies that user configs at kernel-reserved
 // priorities never produce a RoutingRuleSpec, so the spec controller can
 // never tear down (and thus delete) kernel-managed rules at those priorities.
@@ -156,7 +194,7 @@ func (suite *RoutingRuleConfigSuite) TestReservedPrioritySkipped() {
 	// bypasses validation.
 	reserved := networkcfg.NewRoutingRuleConfigV1Alpha1(0)
 	reserved.RuleTable = nethelpers.RoutingTable(100)
-	reserved.RuleSrc = networkcfg.Prefix{Prefix: netip.MustParsePrefix("10.0.0.0/8")}
+	reserved.RuleSrc = meta.Prefix{Prefix: netip.MustParsePrefix("10.0.0.0/8")}
 	reserved.RuleAction = nethelpers.RoutingRuleActionUnicast
 
 	allowed := networkcfg.NewRoutingRuleConfigV1Alpha1(2000)
@@ -186,8 +224,6 @@ func TestRoutingRuleConfigSuite(t *testing.T) {
 	t.Parallel()
 
 	suite.Run(t, &RoutingRuleConfigSuite{
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 5 * time.Second,
-		},
+		Timeout: 5 * time.Second,
 	})
 }

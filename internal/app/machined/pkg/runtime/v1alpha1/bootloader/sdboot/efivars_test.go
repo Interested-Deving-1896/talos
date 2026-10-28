@@ -49,21 +49,20 @@ func TestSetBootEntry(t *testing.T) {
 	talosBootEntry, err := talosLoadOption.Marshal()
 	require.NoError(t, err)
 
+	// Firmware is known to write load options which can't be decoded.
+	undecodableBootEntry := defaultBootEntry[:len(defaultBootEntry)-2]
+
 	blkidInfo := &blkid.Info{
-		ProbeResult: blkid.ProbeResult{
-			Name: "loop0",
-		},
+		Name:       "loop0",
 		SectorSize: 512,
 		Parts: []blkid.NestedProbeResult{
 			{
-				NestedResult: blkid.NestedResult{
-					PartitionUUID:   new(uuid.MustParse("3c8f4e2e-1dd2-4a5b-9f6d-8f3c9e6d7c3b")),
-					PartitionLabel:  new(constants.EFIPartitionLabel),
-					PartitionOffset: 2048,
-					PartitionSize:   409600,
-					PartitionIndex:  1,
-					PartitionType:   new(uuid.MustParse("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")),
-				},
+				PartitionUUID:   new(uuid.MustParse("3c8f4e2e-1dd2-4a5b-9f6d-8f3c9e6d7c3b")),
+				PartitionLabel:  new(constants.EFIPartitionLabel),
+				PartitionOffset: 2048,
+				PartitionSize:   409600,
+				PartitionIndex:  1,
+				PartitionType:   new(uuid.MustParse("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")),
 			},
 		},
 	}
@@ -73,6 +72,7 @@ func TestSetBootEntry(t *testing.T) {
 		efivarfsMock *efivarfs.Mock
 
 		expectedEntries map[int]string
+		expectedBroken  []int
 	}{
 		{
 			name:         "empty efivarfs", // both BootOrder and BootEntries are initially empty
@@ -329,6 +329,54 @@ func TestSetBootEntry(t *testing.T) {
 				42: "Default Boot Entry",
 			},
 		},
+		{
+			name: "undecodable entry", // the broken entry is skipped, but keeps its index
+			efivarfsMock: &efivarfs.Mock{
+				Variables: map[uuid.UUID]map[string]efivarfs.MockVariable{
+					efivarfs.ScopeGlobal: {
+						"BootOrder": {
+							Attrs: 0,
+							Data:  []byte{0x00, 0x00}, // BootOrder: [0]
+						},
+						"Boot0000": {
+							Attrs: 0,
+							Data:  undecodableBootEntry,
+						},
+					},
+				},
+			},
+
+			expectedEntries: map[int]string{
+				1: sdboot.TalosBootEntryDescription,
+			},
+			expectedBroken: []int{0},
+		},
+		{
+			name: "undecodable entry with existing Talos entry",
+			efivarfsMock: &efivarfs.Mock{
+				Variables: map[uuid.UUID]map[string]efivarfs.MockVariable{
+					efivarfs.ScopeGlobal: {
+						"BootOrder": {
+							Attrs: 0,
+							Data:  []byte{0x02, 0x00, 0x00, 0x00}, // BootOrder: [2, 0]
+						},
+						"Boot0000": {
+							Attrs: 0,
+							Data:  undecodableBootEntry,
+						},
+						"Boot0002": {
+							Attrs: 0,
+							Data:  talosBootEntry,
+						},
+					},
+				},
+			},
+
+			expectedEntries: map[int]string{
+				2: sdboot.TalosBootEntryDescription,
+			},
+			expectedBroken: []int{0},
+		},
 	} {
 		t.Run(testData.name, func(t *testing.T) {
 			t.Parallel()
@@ -344,13 +392,16 @@ func TestSetBootEntry(t *testing.T) {
 			bootEntries, err := efivarfs.ListBootEntries(testData.efivarfsMock)
 			require.NoError(t, err)
 
-			require.Len(t, bootEntries, len(testData.expectedEntries), "number of boot entries does not match expected value")
+			require.Len(t, bootEntries, len(testData.expectedEntries)+len(testData.expectedBroken), "number of boot entries does not match expected value")
 
 			for idx, desc := range testData.expectedEntries {
-				entry, err := efivarfs.GetBootEntry(testData.efivarfsMock, idx)
-				require.NoError(t, err)
+				require.NoError(t, bootEntries[idx].Err)
+				require.Equal(t, desc, bootEntries[idx].Option.Description, "boot entry description does not match expected value")
+			}
 
-				require.Equal(t, desc, entry.Description, "boot entry description does not match expected value")
+			for _, idx := range testData.expectedBroken {
+				require.Error(t, bootEntries[idx].Err)
+				require.Contains(t, logger.String(), fmt.Sprintf("Skipping boot entry at index %d: ", idx))
 			}
 		})
 	}

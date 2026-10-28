@@ -18,6 +18,7 @@
 #  - KUBESTR
 #  - HELM
 #  - CILIUM_CLI
+#  - CILIUM_VERSION
 
 set -eoux pipefail
 
@@ -33,7 +34,7 @@ export TALOS_VERSION
 # Kubernetes
 
 export KUBECONFIG="${TMP}/kubeconfig"
-export KUBERNETES_VERSION=${KUBERNETES_VERSION:-1.36.1}
+export KUBERNETES_VERSION=${KUBERNETES_VERSION:-1.38.0-alpha.2}
 
 export NAME_PREFIX="talos-e2e-${SHA}-${PLATFORM}"
 export TIMEOUT=1200
@@ -44,6 +45,7 @@ CLUSTER_NAME=
 
 TEST_SHORT=()
 TEST_RUN=("-test.run" ".")
+TEST_NFS=()
 
 function run_talos_integration_test {
   case "${SHORT_INTEGRATION_TEST:-no}" in
@@ -74,6 +76,14 @@ function run_talos_integration_test {
       TEST_VIRTIOFSD=("-talos.virtiofsd")
   fi
 
+  case "${WITH_IPMI:-false}" in
+    false)
+      ;;
+    *)
+      TEST_IPMI=("-talos.ipmi")
+      ;;
+  esac
+
   "${INTEGRATION_TEST}" \
     -test.v \
     -talos.failfast \
@@ -84,11 +94,14 @@ function run_talos_integration_test {
     -talos.provisioner "${PROVISIONER}" \
     -talos.name "${CLUSTER_NAME}" \
     -talos.image "${REGISTRY}/siderolabs/talos" \
+    -talos.numa-nodes "${QEMU_NUMA_NODES:-0}" \
     ${EXTRA_TEST_ARGS:-} \
     "${TEST_RUN[@]}" \
     "${TEST_SHORT[@]}" \
     "${TEST_AIRGAPPED[@]}" \
-    "${TEST_VIRTIOFSD[@]}"
+    "${TEST_VIRTIOFSD[@]}" \
+    "${TEST_NFS[@]}" \
+    "${TEST_IPMI[@]}"
 }
 
 function run_talos_integration_test_docker {
@@ -203,6 +216,20 @@ function build_registry_mirrors {
 function install_and_run_cilium_cni_tests {
   get_kubeconfig
 
+  # pin the Cilium version explicitly, as the default baked into cilium-cli lags behind the latest stable release
+  local cilium_install_args=("--version=${CILIUM_VERSION}")
+
+  if [[ "${WITH_CILIUM_BGP:-false}" == "true" ]]; then
+    cilium_install_args+=("--set=bgpControlPlane.enabled=true")
+  fi
+
+  if [[ "${WITH_BGP_CLOS:-false}" == "true" && "${CILIUM_INSTALL_TYPE:-none}" == "strict" ]]; then
+    # Full-CLOS nodes keep their IPv4 identity on lo and use IPv6-link-local-only fabric uplinks.
+    # Select both the loopback and every fabric NIC so kube-proxy replacement has an IPv4 direct
+    # routing address while attaching its external service datapath to every uplink.
+    cilium_install_args+=("--set=devices={lo,enp0s+}" "--set=nodePort.directRoutingDevice=lo")
+  fi
+
   case "${WITH_KUBESPAN:-false}" in
     true)
       CILIUM_NODE_ENCRYPTION=false
@@ -217,6 +244,7 @@ function install_and_run_cilium_cni_tests {
   case "${CILIUM_INSTALL_TYPE:-none}" in
     strict)
       ${CILIUM_CLI} install \
+        "${cilium_install_args[@]}" \
         --set=ipam.mode=kubernetes \
         --set=kubeProxyReplacement=true \
         --set=encryption.nodeEncryption=${CILIUM_NODE_ENCRYPTION} \
@@ -231,6 +259,7 @@ function install_and_run_cilium_cni_tests {
       # explicitly setting kubeProxyReplacement=disabled since by the time cilium cli runs talos
       # has not yet applied the kube-proxy manifests
       ${CILIUM_CLI} install \
+        "${cilium_install_args[@]}" \
         --set=ipam.mode=kubernetes \
         --set=kubeProxyReplacement=false \
         --set=encryption.nodeEncryption=${CILIUM_NODE_ENCRYPTION} \
@@ -252,6 +281,6 @@ function install_and_run_cilium_cni_tests {
   ${KUBECTL} label ns cilium-test-1 cilium-test-ccnp1 cilium-test-ccnp2 pod-security.kubernetes.io/enforce=privileged
 
   # --external-target added, as default 'one.one.one.one' is buggy, and CloudFlare status is of course "all healthy"
-  ${CILIUM_CLI} connectivity test --test-namespace cilium-test --external-target google.com --timeout=20m "${CILIUM_TEST_EXTRA_ARGS[@]}"
+  ${CILIUM_CLI} connectivity test --test-namespace cilium-test --external-target google.com --timeout=30m "${CILIUM_TEST_EXTRA_ARGS[@]}"
   ${KUBECTL} delete ns cilium-test-1 cilium-test-ccnp1 cilium-test-ccnp2
 }

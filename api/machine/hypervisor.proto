@@ -1,0 +1,90 @@
+syntax = "proto3";
+
+package machine;
+
+option go_package = "github.com/siderolabs/talos/pkg/machinery/api/machine";
+option java_package = "dev.talos.api.machine";
+
+// HypervisorService exposes virtual machine APIs.
+service HypervisorService {
+  // ConsoleStream attaches exclusively to one managed VM's live serial console.
+  // The first request must be an attach with a nonempty name; subsequent requests
+  // must contain stdin_data, at most 64 KiB per frame. Bytes pass through unchanged.
+  // Client input EOF (half-close), cancellation, or guest EOF detaches the session.
+  // Only live output is sent: there is no replay, persistent log, or resize support.
+  rpc ConsoleStream(stream ConsoleRequest) returns (stream ConsoleResponse);
+
+  // VNCStream attaches exclusively to one managed VM's live VNC endpoint.
+  // The first request must attach a nonempty name; subsequent requests contain
+  // opaque data, at most 64 KiB per frame. RFB negotiation is end-to-end.
+  // Input EOF, cancellation, or guest EOF detaches; serial attachment is separate.
+  rpc VNCStream(stream VNCRequest) returns (stream VNCResponse);
+
+  // Start temporarily overrides a virtual machine's power state to running for the current host boot.
+  // The machine configuration is unchanged; a host reboot drops the override.
+  rpc Start(VirtualMachineStartRequest) returns (VirtualMachineStartResponse);
+  // Stop temporarily overrides a virtual machine's power state to stopped for the current host boot.
+  // The machine configuration is unchanged; a host reboot drops the override.
+  rpc Stop(VirtualMachineStopRequest) returns (VirtualMachineStopResponse);
+  // Reboot restarts a running virtual machine, leaving the machine configuration alone.
+  rpc Reboot(VirtualMachineRebootRequest) returns (VirtualMachineRebootResponse);
+}
+
+message VNCRequest {
+  oneof request {
+    VNCAttach attach = 1;
+    bytes data = 2;
+  }
+}
+
+message VNCAttach {
+  string name = 1;
+}
+
+message VNCResponse {
+  bytes data = 1;
+}
+
+message VirtualMachineStartRequest {
+  // Name of the virtual machine, identified by its VirtualMachineSpec resource.
+  string name = 1;
+}
+
+message VirtualMachineStartResponse {}
+
+message VirtualMachineStopRequest {
+  // Name of the virtual machine, identified by its VirtualMachineSpec resource.
+  string name = 1;
+  // Destroy the domain instead of asking the guest to power itself off.
+  //
+  // Unset asks the guest, so pulling the plug on it is something a caller opts into.
+  bool force = 2;
+}
+
+message VirtualMachineStopResponse {}
+
+message VirtualMachineRebootRequest {
+  // Name of the virtual machine, which must be running.
+  string name = 1;
+  // Destroy the domain instead of asking the guest to restart itself.
+  //
+  // Unset asks the guest, so pulling the plug on it is something a caller opts into.
+  bool force = 2;
+}
+
+message VirtualMachineRebootResponse {}
+
+message ConsoleRequest {
+  oneof request {
+    ConsoleAttach attach = 1;
+    bytes stdin_data = 2;
+  }
+}
+
+message ConsoleAttach {
+  string name = 1;
+}
+
+message ConsoleResponse {
+  bytes stdout_data = 1;
+}

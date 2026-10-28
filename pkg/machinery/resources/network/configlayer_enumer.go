@@ -34,15 +34,18 @@ func _ConfigLayerNoOp() {
 var _ConfigLayerValues = []ConfigLayer{ConfigDefault, ConfigCmdline, ConfigPlatform, ConfigOperator, ConfigMachineConfiguration}
 
 var _ConfigLayerNameToValueMap = map[string]ConfigLayer{
-	_ConfigLayerName[0:7]:        ConfigDefault,
+	_ConfigLayerName[0:7]:   ConfigDefault,
+	_ConfigLayerName[7:14]:  ConfigCmdline,
+	_ConfigLayerName[14:22]: ConfigPlatform,
+	_ConfigLayerName[22:30]: ConfigOperator,
+	_ConfigLayerName[30:43]: ConfigMachineConfiguration,
+}
+
+var _ConfigLayerLowerNameToValueMap = map[string]ConfigLayer{
 	_ConfigLayerLowerName[0:7]:   ConfigDefault,
-	_ConfigLayerName[7:14]:       ConfigCmdline,
 	_ConfigLayerLowerName[7:14]:  ConfigCmdline,
-	_ConfigLayerName[14:22]:      ConfigPlatform,
 	_ConfigLayerLowerName[14:22]: ConfigPlatform,
-	_ConfigLayerName[22:30]:      ConfigOperator,
 	_ConfigLayerLowerName[22:30]: ConfigOperator,
-	_ConfigLayerName[30:43]:      ConfigMachineConfiguration,
 	_ConfigLayerLowerName[30:43]: ConfigMachineConfiguration,
 }
 
@@ -61,7 +64,7 @@ func ConfigLayerString(s string) (ConfigLayer, error) {
 		return val, nil
 	}
 
-	if val, ok := _ConfigLayerNameToValueMap[strings.ToLower(s)]; ok {
+	if val, ok := _ConfigLayerLowerNameToValueMap[strings.ToLower(s)]; ok {
 		return val, nil
 	}
 	return 0, fmt.Errorf("%s does not belong to ConfigLayer values", s)
@@ -101,11 +104,11 @@ func (i *ConfigLayer) UnmarshalText(text []byte) error {
 	return err
 }
 
-const _OperatorName = "dhcp4dhcp6vip"
+const _OperatorName = "dhcp4dhcp6viplldp"
 
-var _OperatorIndex = [...]uint8{0, 5, 10, 13}
+var _OperatorIndex = [...]uint8{0, 5, 10, 13, 17}
 
-const _OperatorLowerName = "dhcp4dhcp6vip"
+const _OperatorLowerName = "dhcp4dhcp6viplldp"
 
 func (i Operator) String() string {
 	if i < 0 || i >= Operator(len(_OperatorIndex)-1) {
@@ -121,23 +124,30 @@ func _OperatorNoOp() {
 	_ = x[OperatorDHCP4-(0)]
 	_ = x[OperatorDHCP6-(1)]
 	_ = x[OperatorVIP-(2)]
+	_ = x[OperatorLLDP-(3)]
 }
 
-var _OperatorValues = []Operator{OperatorDHCP4, OperatorDHCP6, OperatorVIP}
+var _OperatorValues = []Operator{OperatorDHCP4, OperatorDHCP6, OperatorVIP, OperatorLLDP}
 
 var _OperatorNameToValueMap = map[string]Operator{
-	_OperatorName[0:5]:        OperatorDHCP4,
+	_OperatorName[0:5]:   OperatorDHCP4,
+	_OperatorName[5:10]:  OperatorDHCP6,
+	_OperatorName[10:13]: OperatorVIP,
+	_OperatorName[13:17]: OperatorLLDP,
+}
+
+var _OperatorLowerNameToValueMap = map[string]Operator{
 	_OperatorLowerName[0:5]:   OperatorDHCP4,
-	_OperatorName[5:10]:       OperatorDHCP6,
 	_OperatorLowerName[5:10]:  OperatorDHCP6,
-	_OperatorName[10:13]:      OperatorVIP,
 	_OperatorLowerName[10:13]: OperatorVIP,
+	_OperatorLowerName[13:17]: OperatorLLDP,
 }
 
 var _OperatorNames = []string{
 	_OperatorName[0:5],
 	_OperatorName[5:10],
 	_OperatorName[10:13],
+	_OperatorName[13:17],
 }
 
 // OperatorString retrieves an enum value from the enum constants string name.
@@ -147,7 +157,7 @@ func OperatorString(s string) (Operator, error) {
 		return val, nil
 	}
 
-	if val, ok := _OperatorNameToValueMap[strings.ToLower(s)]; ok {
+	if val, ok := _OperatorLowerNameToValueMap[strings.ToLower(s)]; ok {
 		return val, nil
 	}
 	return 0, fmt.Errorf("%s does not belong to Operator values", s)

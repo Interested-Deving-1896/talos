@@ -10,8 +10,8 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/google/cel-go/cel"
-	"github.com/google/cel-go/common/types"
+	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/common/types"
 	"github.com/siderolabs/protoenc"
 	"go.yaml.in/yaml/v4"
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
@@ -80,7 +80,7 @@ func parseExpressionWithOutputType(expression string, env *cel.Env, expectedType
 	return ast, nil
 }
 
-// Merge imlements merge.Mergeable.
+// Merge implements the merger interface: the expression is replaced as a whole.
 func (expr *Expression) Merge(v any) error {
 	other, ok := v.(Expression)
 	if !ok {

@@ -147,7 +147,7 @@ func (suite *PlatformConfigApplySuite) TestRoutes() {
 	suite.Create(platformConfig)
 
 	ctest.AssertResources(suite, []string{
-		"platform/inet4/10.0.0.1//1024",
+		"platform/inet4//1024",
 	}, func(r *network.RouteSpec, asrt *assert.Assertions) {
 		spec := r.TypedSpec()
 
@@ -205,6 +205,33 @@ func (suite *PlatformConfigApplySuite) TestResolvers() {
 		asrt.Equal([]network.NameServerSpec{{Addr: netip.MustParseAddr("1.1.1.1")}}, spec.NameServers)
 		asrt.Equal(network.ConfigPlatform, spec.ConfigLayer)
 	}, rtestutils.WithNamespace(network.ConfigNamespaceName))
+}
+
+func (suite *PlatformConfigApplySuite) TestInvalidNames() {
+	platformConfig := network.NewPlatformConfig(network.NamespaceName, network.PlatformConfigActiveID)
+	platformConfig.TypedSpec().Hostnames = []network.HostnameSpecSpec{
+		{
+			Hostname:    "node1",
+			Domainname:  "poc.example\nregistry.k8s.io",
+			ConfigLayer: network.ConfigPlatform,
+		},
+	}
+	platformConfig.TypedSpec().Resolvers = []network.ResolverSpecSpec{
+		{
+			NameServers:   []network.NameServerSpec{{Addr: netip.MustParseAddr("1.1.1.1")}},
+			SearchDomains: []string{"legit.example", "poc.example foo.bar"},
+			ConfigLayer:   network.ConfigPlatform,
+		},
+	}
+	suite.Create(platformConfig)
+
+	// search domains are filtered
+	ctest.AssertResource(suite, "platform/resolvers", func(r *network.ResolverSpec, asrt *assert.Assertions) {
+		asrt.Equal([]string{"legit.example"}, r.TypedSpec().SearchDomains)
+	}, rtestutils.WithNamespace(network.ConfigNamespaceName))
+
+	// invalid hostname is not populated
+	ctest.AssertNoResource[*network.HostnameSpec](suite, "platform/hostname", rtestutils.WithNamespace(network.ConfigNamespaceName))
 }
 
 func (suite *PlatformConfigApplySuite) TestTimeServers() {
@@ -314,17 +341,15 @@ func TestPlatformConfigApplySuite(t *testing.T) {
 	t.Parallel()
 
 	suite.Run(t, &PlatformConfigApplySuite{
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 5 * time.Second,
-			AfterSetup: func(suite *ctest.DefaultSuite) {
-				suite.Require().NoError(
-					suite.Runtime().RegisterController(
-						&netctrl.PlatformConfigApplyController{
-							V1alpha1Platform: &metal.Metal{},
-						},
-					),
-				)
-			},
+		Timeout: 5 * time.Second,
+		AfterSetup: func(suite *ctest.DefaultSuite) {
+			suite.Require().NoError(
+				suite.Runtime().RegisterController(
+					&netctrl.PlatformConfigApplyController{
+						V1alpha1Platform: &metal.Metal{},
+					},
+				),
+			)
 		},
 	})
 }

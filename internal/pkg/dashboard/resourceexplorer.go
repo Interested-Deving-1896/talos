@@ -21,7 +21,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"k8s.io/client-go/util/jsonpath"
 
+	"github.com/siderolabs/talos/internal/pkg/dashboard/utils"
 	"github.com/siderolabs/talos/pkg/machinery/client"
+	"github.com/siderolabs/talos/pkg/machinery/redactable"
 )
 
 const (
@@ -289,7 +291,7 @@ func (widget *ResourceExplorerGrid) loadResourceTypes() {
 		NotSelectable: true,
 	})
 
-	ctx := nodeContext(widget.ctx, widget.selectedNode)
+	ctx := widget.nodeContext(widget.ctx)
 
 	go func() {
 		list, err := safe.StateListAll[*meta.ResourceDefinition](ctx, widget.dashboard.cli.COSI)
@@ -297,7 +299,7 @@ func (widget *ResourceExplorerGrid) loadResourceTypes() {
 			widget.app.QueueUpdateDraw(func() {
 				widget.initTypesTableHeader()
 				widget.typesTable.SetCell(1, 0, &tview.TableCell{
-					Text:          fmt.Sprintf("[red]%s[-]", formatError(err)),
+					Text:          fmt.Sprintf("[red]%s[-]", tview.Escape(formatError(err))),
 					NotSelectable: true,
 				})
 			})
@@ -360,19 +362,19 @@ func (widget *ResourceExplorerGrid) renderTypesTable() {
 		}
 
 		widget.typesTable.SetCell(row, 0, &tview.TableCell{
-			Text:      spec.Type,
+			Text:      tview.Escape(spec.Type),
 			Align:     tview.AlignLeft,
-			Color:     tcell.ColorWhite,
+			Color:     tcell.ColorDefault,
 			Reference: rd, // used by selectResourceType to retrieve the RD
 			Expansion: 1,
 		})
 		widget.typesTable.SetCell(row, 1, &tview.TableCell{
-			Text:  spec.DefaultNamespace,
+			Text:  tview.Escape(spec.DefaultNamespace),
 			Align: tview.AlignLeft,
-			Color: tcell.ColorWhite,
+			Color: tcell.ColorDefault,
 		})
 		widget.typesTable.SetCell(row, 2, &tview.TableCell{
-			Text:  strings.Join(spec.Aliases, ", "),
+			Text:  tview.Escape(strings.Join(spec.Aliases, ", ")),
 			Align: tview.AlignLeft,
 			Color: tcell.ColorGray,
 		})
@@ -490,17 +492,15 @@ func (widget *ResourceExplorerGrid) renderResourceTable() {
 		md := res.Metadata()
 
 		phaseText := tview.Escape(md.Phase().String())
-		phaseColor := tcell.ColorWhite
 
 		if md.Phase() == resource.PhaseTearingDown {
 			phaseText = "[red]" + phaseText + "[-]"
-			phaseColor = tcell.ColorDefault
 		}
 
 		widget.resourceTable.SetCell(i+1, 0, &tview.TableCell{
 			Text:      tview.Escape(md.ID()),
 			Align:     tview.AlignLeft,
-			Color:     tcell.ColorWhite,
+			Color:     tcell.ColorDefault,
 			Expansion: 1,
 		})
 		widget.resourceTable.SetCell(i+1, 1, &tview.TableCell{
@@ -511,7 +511,7 @@ func (widget *ResourceExplorerGrid) renderResourceTable() {
 		widget.resourceTable.SetCell(i+1, 2, &tview.TableCell{
 			Text:  phaseText,
 			Align: tview.AlignLeft,
-			Color: phaseColor,
+			Color: tcell.ColorDefault,
 		})
 		widget.resourceTable.SetCell(i+1, 3, &tview.TableCell{
 			Text:  tview.Escape(md.Owner()),
@@ -531,7 +531,7 @@ func (widget *ResourceExplorerGrid) renderResourceTable() {
 				widget.resourceTable.SetCell(i+1, 4+j, &tview.TableCell{
 					Text:  tview.Escape(text),
 					Align: tview.AlignLeft,
-					Color: tcell.ColorWhite,
+					Color: tcell.ColorDefault,
 				})
 			}
 		}
@@ -570,7 +570,7 @@ func (widget *ResourceExplorerGrid) stopResourceWatch() {
 //
 //nolint:gocyclo
 func (widget *ResourceExplorerGrid) runResourceWatch(ctx context.Context, rd *meta.ResourceDefinition) {
-	nodeCtx := nodeContext(ctx, widget.selectedNode)
+	nodeCtx := widget.nodeContext(ctx)
 
 	spec := rd.TypedSpec()
 
@@ -693,27 +693,7 @@ func (widget *ResourceExplorerGrid) selectResource(row int) {
 
 // showResourceYAML renders the YAML of the given resource and shows the YAML view.
 func (widget *ResourceExplorerGrid) showResourceYAML(res resource.Resource) {
-	out, err := resource.MarshalYAML(res)
-	if err != nil {
-		widget.yamlView.SetText(fmt.Sprintf("Error marshaling resource: %v", err))
-	} else {
-		outBytes, marshalErr := yaml.Marshal(out)
-		if marshalErr != nil {
-			widget.yamlView.SetText(fmt.Sprintf("Error encoding YAML: %v", marshalErr))
-		} else {
-			var node yaml.Node
-
-			if unmarshalErr := yaml.Unmarshal(outBytes, &node); unmarshalErr != nil {
-				widget.yamlView.SetText(fmt.Sprintf("Error encoding YAML: %v", unmarshalErr))
-			} else {
-				var sb strings.Builder
-
-				renderYAMLNode(&sb, &node, 0, false)
-				widget.yamlView.SetText(sb.String())
-			}
-		}
-	}
-
+	widget.yamlView.SetText(resourceYAMLText(res))
 	widget.yamlView.SetTitle(fmt.Sprintf(" %s / %s (Esc: back) ", res.Metadata().Namespace(), res.Metadata().ID()))
 	widget.yamlView.ScrollToBeginning()
 	widget.level = 2
@@ -738,6 +718,16 @@ func (widget *ResourceExplorerGrid) goBack() {
 	}
 }
 
+// nodeContext builds the context for a COSI call made by the explorer.
+//
+// Besides targeting the selected node, it tells the node that the explorer can display a redacted
+// resource: a sensitive resource which knows how to redact itself is then browsable without the
+// os:admin role, with its secrets replaced, instead of being refused outright. A sensitive resource
+// which cannot be redacted is still denied, which is what formatError explains.
+func (widget *ResourceExplorerGrid) nodeContext(ctx context.Context) context.Context {
+	return redactable.WithMode(utils.NodeContext(ctx, widget.selectedNode), redactable.ModeAccept)
+}
+
 // formatError returns a user-friendly error message.
 // Permission denied errors are given a clear explanation since sensitive resources
 // are only accessible with elevated privileges.
@@ -747,6 +737,32 @@ func formatError(err error) string {
 	}
 
 	return err.Error()
+}
+
+// resourceYAMLText renders a resource as tview-colored YAML, or an error message when it cannot
+// be marshaled.
+func resourceYAMLText(res resource.Resource) string {
+	out, err := resource.MarshalYAML(res)
+	if err != nil {
+		return tview.Escape(fmt.Sprintf("Error marshaling resource: %v", err))
+	}
+
+	outBytes, err := yaml.Marshal(out)
+	if err != nil {
+		return tview.Escape(fmt.Sprintf("Error encoding YAML: %v", err))
+	}
+
+	var node yaml.Node
+
+	if err = yaml.Unmarshal(outBytes, &node); err != nil {
+		return tview.Escape(fmt.Sprintf("Error encoding YAML: %v", err))
+	}
+
+	var sb strings.Builder
+
+	renderYAMLNode(&sb, &node, 0, false)
+
+	return sb.String()
 }
 
 // renderYAMLNode walks a yaml.Node AST and writes a tview-colored representation
@@ -867,6 +883,6 @@ func headerCell(text string) *tview.TableCell {
 		Text:          "[::b]" + text,
 		Align:         tview.AlignLeft,
 		NotSelectable: true,
-		Color:         tcell.ColorWhite,
+		Color:         tcell.ColorDefault,
 	}
 }

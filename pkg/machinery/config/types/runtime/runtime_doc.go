@@ -34,6 +34,13 @@ func (KmsgLogV1Alpha1) Doc() *encoder.Doc {
 				Description: "The URL encodes the log destination.\nThe scheme must be tcp:// or udp://.\nThe path must be empty.\nThe port is required.",
 				Comments:    [3]string{"" /* encoder.HeadComment */, "The URL encodes the log destination." /* encoder.LineComment */, "" /* encoder.FootComment */},
 			},
+			{
+				Name:        "extraTags",
+				Type:        "map[string]string",
+				Note:        "",
+				Description: "Extra tags (key-value) pairs to attach to every kernel log message sent.\nThe keys `facility`, `seq`, `clock`, `priority`, `msg`, `talos-time`, and `talos-level` are reserved and rejected.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Extra tags (key-value) pairs to attach to every kernel log message sent." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
 		},
 	}
 
@@ -132,6 +139,13 @@ func (OOMV1Alpha1) Doc() *encoder.Doc {
 				Comments:    [3]string{"" /* encoder.HeadComment */, "This expression defines how to rank cgroups for OOM handler." /* encoder.LineComment */, "" /* encoder.FootComment */},
 			},
 			{
+				Name:        "strictCgroupClassOrdering",
+				Type:        "bool",
+				Note:        "",
+				Description: "Whether to enforce strict QoS class ordering when selecting an OOM victim.\n\nWhen enabled (the default), cgroups in the lowest-importance QoS class are\nkilled first, and the ranking score only breaks ties within a class.\nWhen disabled, the highest-scoring cgroup is killed regardless of class.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Whether to enforce strict QoS class ordering when selecting an OOM victim." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
 				Name:        "sampleInterval",
 				Type:        "Duration",
 				Note:        "",
@@ -142,6 +156,259 @@ func (OOMV1Alpha1) Doc() *encoder.Doc {
 	}
 
 	doc.AddExample("", exampleOOMV1Alpha1())
+
+	return doc
+}
+
+func (SysctlConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "SysctlConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "SysctlConfig configures Linux kernel sysctl values." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "SysctlConfig configures Linux kernel sysctl values.",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "params",
+				Type:        "map[string]string",
+				Note:        "",
+				Description: "Used to configure the machine's sysctls (kernel parameters under `/proc/sys`).\nValues from this document are merged with the deprecated v1alpha1 machine.sysctls values (if set),\nwith this document taking precedence on key conflicts.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Used to configure the machine's sysctls (kernel parameters under `/proc/sys`)." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.AddExample("", exampleSysctlConfigV1Alpha1())
+
+	doc.Fields[1].AddExample("SysctlConfig usage example.", exampleSysctlParams())
+
+	return doc
+}
+
+func (SysfsConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "SysfsConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "SysfsConfig configures Linux kernel sysfs values." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "SysfsConfig configures Linux kernel sysfs values.",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "params",
+				Type:        "map[string]string",
+				Note:        "",
+				Description: "Used to configure the machine's sysfs (kernel attributes under `/sys`).\nValues from this document are merged with the deprecated v1alpha1 machine.sysfs values (if set),\nwith this document taking precedence on key conflicts.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Used to configure the machine's sysfs (kernel attributes under `/sys`)." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.AddExample("", exampleSysfsConfigV1Alpha1())
+
+	doc.Fields[1].AddExample("SysfsConfig usage example.", exampleSysfsParams())
+
+	return doc
+}
+
+func (EtcFileConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "EtcFileConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "EtcFileConfig configures a user-managed file under /etc." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "EtcFileConfig configures a user-managed file under /etc.",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "name",
+				Type:        "string",
+				Note:        "",
+				Description: "Path of the file relative to `/etc`.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Path of the file relative to `/etc`." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "mode",
+				Type:        "EtcFileMode",
+				Note:        "",
+				Description: "The file's permissions in octal.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "The file's permissions in octal." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "contents",
+				Type:        "string",
+				Note:        "",
+				Description: "The contents of the file.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "The contents of the file." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.AddExample("", exampleEtcFileConfigV1Alpha1())
+
+	return doc
+}
+
+func (UdevRulesConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "UdevRulesConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "UdevRulesConfig is a udev rules config document." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "UdevRulesConfig is a udev rules config document.",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "rules",
+				Type:        "[]string",
+				Note:        "",
+				Description: "Custom udev rules.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Custom udev rules." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.AddExample("", exampleUdevRulesConfigV1Alpha1())
+
+	return doc
+}
+
+func (UnattendedInstallConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "UnattendedInstallConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "UnattendedInstallConfig is an UnattendedInstallConfig config document." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "UnattendedInstallConfig is an UnattendedInstallConfig config document.",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "reboot",
+				Type:        "bool",
+				Note:        "",
+				Description: "Reboot is a flag to indicate if the system should reboot after installation.\nIf not set, Talos will reboot only if the installer.image is set.\n",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Reboot is a flag to indicate if the system should reboot after installation." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "installer",
+				Type:        "InstallerSpec",
+				Note:        "",
+				Description: "The installer describes the source of the installation.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "The installer describes the source of the installation." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "provisioning",
+				Type:        "ProvisioningSpec",
+				Note:        "",
+				Description: "The provisioning describes how the installation disk should be provisioned.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "The provisioning describes how the installation disk should be provisioned." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.AddExample("", exampleUnattendedInstallConfigV1Alpha1())
+
+	doc.Fields[2].AddExample("", exampleInstallerSpec())
+
+	return doc
+}
+
+func (InstallerSpec) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "InstallerSpec",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "InstallerSpec describes the installer to perform the installation." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "InstallerSpec describes the installer to perform the installation.",
+		AppearsIn: []encoder.Appearance{
+			{
+				TypeName:  "UnattendedInstallConfigV1Alpha1",
+				FieldName: "installer",
+			},
+		},
+		Fields: []encoder.Doc{
+			{
+				Name:        "image",
+				Type:        "string",
+				Note:        "",
+				Description: "Allows for supplying the image used to perform the installation.\nImage reference for each Talos release can be found on\n[GitHub releases page](https://github.com/siderolabs/talos/releases).\n\nIf not set, it will run installer based on the current Talos version\nand current schematic (this requires booting asset built by Image\nFactory).",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Allows for supplying the image used to perform the installation." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.AddExample("", exampleInstallerSpec())
+
+	doc.Fields[0].AddExample("", "factory.talos.dev/metal-installer/376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba:latest")
+
+	return doc
+}
+
+func (ProvisioningSpec) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "ProvisioningSpec",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "ProvisioningSpec describes how the Physical Volumes are provisioned." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "ProvisioningSpec describes how the Physical Volumes are provisioned.",
+		AppearsIn: []encoder.Appearance{
+			{
+				TypeName:  "UnattendedInstallConfigV1Alpha1",
+				FieldName: "provisioning",
+			},
+		},
+		Fields: []encoder.Doc{
+			{
+				Name:        "diskSelector",
+				Type:        "DiskSelectorSpec",
+				Note:        "",
+				Description: "Matches disks to initialize as physical volumes.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Matches disks to initialize as physical volumes." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "wipe",
+				Type:        "bool",
+				Note:        "",
+				Description: "Indicates if the installation disk should be wiped at installation time.\nDefaults to `true`.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Indicates if the installation disk should be wiped at installation time." /* encoder.LineComment */, "" /* encoder.FootComment */},
+				Values: []string{
+					"true",
+					"yes",
+					"false",
+					"no",
+				},
+			},
+		},
+	}
+
+	return doc
+}
+
+func (DiskSelectorSpec) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "DiskSelectorSpec",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "DiskSelectorSpec matches disks with CEL." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "DiskSelectorSpec matches disks with CEL.",
+		AppearsIn: []encoder.Appearance{
+			{
+				TypeName:  "ProvisioningSpec",
+				FieldName: "diskSelector",
+			},
+		},
+		Fields: []encoder.Doc{
+			{
+				Name:        "match",
+				Type:        "Expression",
+				Note:        "",
+				Description: "CEL expression matching a disk.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "CEL expression matching a disk." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.Fields[0].AddExample("match raw volume partitions labeled r-lvm*", exampleDiskSelector())
 
 	return doc
 }
@@ -180,6 +447,352 @@ func (WatchdogTimerV1Alpha1) Doc() *encoder.Doc {
 	return doc
 }
 
+func (KernelModuleConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "KernelModuleConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "KernelModuleConfig is a config document to configure a Linux kernel module to load." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "KernelModuleConfig is a config document to configure a Linux kernel module to load.\nListed modules are loaded at boot with the given parameters.\n\nModules requested by the kernel on demand (e.g. a driver loading a helper module while probing a device)\nare loaded automatically, whether listed or not, so there is no need to list such modules or to order them;\nthe parameters are applied if the module is listed.\n",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "name",
+				Type:        "string",
+				Note:        "",
+				Description: "Module name.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Module name." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "parameters",
+				Type:        "[]string",
+				Note:        "",
+				Description: "Module parameters, changes applied after reboot.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Module parameters, changes applied after reboot." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.AddExample("", exampleKernelModuleConfigV1Alpha1())
+
+	return doc
+}
+
+func (SecurityProfileConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "SecurityProfileConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "SecurityProfileConfig is a node security profile configuration document." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "SecurityProfileConfig is a node security profile configuration document.\nThe security profile groups node-level security hardening features. Additional hardening options\nwill be added to this document over time.\n\nWorkload isolation runs the container runtime plane (CRI containerd, the kubelet, and all pods)\ninside a dedicated PID and mount namespace anchored by the `sandboxd` service, isolating them from\n`machined` (PID 1) and its file descriptors.\n\n`talosctl gen config` emits this document with `workloadIsolation: true` for Talos 1.14+, so new\nclusters are isolated by default; clusters upgraded from older versions do not have the document and\nkeep the old (non-isolated) behavior unless it is added.\n\nNote: with workload isolation enabled, the deprecated in-tree Kubernetes iSCSI volume plugin does not\nwork (the kubelet cannot reach the host iscsid across the sandbox); use a CSI driver instead.\n\nBy default, Ctrl-Alt-Delete reboots the machine. With `ignoreCtrlAltDelete: true`, Ctrl-Alt-Delete\nis logged and ignored. Ctrl-Alt-Delete still reboots the machine until a configuration with this\noption is applied. The option has no effect in container mode.\n",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "workloadIsolation",
+				Type:        "bool",
+				Note:        "",
+				Description: "Enable workload isolation (run the container plane inside the sandbox namespace).",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Enable workload isolation (run the container plane inside the sandbox namespace)." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "ignoreCtrlAltDelete",
+				Type:        "bool",
+				Note:        "",
+				Description: "Ignore Ctrl-Alt-Delete instead of rebooting the machine.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Ignore Ctrl-Alt-Delete instead of rebooting the machine." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.AddExample("", exampleSecurityProfileConfigV1Alpha1())
+
+	return doc
+}
+
+func (CPUPartitionConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "CPUPartitionConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "CPUPartitionConfig is a CPU partition config document." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "CPUPartitionConfig is a CPU partition config document.\nCPUPartitionConfig declares the host CPUs each fixed Talos workload root may run on.\n\nThe roots are `init`, `system`, `podruntime`, `kubepods`, `taloscontainers` and\n`virtualMachines`. A root left out of the document is unrestricted; a root listed in\nthe document must name at least one CPU. Roots may overlap each other.\n\nThe document does not require virtual machines: omit `virtualMachines` to partition\nthe host services and Kubernetes pods of an ordinary node.\n\nThe virtual machine root may be divided into named, pairwise disjoint slices. An\nexclusive slice must not overlap any other root, and every other root must then be\nbounded explicitly.\n\nIn container mode the document is validated but declares no policy.\n",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "init",
+				Type:        "CPUPartitionRoot",
+				Note:        "",
+				Description: "Host CPUs for machined and the early boot services.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Host CPUs for machined and the early boot services." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "system",
+				Type:        "CPUPartitionRoot",
+				Note:        "",
+				Description: "Host CPUs for Talos system services (apid, trustd, udevd, ...).",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Host CPUs for Talos system services (apid, trustd, udevd, ...)." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "podruntime",
+				Type:        "CPUPartitionRoot",
+				Note:        "",
+				Description: "Host CPUs for the Kubernetes runtime components (containerd, the kubelet, etcd).",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Host CPUs for the Kubernetes runtime components (containerd, the kubelet, etcd)." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "kubepods",
+				Type:        "CPUPartitionRoot",
+				Note:        "",
+				Description: "Host CPUs for Kubernetes pods.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Host CPUs for Kubernetes pods." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "taloscontainers",
+				Type:        "CPUPartitionRoot",
+				Note:        "",
+				Description: "Host CPUs for containers declared via `ContainerConfig`.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Host CPUs for containers declared via `ContainerConfig`." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "virtualMachines",
+				Type:        "CPUPartitionVirtualMachines",
+				Note:        "",
+				Description: "Host CPUs for virtual machines, optionally divided into named slices.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Host CPUs for virtual machines, optionally divided into named slices." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.AddExample("Kubernetes node with host services and pods on separate CPUs.", exampleCPUPartitionConfigV1Alpha1())
+
+	doc.AddExample("Virtual machine root with an exclusive slice.", exampleCPUPartitionConfigV1Alpha1Slices())
+
+	return doc
+}
+
+func (CPUPartitionRoot) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "CPUPartitionRoot",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "CPUPartitionRoot bounds one fixed root to a set of host CPUs." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "CPUPartitionRoot bounds one fixed root to a set of host CPUs.",
+		AppearsIn: []encoder.Appearance{
+			{
+				TypeName:  "CPUPartitionConfigV1Alpha1",
+				FieldName: "init",
+			},
+			{
+				TypeName:  "CPUPartitionConfigV1Alpha1",
+				FieldName: "system",
+			},
+			{
+				TypeName:  "CPUPartitionConfigV1Alpha1",
+				FieldName: "podruntime",
+			},
+			{
+				TypeName:  "CPUPartitionConfigV1Alpha1",
+				FieldName: "kubepods",
+			},
+			{
+				TypeName:  "CPUPartitionConfigV1Alpha1",
+				FieldName: "taloscontainers",
+			},
+		},
+		Fields: []encoder.Doc{
+			{
+				Name:        "cpus",
+				Type:        "string",
+				Note:        "",
+				Description: "Host CPUs as a Linux CPU list, e.g. `0-1` or `0,2-3`.\n\nCPU IDs are the kernel's logical CPU numbers, SMT threads included.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Host CPUs as a Linux CPU list, e.g. `0-1` or `0,2-3`." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.Fields[0].AddExample("", "0-1")
+
+	return doc
+}
+
+func (CPUPartitionVirtualMachines) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "CPUPartitionVirtualMachines",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "CPUPartitionVirtualMachines bounds the virtual machine root and divides it into slices." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "CPUPartitionVirtualMachines bounds the virtual machine root and divides it into slices.",
+		AppearsIn: []encoder.Appearance{
+			{
+				TypeName:  "CPUPartitionConfigV1Alpha1",
+				FieldName: "virtualMachines",
+			},
+		},
+		Fields: []encoder.Doc{
+			{
+				Name:        "cpus",
+				Type:        "string",
+				Note:        "",
+				Description: "Host CPUs of the virtual machine root, as a Linux CPU list.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Host CPUs of the virtual machine root, as a Linux CPU list." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "slices",
+				Type:        "[]CPUPartitionSlice",
+				Note:        "",
+				Description: "Named, pairwise disjoint subsets of `cpus`.\n\nA configuration patch replaces this list as a whole.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Named, pairwise disjoint subsets of `cpus`." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.Fields[0].AddExample("", "4-7")
+
+	return doc
+}
+
+func (CPUPartitionSlice) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "CPUPartitionSlice",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "CPUPartitionSlice is one named subset of the virtual machine root." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "CPUPartitionSlice is one named subset of the virtual machine root.",
+		AppearsIn: []encoder.Appearance{
+			{
+				TypeName:  "CPUPartitionVirtualMachines",
+				FieldName: "slices",
+			},
+		},
+		Fields: []encoder.Doc{
+			{
+				Name:        "name",
+				Type:        "string",
+				Note:        "",
+				Description: "Unique slice name: 1 to 63 ASCII letters, digits and hyphens. `shared` is reserved.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Unique slice name: 1 to 63 ASCII letters, digits and hyphens. `shared` is reserved." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "cpus",
+				Type:        "string",
+				Note:        "",
+				Description: "Host CPUs of the slice, as a Linux CPU list within the virtual machine root.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Host CPUs of the slice, as a Linux CPU list within the virtual machine root." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "exclusive",
+				Type:        "bool",
+				Note:        "",
+				Description: "Keep the slice's CPUs out of every other root.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Keep the slice's CPUs out of every other root." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.Fields[0].AddExample("", "database")
+	doc.Fields[1].AddExample("", "6-7")
+
+	return doc
+}
+
+func (WorkloadResourceConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "WorkloadResourceConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "WorkloadResourceConfig is a workload resource config document." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "WorkloadResourceConfig is a workload resource config document.\nWorkloadResourceConfig declares an aggregate memory ceiling for each Talos workload root.\n\nThe roots are `kubepods`, `taloscontainers` and `virtualMachines`; every root is optional\nand independent of the others. Omitting a root removes its aggregate cap; individual child\nlimits still apply.\nA limit must be positive; it is rounded down to the host page size before it is applied,\nand bounds RAM only (including page cache charged to the root): swap and hugepages are\nnot limited by it.\n\nTalos exclusively owns `memory.max` on `/taloscontainers` and `/virtualmachines.partition`,\neven without this document. An omitted limit (zero internally) means an unlimited aggregate cap.\nKubelet reserved-memory enforcement on these roots is rejected; CPU-only or compressible\nenforcement is allowed. Static validation cannot inspect external kubelet drop-in files;\ndrop-in directories are rejected while any workload cap is active.\nLowering a limit below current usage makes the kernel reclaim and OOM-kill within that root,\nwhich can terminate containers or virtual machines.\n\nThe `kubepods` limit is applied by the kubelet, which stays the only writer of its cgroup:\nTalos derives `systemReserved.memory` from the limit, so changing it restarts the kubelet,\nand a limit below the memory used by pods (control plane static pods included) causes\nOOM kills. The schedulable Node Allocatable is the limit minus the hard eviction\nthreshold and any hugepage capacity, so it is lower than the limit. Setting\n`systemReserved.memory`, the equivalent kubelet command line flags or the `Static` memory\nmanager policy together with the limit is rejected. The limit is inactive while Kubernetes\nis not configured on the machine; the other roots are enforced regardless.\n\nIn container mode the document is validated but declares no policy.\n",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "kubepods",
+				Type:        "WorkloadResourceRoot",
+				Note:        "",
+				Description: "Limits for Kubernetes pods.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Limits for Kubernetes pods." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "taloscontainers",
+				Type:        "WorkloadResourceRoot",
+				Note:        "",
+				Description: "Limits for containers declared via `ContainerConfig`.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Limits for containers declared via `ContainerConfig`." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "virtualMachines",
+				Type:        "WorkloadResourceRoot",
+				Note:        "",
+				Description: "Limits for virtual machines.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Limits for virtual machines." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.AddExample("Kubernetes node with containers and virtual machines.", exampleWorkloadResourceConfigV1Alpha1())
+
+	doc.AddExample("Virtual machine host without Kubernetes.", exampleWorkloadResourceConfigV1Alpha1VirtualMachines())
+
+	return doc
+}
+
+func (WorkloadResourceRoot) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "WorkloadResourceRoot",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "WorkloadResourceRoot holds the limits of one workload root." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "WorkloadResourceRoot holds the limits of one workload root.",
+		AppearsIn: []encoder.Appearance{
+			{
+				TypeName:  "WorkloadResourceConfigV1Alpha1",
+				FieldName: "kubepods",
+			},
+			{
+				TypeName:  "WorkloadResourceConfigV1Alpha1",
+				FieldName: "taloscontainers",
+			},
+			{
+				TypeName:  "WorkloadResourceConfigV1Alpha1",
+				FieldName: "virtualMachines",
+			},
+		},
+		Fields: []encoder.Doc{
+			{
+				Name:        "memory",
+				Type:        "WorkloadMemoryResource",
+				Note:        "",
+				Description: "Memory limits of the root.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Memory limits of the root." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	return doc
+}
+
+func (WorkloadMemoryResource) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "WorkloadMemoryResource",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "WorkloadMemoryResource bounds the memory of one workload root." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "WorkloadMemoryResource bounds the memory of one workload root.",
+		AppearsIn: []encoder.Appearance{
+			{
+				TypeName:  "WorkloadResourceRoot",
+				FieldName: "memory",
+			},
+		},
+		Fields: []encoder.Doc{
+			{
+				Name:        "limit",
+				Type:        "ByteSize",
+				Note:        "",
+				Description: "Aggregate memory ceiling of the root, in bytes.\n\nThe value can be expressed in human readable format, e.g. 16GiB, and must be positive.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Aggregate memory ceiling of the root, in bytes." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.Fields[0].AddExample("", "16GiB")
+
+	return doc
+}
+
 // GetFileDoc returns documentation for the file runtime_doc.go.
 func GetFileDoc() *encoder.FileDoc {
 	return &encoder.FileDoc{
@@ -190,7 +803,24 @@ func GetFileDoc() *encoder.FileDoc {
 			EventSinkV1Alpha1{}.Doc(),
 			EnvironmentV1Alpha1{}.Doc(),
 			OOMV1Alpha1{}.Doc(),
+			SysctlConfigV1Alpha1{}.Doc(),
+			SysfsConfigV1Alpha1{}.Doc(),
+			EtcFileConfigV1Alpha1{}.Doc(),
+			UdevRulesConfigV1Alpha1{}.Doc(),
+			UnattendedInstallConfigV1Alpha1{}.Doc(),
+			InstallerSpec{}.Doc(),
+			ProvisioningSpec{}.Doc(),
+			DiskSelectorSpec{}.Doc(),
 			WatchdogTimerV1Alpha1{}.Doc(),
+			KernelModuleConfigV1Alpha1{}.Doc(),
+			SecurityProfileConfigV1Alpha1{}.Doc(),
+			CPUPartitionConfigV1Alpha1{}.Doc(),
+			CPUPartitionRoot{}.Doc(),
+			CPUPartitionVirtualMachines{}.Doc(),
+			CPUPartitionSlice{}.Doc(),
+			WorkloadResourceConfigV1Alpha1{}.Doc(),
+			WorkloadResourceRoot{}.Doc(),
+			WorkloadMemoryResource{}.Doc(),
 		},
 	}
 }

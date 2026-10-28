@@ -5,20 +5,33 @@
 package container_test
 
 import (
+	"context"
 	"net/netip"
 	"net/url"
 	"testing"
 
+	"github.com/cosi-project/runtime/pkg/state"
+	"github.com/cosi-project/runtime/pkg/state/impl/inmem"
+	"github.com/cosi-project/runtime/pkg/state/impl/namespaced"
 	"github.com/siderolabs/crypto/x509"
 	"github.com/siderolabs/gen/xtesting/must"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/siderolabs/talos/pkg/machinery/cel"
+	"github.com/siderolabs/talos/pkg/machinery/cel/celenv"
 	"github.com/siderolabs/talos/pkg/machinery/config/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/block"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/cluster"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/hardware"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/k8s"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/network"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/runtime"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/siderolink"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1"
+	"github.com/siderolabs/talos/pkg/machinery/config/validation"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
 	blockres "github.com/siderolabs/talos/pkg/machinery/resources/block"
@@ -34,7 +47,7 @@ func TestValidateAsClient(t *testing.T) {
 
 	v1alpha1Cfg := &v1alpha1.Config{
 		ClusterConfig: &v1alpha1.ClusterConfig{
-			ControlPlane: &v1alpha1.ControlPlaneConfig{
+			ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing legacy features
 				Endpoint: &v1alpha1.Endpoint{
 					URL: must.Value(url.Parse("https://localhost:6443"))(t),
 				},
@@ -112,7 +125,7 @@ func TestCrossValidateEncryption(t *testing.T) {
 
 	v1alpha1Cfg := &v1alpha1.Config{
 		ClusterConfig: &v1alpha1.ClusterConfig{
-			ControlPlane: &v1alpha1.ControlPlaneConfig{
+			ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing legacy features
 				Endpoint: &v1alpha1.Endpoint{
 					URL: must.Value(url.Parse("https://localhost:6443"))(t),
 				},
@@ -123,7 +136,7 @@ func TestCrossValidateEncryption(t *testing.T) {
 			MachineCA: &x509.PEMEncodedCertificateAndKey{
 				Crt: []byte("cert"),
 			},
-			MachineSystemDiskEncryption: &v1alpha1.SystemDiskEncryptionConfig{
+			MachineSystemDiskEncryption: &v1alpha1.SystemDiskEncryptionConfig{ //nolint:staticcheck // testing legacy features
 				EphemeralPartition: &v1alpha1.EncryptionConfig{
 					EncryptionKeys: []*v1alpha1.EncryptionKey{
 						{
@@ -223,7 +236,7 @@ func TestValidateContainer(t *testing.T) {
 
 	v1alpha1Cfg := &v1alpha1.Config{
 		ClusterConfig: &v1alpha1.ClusterConfig{
-			ControlPlane: &v1alpha1.ControlPlaneConfig{
+			ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing legacy features
 				Endpoint: &v1alpha1.Endpoint{
 					URL: must.Value(url.Parse("https://localhost:6443"))(t),
 				},
@@ -245,10 +258,14 @@ func TestValidateContainer(t *testing.T) {
 		},
 	}
 
+	v1alpha1CfgControlplane := v1alpha1Cfg.DeepCopy()
+	v1alpha1CfgControlplane.MachineConfig.MachineType = "controlplane"
+	v1alpha1CfgControlplane.MachineConfig.MachineCA.Key = []byte("controlplane-key")
+
 	resolverConfig := network.NewResolverConfigV1Alpha1()
 	resolverConfig.ResolverNameservers = []network.NameserverConfig{
 		{
-			Address: network.Addr{Addr: netip.MustParseAddr("1.1.1.1")},
+			Address: meta.Addr{Addr: netip.MustParseAddr("1.1.1.1")},
 		},
 	}
 
@@ -258,10 +275,37 @@ func TestValidateContainer(t *testing.T) {
 		HostDNSForwardKubeDNSToHost: new(true),
 	}
 
+	linkConfigEth0 := network.NewLinkConfigV1Alpha1("eth0")
+	linkConfigEth0.LinkRoutes = []network.RouteConfig{
+		{
+			RouteGateway: meta.Addr{Addr: netip.MustParseAddr("10.0.0.1")},
+		},
+		{
+			RouteDestination: meta.Prefix{Prefix: netip.MustParsePrefix("192.168.0.0/16")},
+			RouteGateway:     meta.Addr{Addr: netip.MustParseAddr("10.0.0.1")},
+		},
+	}
+
+	linkConfigEth1 := network.NewLinkConfigV1Alpha1("eth1")
+	linkConfigEth1.LinkRoutes = []network.RouteConfig{
+		{
+			RouteGateway: meta.Addr{Addr: netip.MustParseAddr("10.1.0.1")},
+		},
+		{
+			RouteGateway: meta.Addr{Addr: netip.MustParseAddr("10.1.0.2")},
+			RouteMetric:  100,
+		},
+		{
+			RouteGateway: meta.Addr{Addr: netip.MustParseAddr("fe80::1")},
+		},
+	}
+
+	blackholeRouteConfig := network.NewBlackholeRouteConfigV1Alpha1("192.168.0.0/16")
+
 	resolverConfigDoT := network.NewResolverConfigV1Alpha1()
 	resolverConfigDoT.ResolverNameservers = []network.NameserverConfig{
 		{
-			Address: network.Addr{
+			Address: meta.Addr{
 				Addr: netip.MustParseAddr("1.1.1.1"),
 			},
 			Protocol:      nethelpers.DNSProtocolDNSOverTLS,
@@ -269,12 +313,64 @@ func TestValidateContainer(t *testing.T) {
 		},
 	}
 
+	kubeEtcdEncryptionConfig := k8s.NewKubeEtcdEncryptionConfigV1Alpha1()
+	kubeEtcdEncryptionConfig.Config = meta.Unstructured{
+		Object: map[string]any{
+			"some": "thing",
+		},
+	}
+
+	kubespanConfig := network.NewKubeSpanV1Alpha1()
+	kubespanConfig.ConfigEnabled = new(true)
+
+	discoveryIdentityConfig := cluster.NewDiscoveryIdentityConfigV1Alpha1(
+		"MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=",
+		"vlf2HU1NEZL3Ezi9Tk+RZBLJUbjnsHnTzs3wK9JNk6Q=",
+	)
+
+	discoveryServiceConfig := cluster.NewDiscoveryServiceConfigV1Alpha1("default", must.Value(url.Parse("https://discovery.api/"))(t))
+
+	apiServerCAConfig := k8s.NewKubeAPIServerCAConfigV1Alpha1()
+
+	// the cluster endpoint was migrated out of the v1alpha1 config
+	v1alpha1CfgControlplaneNoEndpoint := v1alpha1CfgControlplane.DeepCopy()
+	v1alpha1CfgControlplaneNoEndpoint.ClusterConfig.ControlPlane = nil //nolint:staticcheck // testing legacy features
+
+	kubeClusterConfig := k8s.NewKubeClusterConfigV1Alpha1()
+	kubeClusterConfig.ClusterNameConfig = "test-cluster"
+	kubeClusterConfig.ClusterEndpointConfig = meta.URL{URL: must.Value(url.Parse("https://localhost:6443"))(t)}
+
+	// .machine.nodeLabels migrated to the KubeNodeConfig document as-is, without the control plane role label
+	kubeNodeConfig := k8s.NewKubeNodeConfigV1Alpha1()
+	kubeNodeConfig.LabelsConfig = map[string]string{
+		"rack": "r13a25",
+	}
+
+	kubeNodeConfigControlplane := k8s.NewKubeNodeConfigV1Alpha1()
+	kubeNodeConfigControlplane.LabelsConfig = map[string]string{
+		constants.LabelNodeRoleControlPlane: "",
+	}
+	kubeNodeConfigControlplane.TaintsConfig = map[string]string{
+		constants.LabelNodeRoleControlPlane: constants.TaintEffectNoSchedule,
+	}
+
+	kubeNodeConfigStandalone := k8s.NewKubeNodeConfigV1Alpha1()
+	kubeNodeConfigStandalone.SkipNodeRegistrationConfig = new(true)
+
+	encryptedDNSWarning := "all configured nameservers use encrypted DNS (DoT or DoH): validating certificates requires a correct system clock, " +
+		"so boot may stall when NTP servers are configured by hostname; consider keeping at least one plain-DNS fallback or configuring NTP servers by IP address"
+
+	controlPlaneLabelWarning := "KubeNodeConfig document should set the \"node-role.kubernetes.io/control-plane\" node label on control plane machines " +
+		"(and, unless scheduling on control planes is allowed, the \"node-role.kubernetes.io/control-plane: NoSchedule\" taint): " +
+		"unlike .machine.nodeLabels/.machine.nodeTaints, the document contents are used as-is"
+
 	for _, tt := range []struct {
 		name        string
 		documents   []config.Document
 		inContainer bool
 
-		expectedError string
+		expectedWarnings []string
+		expectedError    string
 	}{
 		{
 			name: "empty !container",
@@ -320,13 +416,92 @@ func TestValidateContainer(t *testing.T) {
 			inContainer: true,
 		},
 		{
-			name:          "DoT without hostDNS",
-			documents:     []config.Document{resolverConfigDoT},
-			expectedError: "1 error occurred:\n\t* hostDNS must be enabled when using non-default DNS protocols\n\n",
+			name:             "DoT without hostDNS",
+			documents:        []config.Document{resolverConfigDoT},
+			expectedWarnings: []string{encryptedDNSWarning},
+			expectedError:    "1 error occurred:\n\t* hostDNS must be enabled when using non-default DNS protocols\n\n",
 		},
 		{
-			name:      "DoT with hostDNS",
-			documents: []config.Document{resolverConfigDoT, v1alpha1CfgHostDNS},
+			name:             "DoT with hostDNS",
+			documents:        []config.Document{resolverConfigDoT, v1alpha1CfgHostDNS},
+			expectedWarnings: []string{encryptedDNSWarning},
+		},
+		{
+			name:      "routes with the same key",
+			documents: []config.Document{linkConfigEth0, linkConfigEth1, blackholeRouteConfig},
+			expectedWarnings: []string{
+				`link "eth0" route 0 and link "eth1" route 0 both configure the inet4 route to default with metric 1024 in table main, only one of them is going to be installed`,
+				`link "eth0" route 1 and blackhole route "192.168.0.0/16" both configure the inet4 route to 192.168.0.0/16 with metric 1024 in table main, only one of them is going to be installed`,
+			},
+		},
+		{
+			name:      "controlplane doc only",
+			documents: []config.Document{kubeEtcdEncryptionConfig},
+
+			expectedError: "1 error occurred:\n\t* the following document kinds are only allowed on control plane machines: [KubeEtcdEncryptionConfig]\n\n",
+		},
+		{
+			name:      "controlplane doc with v1alpha1 worker",
+			documents: []config.Document{v1alpha1Cfg, kubeEtcdEncryptionConfig},
+
+			expectedError: "1 error occurred:\n\t* the following document kinds are only allowed on control plane machines: [KubeEtcdEncryptionConfig]\n\n",
+		},
+		{
+			name:      "kubespan without discovery",
+			documents: []config.Document{v1alpha1Cfg, kubespanConfig},
+
+			expectedError: "1 error occurred:\n\t* KubeSpan requires cluster discovery to be enabled\n\n",
+		},
+		{
+			name:      "discovery without identity",
+			documents: []config.Document{discoveryServiceConfig, kubespanConfig},
+
+			expectedError: "2 errors occurred:\n\t* cluster ID (.cluster.id or DiscoveryIdentityConfig) should be set when cluster discovery (DiscoveryServiceConfig) is enabled\n" +
+				"\t* cluster secret (.cluster.secret or DiscoveryIdentityConfig) should be set when cluster discovery (DiscoveryServiceConfig) is enabled\n\n",
+		},
+		{
+			name:      "discovery with kubespan and identity",
+			documents: []config.Document{discoveryServiceConfig, discoveryIdentityConfig, kubespanConfig},
+		},
+		{
+			name:      "api-server CA without etcd encryption",
+			documents: []config.Document{v1alpha1CfgControlplane, apiServerCAConfig},
+
+			expectedError: "1 error occurred:\n\t* etcd encryption config is required for control plane machines running kube-apiserver\n\n",
+		},
+		{
+			// the cluster endpoint was removed from the v1alpha1 config, but the KubeClusterConfig
+			// document was not added: Kubernetes is configured, but there is no way to reach it
+			name:      "api-server CA without cluster endpoint",
+			documents: []config.Document{v1alpha1CfgControlplaneNoEndpoint, apiServerCAConfig, kubeEtcdEncryptionConfig},
+
+			expectedError: "1 error occurred:\n\t* cluster name and endpoint are required when Kubernetes is configured: " +
+				"either .cluster.clusterName/.cluster.controlPlane.endpoint or the KubeClusterConfig document\n\n",
+		},
+		{
+			name:      "api-server CA with migrated cluster endpoint",
+			documents: []config.Document{v1alpha1CfgControlplaneNoEndpoint, apiServerCAConfig, kubeEtcdEncryptionConfig, kubeClusterConfig},
+		},
+		{
+			// the control plane role label is not synthesized for the KubeNodeConfig document
+			name:      "node config without control plane role label",
+			documents: []config.Document{v1alpha1CfgControlplane, kubeNodeConfig},
+
+			expectedWarnings: []string{controlPlaneLabelWarning},
+		},
+		{
+			name:      "node config with control plane role label",
+			documents: []config.Document{v1alpha1CfgControlplane, kubeNodeConfigControlplane},
+		},
+		{
+			// the node is not registered in Kubernetes, so the labels and taints are not used
+			name:      "node config with skipped node registration",
+			documents: []config.Document{v1alpha1CfgControlplane, kubeNodeConfigStandalone},
+		},
+		{
+			// worker machines never get the control plane role label
+			name:      "node config without control plane role label on a worker",
+			documents: []config.Document{v1alpha1Cfg, kubeNodeConfig},
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -335,12 +510,123 @@ func TestValidateContainer(t *testing.T) {
 			ctr, err := container.New(tt.documents...)
 			require.NoError(t, err)
 
-			_, err = ctr.ValidateAsClient(validationMode{inContainer: tt.inContainer})
+			warnings, err := ctr.ValidateAsClient(validationMode{inContainer: tt.inContainer})
+
+			assert.Equal(t, tt.expectedWarnings, warnings)
 
 			if tt.expectedError == "" {
 				require.NoError(t, err)
 			} else {
 				require.EqualError(t, err, tt.expectedError)
+			}
+		})
+	}
+}
+
+func TestRuntimeValidateSystemVolumeBacking(t *testing.T) {
+	t.Parallel()
+
+	const (
+		documentAbsent              = "absent"
+		documentWithoutProvisioning = "directory"
+		documentWithProvisioning    = "partition"
+	)
+
+	for _, test := range []struct {
+		name string
+
+		// document controls the KUBELET VolumeConfig document in the config:
+		// absent (removed), present without provisioning, or present with provisioning.
+		document string
+
+		// current volume to seed into the state (skipped if seedStatus is false).
+		seedStatus   bool
+		currentType  blockres.VolumeType
+		currentPhase blockres.VolumePhase
+
+		expectedErrorContains string
+	}{
+		{
+			name:         "removing config of a ready partition volume is rejected",
+			document:     documentAbsent,
+			seedStatus:   true,
+			currentType:  blockres.VolumeTypePartition,
+			currentPhase: blockres.VolumePhaseReady,
+
+			expectedErrorContains: `the "KUBELET" system volume is backed by a dedicated partition and its VolumeConfig cannot be removed; ` +
+				`migrating a system volume off a dedicated partition is not supported`,
+		},
+		{
+			name:         "removing config of a ready directory volume is allowed",
+			document:     documentAbsent,
+			seedStatus:   true,
+			currentType:  blockres.VolumeTypeDirectory,
+			currentPhase: blockres.VolumePhaseReady,
+		},
+		{
+			name:       "removing config with no established volume is allowed (cluster creation)",
+			document:   documentAbsent,
+			seedStatus: false,
+		},
+		{
+			name:         "removing config of an unsettled partition volume is allowed",
+			document:     documentAbsent,
+			seedStatus:   true,
+			currentType:  blockres.VolumeTypePartition,
+			currentPhase: blockres.VolumePhaseWaiting,
+		},
+		{
+			name:         "demoting via present config (drop provisioning) is still rejected by the per-document guard",
+			document:     documentWithoutProvisioning,
+			seedStatus:   true,
+			currentType:  blockres.VolumeTypePartition,
+			currentPhase: blockres.VolumePhaseReady,
+
+			expectedErrorContains: `the backing of the "KUBELET" system volume cannot be changed after creation (current: partition, requested: directory)`,
+		},
+		{
+			name:         "matching present partition config is allowed",
+			document:     documentWithProvisioning,
+			seedStatus:   true,
+			currentType:  blockres.VolumeTypePartition,
+			currentPhase: blockres.VolumePhaseReady,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			st := state.WrapCore(namespaced.NewState(inmem.Build))
+
+			if test.seedStatus {
+				vs := blockres.NewVolumeStatus(blockres.NamespaceName, constants.KubeletDataVolumeID)
+				vs.TypedSpec().Type = test.currentType
+				vs.TypedSpec().Phase = test.currentPhase
+				require.NoError(t, st.Create(ctx, vs))
+			}
+
+			var documents []config.Document
+
+			if test.document != documentAbsent {
+				vc := block.NewVolumeConfigV1Alpha1()
+				vc.MetaName = constants.KubeletDataVolumeID
+
+				if test.document == documentWithProvisioning {
+					vc.ProvisioningSpec.ProvisioningMaxSize = block.MustSize("5GB")
+				}
+
+				documents = append(documents, vc)
+			}
+
+			ctr, err := container.New(documents...)
+			require.NoError(t, err)
+
+			_, err = ctr.ValidateAtRuntime(ctx, st, validationMode{})
+
+			if test.expectedErrorContains == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, test.expectedErrorContains)
 			}
 		})
 	}
@@ -360,4 +646,368 @@ func (validationMode) RequiresInstall() bool {
 
 func (v validationMode) InContainer() bool {
 	return v.inContainer
+}
+
+// TestCPUScalingSysfsConflict covers the case where CPU frequency scaling is configured twice over:
+// CPUScalingSpecController and KernelParamSpecController would each revert the other forever.
+func TestCPUScalingSysfsConflict(t *testing.T) {
+	t.Parallel()
+
+	scalingCfg := hardware.NewCPUScalingConfigV1Alpha1("all")
+	scalingCfg.Selector.Match = cel.MustExpression(cel.ParseBooleanExpression(`true`, celenv.CPUScalingLocator()))
+	scalingCfg.ScalingGovernor = "performance"
+
+	for _, test := range []struct {
+		name      string
+		sysfsKeys map[string]string
+
+		expectedError string
+	}{
+		{
+			name:          "cpufreq key conflicts",
+			sysfsKeys:     map[string]string{"devices.system.cpu.cpu0.cpufreq.scaling_governor": "powersave"},
+			expectedError: `conflicts with CPUScalingConfig`,
+		},
+		{
+			name:      "unrelated sysfs key is fine",
+			sysfsKeys: map[string]string{"kernel.kexec_load_disabled": "1"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			sysfsCfg := runtime.NewSysfsConfigV1Alpha1()
+			sysfsCfg.Params = test.sysfsKeys
+
+			cfg, err := container.New(scalingCfg, sysfsCfg)
+			require.NoError(t, err)
+
+			_, err = cfg.ValidateAsClient(validationMode{})
+
+			if test.expectedError == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorContains(t, err, test.expectedError)
+			}
+		})
+	}
+}
+
+func TestWorkloadResourceKubeletConflict(t *testing.T) {
+	t.Parallel()
+
+	newV1Alpha1 := func(kubelet *v1alpha1.KubeletConfig, withKubernetes bool) *v1alpha1.Config { //nolint:staticcheck // testing legacy features
+		cfg := &v1alpha1.Config{
+			MachineConfig: &v1alpha1.MachineConfig{
+				MachineType:    "worker",
+				MachineCA:      &x509.PEMEncodedCertificateAndKey{Crt: []byte("cert")},
+				MachineKubelet: kubelet, //nolint:staticcheck // testing legacy features
+				MachineFeatures: &v1alpha1.FeaturesConfig{
+					HostDNSSupport: &v1alpha1.HostDNSConfig{ //nolint:staticcheck // testing legacy features
+						HostDNSConfigEnabled:        new(true),
+						HostDNSForwardKubeDNSToHost: new(true),
+					},
+				},
+			},
+			ClusterConfig: &v1alpha1.ClusterConfig{
+				ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing legacy features
+					Endpoint: &v1alpha1.Endpoint{URL: must.Value(url.Parse("https://localhost:6443"))(t)},
+				},
+			},
+		}
+
+		if withKubernetes {
+			cfg.ClusterConfig.ClusterNetwork = &v1alpha1.ClusterNetworkConfig{} //nolint:staticcheck // testing legacy features
+		}
+
+		return cfg
+	}
+
+	newWorkloadResources := func(kubepods, talosContainers string) *runtime.WorkloadResourceConfigV1Alpha1 {
+		cfg := runtime.NewWorkloadResourceConfigV1Alpha1()
+
+		if kubepods != "" {
+			cfg.KubepodsConfig = &runtime.WorkloadResourceRoot{MemoryConfig: &runtime.WorkloadMemoryResource{MemoryLimit: meta.MustByteSize(kubepods)}}
+		}
+
+		if talosContainers != "" {
+			cfg.TalosContainersConfig = &runtime.WorkloadResourceRoot{MemoryConfig: &runtime.WorkloadMemoryResource{MemoryLimit: meta.MustByteSize(talosContainers)}}
+		}
+
+		return cfg
+	}
+
+	newVirtualMachineResources := func(limit string) *runtime.WorkloadResourceConfigV1Alpha1 {
+		cfg := runtime.NewWorkloadResourceConfigV1Alpha1()
+		cfg.VirtualMachinesConfig = &runtime.WorkloadResourceRoot{MemoryConfig: &runtime.WorkloadMemoryResource{MemoryLimit: meta.MustByteSize(limit)}}
+
+		return cfg
+	}
+
+	newKubelet := func(extraConfig map[string]any, extraArgs meta.Args) *v1alpha1.KubeletConfig { //nolint:staticcheck // testing legacy features
+		return &v1alpha1.KubeletConfig{ //nolint:staticcheck // testing legacy features
+			KubeletImage:       "kubelet",                              //nolint:staticcheck // testing legacy features
+			KubeletExtraConfig: meta.Unstructured{Object: extraConfig}, //nolint:staticcheck // testing legacy features
+			KubeletExtraArgs:   extraArgs,                              //nolint:staticcheck // testing legacy features
+		}
+	}
+
+	talosRootKubelet := newKubelet(map[string]any{
+		"systemReserved":         map[string]any{"memory": "1Gi"},
+		"systemReservedCgroup":   "/taloscontainers",
+		"enforceNodeAllocatable": []any{"pods", "system-reserved"},
+	}, nil)
+
+	talosRootCompressibleKubelet := newKubelet(map[string]any{
+		"systemReserved":         map[string]any{"memory": "1Gi"},
+		"systemReservedCgroup":   "/taloscontainers",
+		"enforceNodeAllocatable": []any{"pods", "system-reserved-compressible"},
+	}, nil)
+
+	talosRootArgsKubelet := newKubelet(map[string]any{"kubeReserved": map[string]any{"memory": "2Gi"}}, meta.Args{
+		"enforce_node_allocatable": meta.NewArgValue("pods,kube-reserved", nil),
+		"kube-reserved-cgroup":     meta.NewArgValue("virtualmachines.partition", nil),
+	})
+
+	talosRootDefaultedKubelet := newKubelet(map[string]any{
+		"systemReservedCgroup":   "/taloscontainers",
+		"enforceNodeAllocatable": []any{"pods", "system-reserved"},
+	}, nil)
+
+	configDirKubelet := newKubelet(nil, meta.Args{"config_dir": meta.NewArgValue("/etc/kubernetes/kubelet.conf.d", nil)})
+
+	talosRootError := `kubelet enforces the "systemReserved.memory" reservation on the Talos-managed cgroup "/taloscontainers" through "enforceNodeAllocatable" "system-reserved"`
+
+	conflictingKubelet := &v1alpha1.KubeletConfig{ //nolint:staticcheck // testing legacy features
+		KubeletImage: "kubelet", //nolint:staticcheck // testing legacy features
+		KubeletExtraConfig: meta.Unstructured{ //nolint:staticcheck // testing legacy features
+			Object: map[string]any{"systemReserved": map[string]any{"memory": "1Gi"}},
+		},
+		KubeletExtraArgs: meta.Args{ //nolint:staticcheck // testing legacy features
+			"eviction-hard": meta.NewArgValue("memory.available<100Mi", nil),
+		},
+	}
+
+	compatibleKubelet := &v1alpha1.KubeletConfig{ //nolint:staticcheck // testing legacy features
+		KubeletImage: "kubelet", //nolint:staticcheck // testing legacy features
+		KubeletExtraConfig: meta.Unstructured{ //nolint:staticcheck // testing legacy features
+			Object: map[string]any{
+				"systemReserved":         map[string]any{"cpu": "500m"},
+				"kubeReserved":           map[string]any{"memory": "512Mi"},
+				"enforceNodeAllocatable": []any{"pods", "system-reserved-compressible"},
+				"systemReservedCgroup":   "/system",
+			},
+		},
+	}
+
+	multidocKubelet := k8s.NewKubeletConfigV1Alpha1()
+	multidocKubelet.KubeletImage = "kubelet"
+	multidocKubelet.KubeletConfig = meta.Unstructured{Object: map[string]any{"cgroupsPerQOS": false}}
+
+	multidocNetwork := k8s.NewKubeNetworkConfigV1Alpha1()
+	multidocNetwork.NetworkPodSubnets = []meta.Prefix{{Prefix: netip.MustParsePrefix("10.244.0.0/16")}}
+	multidocNetwork.NetworkServiceSubnets = []meta.Prefix{{Prefix: netip.MustParsePrefix("10.96.0.0/12")}}
+
+	for _, test := range []struct {
+		name        string
+		documents   []config.Document
+		inContainer bool
+
+		expectedErrors []string
+	}{
+		{
+			name:      "no limit imposes nothing",
+			documents: []config.Document{newV1Alpha1(conflictingKubelet, true), newWorkloadResources("", "4GiB")},
+		},
+		{
+			name:           "no document rejects system memory on containers root",
+			documents:      []config.Document{newV1Alpha1(talosRootKubelet, true)},
+			expectedErrors: []string{talosRootError},
+		},
+		{
+			name: "no document rejects system memory on VM root",
+			documents: []config.Document{newV1Alpha1(newKubelet(map[string]any{
+				"systemReserved":         map[string]any{"memory": "1Gi"},
+				"systemReservedCgroup":   "/virtualmachines.partition",
+				"enforceNodeAllocatable": []any{"pods", "system-reserved"},
+			}, nil), true)},
+			expectedErrors: []string{`"systemReserved.memory" reservation on the Talos-managed cgroup "/virtualmachines.partition"`},
+		},
+		{
+			name: "no document rejects kube memory on containers root",
+			documents: []config.Document{newV1Alpha1(newKubelet(map[string]any{
+				"kubeReserved":           map[string]any{"memory": "1Gi"},
+				"kubeReservedCgroup":     "/taloscontainers",
+				"enforceNodeAllocatable": []any{"pods", "kube-reserved"},
+			}, nil), true)},
+			expectedErrors: []string{`"kubeReserved.memory" reservation on the Talos-managed cgroup "/taloscontainers"`},
+		},
+		{
+			name:           "no document rejects kube memory on VM root via aliases",
+			documents:      []config.Document{newV1Alpha1(talosRootArgsKubelet, true)},
+			expectedErrors: []string{`"kubeReserved.memory" reservation on the Talos-managed cgroup "virtualmachines.partition"`},
+		},
+		{
+			name:           "no document rejects default system memory on containers root",
+			documents:      []config.Document{newV1Alpha1(talosRootDefaultedKubelet, true)},
+			expectedErrors: []string{talosRootError},
+		},
+		{
+			name: "no document rejects default system memory on VM root via aliases",
+			documents: []config.Document{newV1Alpha1(newKubelet(nil, meta.Args{
+				"system_reserved_cgroup":   meta.NewArgValue("/virtualmachines.partition", nil),
+				"enforce_node_allocatable": meta.NewArgValue("pods,system-reserved", nil),
+			}), true)},
+			expectedErrors: []string{`"systemReserved.memory" reservation on the Talos-managed cgroup "/virtualmachines.partition"`},
+		},
+		{
+			name:      "no document allows compressible enforcement",
+			documents: []config.Document{newV1Alpha1(talosRootCompressibleKubelet, true)},
+		},
+		{
+			name: "no document allows CPU-only enforcement on both roots",
+			documents: []config.Document{newV1Alpha1(newKubelet(map[string]any{
+				"systemReserved":         map[string]any{"cpu": "500m"},
+				"systemReservedCgroup":   "/taloscontainers",
+				"kubeReserved":           map[string]any{"cpu": "500m"},
+				"kubeReservedCgroup":     "/virtualmachines.partition",
+				"enforceNodeAllocatable": []any{"pods", "system-reserved", "kube-reserved"},
+			}, nil), true)},
+		},
+		{
+			name: "no document allows memory enforcement on unrelated roots",
+			documents: []config.Document{newV1Alpha1(newKubelet(map[string]any{
+				"systemReservedCgroup":   "/system",
+				"kubeReserved":           map[string]any{"memory": "1Gi"},
+				"kubeReservedCgroup":     "/kube-reserved",
+				"enforceNodeAllocatable": []any{"pods", "system-reserved", "kube-reserved"},
+			}, nil), true)},
+		},
+		{
+			name:      "no document allows drop-in directory",
+			documents: []config.Document{newV1Alpha1(configDirKubelet, true)},
+		},
+		{
+			name:        "no document skips container mode",
+			documents:   []config.Document{newV1Alpha1(talosRootKubelet, true)},
+			inContainer: true,
+		},
+		{
+			name:      "no document skips absent Kubernetes",
+			documents: []config.Document{newV1Alpha1(talosRootKubelet, false)},
+		},
+		{
+			name:      "containers limit with compressible enforcement on its root",
+			documents: []config.Document{newV1Alpha1(talosRootCompressibleKubelet, true), newWorkloadResources("", "4GiB")},
+		},
+		{
+			name:      "containers limit without Kubernetes",
+			documents: []config.Document{newV1Alpha1(talosRootKubelet, false), newWorkloadResources("", "4GiB")},
+		},
+		{
+			name:        "containers limit in container mode",
+			documents:   []config.Document{newV1Alpha1(talosRootKubelet, true), newWorkloadResources("", "4GiB")},
+			inContainer: true,
+		},
+		{
+			name:      "containers limit with memory enforcement on its root",
+			documents: []config.Document{newV1Alpha1(talosRootKubelet, true), newWorkloadResources("", "4GiB")},
+
+			expectedErrors: []string{talosRootError},
+		},
+		{
+			name:      "containers limit with Talos-defaulted memory enforcement on its root",
+			documents: []config.Document{newV1Alpha1(talosRootDefaultedKubelet, true), newWorkloadResources("", "4GiB")},
+
+			expectedErrors: []string{talosRootError},
+		},
+		{
+			name:      "kubepods limit with memory enforcement on the containers root",
+			documents: []config.Document{newV1Alpha1(talosRootKubelet, true), newWorkloadResources("16GiB", "")},
+
+			expectedErrors: []string{talosRootError},
+		},
+		{
+			name:      "virtual machines limit with argument enforcement on its root",
+			documents: []config.Document{newV1Alpha1(talosRootArgsKubelet, true), newVirtualMachineResources("32GiB")},
+
+			expectedErrors: []string{`kubelet enforces the "kubeReserved.memory" reservation on the Talos-managed cgroup "virtualmachines.partition" through "enforceNodeAllocatable" "kube-reserved"`},
+		},
+		{
+			name:      "containers limit with a configuration directory",
+			documents: []config.Document{newV1Alpha1(configDirKubelet, true), newWorkloadResources("", "4GiB")},
+
+			expectedErrors: []string{`kubelet argument "config_dir" conflicts with WorkloadResourceConfig`},
+		},
+		{
+			name:      "kubepods limit with a configuration directory",
+			documents: []config.Document{newV1Alpha1(configDirKubelet, true), newWorkloadResources("16GiB", "")},
+
+			expectedErrors: []string{`kubelet argument "config_dir" conflicts with the kubepods memory limit`},
+		},
+		{
+			name:        "kubepods limit in container mode",
+			documents:   []config.Document{newV1Alpha1(conflictingKubelet, true), newWorkloadResources("16GiB", "4GiB")},
+			inContainer: true,
+		},
+		{
+			name: "kubepods limit with multi-doc kubelet in container mode",
+			documents: []config.Document{
+				newV1Alpha1(nil, false),
+				multidocNetwork,
+				k8s.NewKubeNodeConfigV1Alpha1(),
+				multidocKubelet,
+				newWorkloadResources("16GiB", ""),
+			},
+			inContainer: true,
+		},
+		{
+			name:      "compatible kubelet settings",
+			documents: []config.Document{newV1Alpha1(compatibleKubelet, true), newWorkloadResources("16GiB", "")},
+		},
+		{
+			name:      "inactive limit without Kubernetes",
+			documents: []config.Document{newV1Alpha1(conflictingKubelet, false), newWorkloadResources("16GiB", "4GiB")},
+		},
+		{
+			name:      "active limit with legacy kubelet conflicts",
+			documents: []config.Document{newV1Alpha1(conflictingKubelet, true), newWorkloadResources("16GiB", "")},
+
+			expectedErrors: []string{
+				`kubelet argument "eviction-hard" conflicts with the kubepods memory limit: use the "evictionHard" configuration field instead`,
+				`kubelet configuration field "systemReserved.memory" conflicts with the kubepods memory limit`,
+			},
+		},
+		{
+			name: "active limit with multi-doc kubelet conflicts",
+			documents: []config.Document{
+				newV1Alpha1(nil, false),
+				multidocNetwork,
+				k8s.NewKubeNodeConfigV1Alpha1(),
+				multidocKubelet,
+				newWorkloadResources("16GiB", ""),
+			},
+
+			expectedErrors: []string{`kubelet configuration field "cgroupsPerQOS" must be enabled with the kubepods memory limit`},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := container.New(test.documents...)
+			require.NoError(t, err)
+
+			_, err = cfg.ValidateAsClient(validationMode{inContainer: test.inContainer}, validation.WithLocal())
+
+			if len(test.expectedErrors) == 0 {
+				assert.NoError(t, err)
+
+				return
+			}
+
+			for _, expected := range test.expectedErrors {
+				assert.ErrorContains(t, err, expected)
+			}
+		})
+	}
 }

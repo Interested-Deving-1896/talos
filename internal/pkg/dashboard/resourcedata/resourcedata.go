@@ -18,8 +18,9 @@ import (
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 
-	"github.com/siderolabs/talos/internal/pkg/dashboard/util"
+	"github.com/siderolabs/talos/internal/pkg/dashboard/utils"
 	"github.com/siderolabs/talos/pkg/machinery/client"
+	"github.com/siderolabs/talos/pkg/machinery/redactable"
 	"github.com/siderolabs/talos/pkg/machinery/resources/cluster"
 	"github.com/siderolabs/talos/pkg/machinery/resources/config"
 	"github.com/siderolabs/talos/pkg/machinery/resources/hardware"
@@ -44,7 +45,8 @@ type Source struct {
 	eg   errgroup.Group
 	once sync.Once
 
-	COSI state.State
+	COSI  state.State
+	Nodes []string
 
 	ch             chan Data
 	NodeResourceCh <-chan Data
@@ -71,9 +73,15 @@ func (source *Source) run(ctx context.Context) {
 
 	source.NodeResourceCh = source.ch
 
-	for _, nodeContext := range util.NodeContexts(ctx) {
+	for _, node := range source.Nodes {
 		source.eg.Go(func() error {
-			source.runResourceWatchWithRetries(nodeContext.Ctx, nodeContext.Node)
+			// the dashboard runs with a reduced set of roles, so it accepts the resources it watches
+			// in the redacted form: a resource which can be redacted is served with its secrets taken
+			// out instead of being denied outright, and one which carries no secret at all comes
+			// through untouched
+			nodeCtx := redactable.WithMode(utils.NodeContext(ctx, node), redactable.ModeAccept)
+
+			source.runResourceWatchWithRetries(nodeCtx, node)
 
 			return nil
 		})
@@ -110,7 +118,10 @@ func (source *Source) runResourceWatch(ctx context.Context, node string) error {
 		runtime.NewMachineStatus().Metadata(),
 		runtime.NewSecurityStateSpec(v1alpha1.NamespaceName).Metadata(),
 		config.NewMachineType().Metadata(),
+		// KubeletSpec is sensitive (os:admin only), while KubeletStatus is not, but it is not available on older Talos versions,
+		// so watch both and use whichever comes through.
 		k8s.NewKubeletSpec(k8s.NamespaceName, k8s.KubeletID).Metadata(),
+		k8s.NewKubeletStatus(k8s.NamespaceName, k8s.KubeletID).Metadata(),
 		network.NewResolverStatus(network.NamespaceName, network.ResolverID).Metadata(),
 		network.NewTimeServerStatus(network.NamespaceName, network.TimeServerID).Metadata(),
 		hardware.NewSystemInformation(hardware.SystemInformationID).Metadata(),

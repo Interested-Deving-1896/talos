@@ -11,6 +11,7 @@ import (
 
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/provision"
+	"github.com/siderolabs/talos/pkg/provision/providers/vm"
 )
 
 // Create Talos cluster as a set of qemu VMs.
@@ -22,6 +23,12 @@ func (p *provisioner) Create(ctx context.Context, request provision.ClusterReque
 	for _, opt := range opts {
 		if err := opt(&options); err != nil {
 			return nil, err
+		}
+	}
+
+	for _, node := range request.Nodes {
+		if err := validateNUMANodes(options.NUMANodes, nodeVCPUCount(node.NanoCPUs), node.Memory/1024/1024); err != nil {
+			return nil, fmt.Errorf("node %s: %w", node.Name, err)
 		}
 	}
 
@@ -61,6 +68,14 @@ func (p *provisioner) Create(ctx context.Context, request provision.ClusterReque
 
 	if err = p.CreateNetwork(ctx, state, request.Network, options); err != nil {
 		return nil, fmt.Errorf("unable to provision CNI network: %w", err)
+	}
+
+	if options.NFSEnabled {
+		fmt.Fprintln(options.LogWriter, "creating NFS server")
+
+		if err = p.CreateNFS(state, request); err != nil {
+			return nil, fmt.Errorf("error creating NFS server: %w", err)
+		}
 	}
 
 	fmt.Fprintln(options.LogWriter, "creating load balancer")
@@ -108,12 +123,32 @@ func (p *provisioner) Create(ctx context.Context, request provision.ClusterReque
 		}
 	}
 
+	if options.LLDPEnabled {
+		fmt.Fprintln(options.LogWriter, "creating LLDP test advertiser")
+
+		if err = p.CreateLLDP(state, request); err != nil {
+			return nil, fmt.Errorf("error creating LLDP test advertiser: %w", err)
+		}
+	}
+
+	if options.BGPEnabled {
+		fmt.Fprintln(options.LogWriter, "creating BGP fabric peer")
+
+		if err = p.CreateBGP(state, request, options); err != nil {
+			return nil, fmt.Errorf("error creating BGP fabric peer: %w", err)
+		}
+	}
+
 	if options.JSONLogsEndpoint != "" {
 		fmt.Fprintln(options.LogWriter, "creating JSON logs server")
 
 		if err = p.CreateJSONLogs(state, request, options); err != nil {
 			return nil, fmt.Errorf("error creating JSON logs server: %w", err)
 		}
+	}
+
+	if err = vm.DumpExtraIPAMRecords(statePath, request.Network); err != nil {
+		return nil, err
 	}
 
 	var nodeInfo []provision.NodeInfo //nolint:prealloc // this is created by p.createNodes
@@ -124,7 +159,8 @@ func (p *provisioner) Create(ctx context.Context, request provision.ClusterReque
 		return nil, err
 	}
 
-	// On darwin, qemu creates the bridge interface to which the dhcpd server is attached to, so at least one machine has to be created first.
+	// On darwin the bridge already exists here: CreateNetwork brought it up and holds it open for the
+	// network lifetime, so the dhcpd finds it regardless of node creation order.
 	fmt.Fprintln(options.LogWriter, "creating dhcpd")
 
 	if err = p.CreateDHCPd(ctx, state, request); err != nil {
@@ -166,6 +202,7 @@ func (p *provisioner) Create(ctx context.Context, request provision.ClusterReque
 			NoMasqueradeCIDRs: request.Network.NoMasqueradeCIDRs,
 			GatewayAddrs:      request.Network.GatewayAddrs,
 			MTU:               request.Network.MTU,
+			ExtraDHCPRecords:  request.Network.ExtraDHCPRecords,
 		},
 		Nodes:              nodeInfo,
 		ExtraNodes:         pxeNodeInfo,

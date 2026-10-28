@@ -142,10 +142,10 @@ func (h *KMSKeyHandler) getConn() (*grpc.ClientConn, error) {
 		})
 	}
 
+	proxy := dialer.NewDynamicProxy(httpdefaults.RootCAsTLSConfig)
+
 	return grpc.NewClient(
-		endpoint.Host,
-		grpc.WithTransportCredentials(transportCredentials),
-		grpc.WithSharedWriteBuffer(true),
-		grpc.WithContextDialer(dialer.DynamicProxyDialerWithTLSConfig(httpdefaults.RootCAsTLSConfig)),
+		proxy.Target(endpoint.Host),
+		append([]grpc.DialOption{grpc.WithTransportCredentials(transportCredentials)}, proxy.DialOptions()...)...,
 	)
 }

@@ -1,0 +1,53 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+package qemu
+
+import (
+	"context"
+	"net"
+
+	"github.com/siderolabs/talos/pkg/provision"
+)
+
+// MemoryArgsForTest exposes NUMA memory argument construction for tests.
+var MemoryArgsForTest = memoryArgs
+
+// SMPArgForTest exposes the CPU topology argument.
+var SMPArgForTest = smpArg
+
+// FabricDeviceForTest exposes fabric device argument construction for tests.
+func FabricDeviceForTest(clos bool, index int, mac string, mtu int, virtioNetDeviceArgs string) string {
+	return fabricDevice(&LaunchConfig{
+		CLOSNoNet0:          clos,
+		Network:             networkConfig{networkConfigBase: networkConfigBase{MTU: mtu}},
+		virtioNetDeviceArgs: virtioNetDeviceArgs,
+	}, index, FabricUplink{mac: mac})
+}
+
+// ParseDevicePropertiesForTest exposes the `qemu -device <dev>,help` parser for tests.
+var ParseDevicePropertiesForTest = parseDeviceProperties
+
+// VirtioNetTunnelOffloadArgsForTest exposes the virtio-net tunnel offload argument construction for tests.
+var VirtioNetTunnelOffloadArgsForTest = virtioNetTunnelOffloadArgs
+
+// APIPortAllocatorForTest exposes apiPortAllocator for tests.
+type APIPortAllocatorForTest struct {
+	allocator apiPortAllocator
+}
+
+// Allocate reserves an API port for tests.
+func (allocator *APIPortAllocatorForTest) Allocate(ctx context.Context, host string) (*net.TCPAddr, error) {
+	return allocator.allocator.allocate(ctx, host)
+}
+
+// BuildFabricUplinksForTest exposes BGP test uplink construction for tests.
+func BuildFabricUplinksForTest(networkName, managementBridge string, nodeIdx, count, mtu int, bgpEnabled, bgpCLOS bool) []FabricUplink {
+	return buildFabricUplinks(networkName, managementBridge, nodeIdx, count, mtu, bgpEnabled, bgpCLOS)
+}
+
+// ProbeHTTPForTest exposes the bounded provisioner-host HTTP implementation for tests.
+func ProbeHTTPForTest(ctx context.Context, request provision.HTTPProbeRequest) (provision.HTTPProbeResponse, error) {
+	return probeHTTP(ctx, request)
+}

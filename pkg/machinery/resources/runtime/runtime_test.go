@@ -25,7 +25,11 @@ func TestRegisterResource(t *testing.T) {
 
 	for _, resource := range []meta.ResourceWithRD{
 		&runtime.APIServiceConfig{},
+		&runtime.BootID{},
+		&runtime.BootPartitionStatus{},
 		&runtime.BootedEntry{},
+		&runtime.CPUPartitionSpec{},
+		&runtime.CPUPartitionStatus{},
 		&runtime.DevicesStatus{},
 		&runtime.Diagnostic{},
 		&runtime.EventSinkConfig{},
@@ -52,6 +56,7 @@ func TestRegisterResource(t *testing.T) {
 		&runtime.UniqueMachineToken{},
 		&runtime.WatchdogTimerConfig{},
 		&runtime.WatchdogTimerStatus{},
+		&runtime.WorkloadMemorySpec{},
 	} {
 		assert.NoError(t, resourceRegistry.Register(ctx, resource))
 	}

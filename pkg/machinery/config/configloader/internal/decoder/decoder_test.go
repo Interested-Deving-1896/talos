@@ -18,6 +18,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/configloader/internal/decoder"
 	"github.com/siderolabs/talos/pkg/machinery/config/internal/registry"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/k8s"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1"
 )
@@ -49,6 +50,7 @@ type MockV2 struct {
 	Meta
 
 	Slice []Mock           `yaml:"slice"`
+	Ptrs  []*Mock          `yaml:"ptrs"`
 	Map   map[string]*Mock `yaml:"map"`
 }
 
@@ -173,7 +175,7 @@ spec:
 	test: true
 `),
 			expected:    nil,
-			expectedErr: "decode error: yaml: while scanning for the next token at line 5: found character that cannot start any token",
+			expectedErr: "decode error: go-yaml load error in scanner (while scanning for the next token) at L5.C1: found character that cannot start any token",
 		},
 		{
 			name: "extra field",
@@ -225,6 +227,64 @@ map:
 `),
 			expected:    nil,
 			expectedErr: "error decoding document v1alpha2/mock/ (line 2): unknown keys found during decoding:\nmap:\n    second:\n        a:\n            b: {}\n",
+		},
+		{
+			name: "null in slice of pointers",
+			source: []byte(`---
+kind: mock
+apiVersion: v1alpha2
+ptrs:
+  - test: true
+  -
+  - null
+`),
+			expected:    nil,
+			expectedErr: "error decoding document v1alpha2/mock/ (line 2): null value is not allowed at \"ptrs[1]\" (line 6)\nnull value is not allowed at \"ptrs[2]\" (line 7)",
+		},
+		{
+			name: "null in map of pointers",
+			source: []byte(`---
+kind: mock
+apiVersion: v1alpha2
+map:
+  first: null
+  second:
+    test: true
+`),
+			expected:    nil,
+			expectedErr: "error decoding document v1alpha2/mock/ (line 2): null value is not allowed at \"map.first\" (line 5)",
+		},
+		{
+			// the YAML library drops a null item when decoding into a slice of values, so there's nothing to reject
+			name: "null in slice of values",
+			source: []byte(`---
+kind: mock
+apiVersion: v1alpha2
+slice:
+  - null
+  - test: true
+`),
+			expected: []config.Document{
+				&MockV2{
+					Slice: []Mock{{Test: true}},
+				},
+			},
+		},
+		{
+			name: "null in v1alpha1 network interfaces",
+			source: []byte(`---
+version: v1alpha1
+machine:
+  network:
+    interfaces:
+      - interface: eth0
+        vlans:
+          - null
+      - null
+`),
+			expected: nil,
+			expectedErr: "error decoding document /v1alpha1/ (line 2): null value is not allowed at \"machine.network.interfaces[0].vlans[0]\"" +
+				" (line 8)\nnull value is not allowed at \"machine.network.interfaces[1]\" (line 9)",
 		},
 		{
 			name: "valid nested",
@@ -286,7 +346,7 @@ omit: false
 			name:        "internal error",
 			source:      []byte(":   \xea"),
 			expected:    nil,
-			expectedErr: "decode error: yaml: offset 4: incomplete UTF-8 octet sequence",
+			expectedErr: "decode error: go-yaml load error in reader at <unknown position>: incomplete UTF-8 octet sequence",
 		},
 		{
 			name: "unstructured config",
@@ -303,6 +363,28 @@ pods:
 `),
 			expected:    nil,
 			expectedErr: "",
+		},
+		{
+			name: "kube apiserver extra args list value",
+			source: []byte(`---
+apiVersion: v1alpha1
+kind: KubeAPIServerConfig
+extraArgs:
+  service-account-issuer:
+    - https://OLD-ENDPOINT:6443
+    - https://NEW-ENDPOINT:6443
+`),
+			expected: []config.Document{
+				&k8s.KubeAPIServerConfigV1Alpha1{
+					Meta: meta.Meta{
+						MetaAPIVersion: "v1alpha1",
+						MetaKind:       "KubeAPIServerConfig",
+					},
+					PodArgs: meta.Args{
+						"service-account-issuer": meta.NewArgValue("", []string{"https://OLD-ENDPOINT:6443", "https://NEW-ENDPOINT:6443"}),
+					},
+				},
+			},
 		},
 		{
 			name: "omit empty test",
@@ -340,7 +422,7 @@ test: true
 			t.Parallel()
 
 			d := decoder.NewDecoder()
-			actual, err := d.Decode(bytes.NewReader(tt.source), false)
+			actual, err := d.Decode(bytes.NewReader(tt.source), false, false)
 
 			if tt.expected != nil {
 				assert.Equal(t, tt.expected, actual)
@@ -369,7 +451,7 @@ func TestDecoderV1Alpha1Config(t *testing.T) {
 			require.NoError(t, err)
 
 			d := decoder.NewDecoder()
-			_, err = d.Decode(bytes.NewReader(contents), false)
+			_, err = d.Decode(bytes.NewReader(contents), false, false)
 
 			assert.NoError(t, err)
 		})
@@ -383,9 +465,13 @@ func TestDoubleV1Alpha1(t *testing.T) {
 	contents := must.Value(files.ReadFile("v1alpha1.yaml"))(t)
 
 	d := decoder.NewDecoder()
-	_, err := d.Decode(bytes.NewReader(contents), false)
+	_, err := d.Decode(bytes.NewReader(contents), false, false)
 	require.Error(t, err)
 	require.ErrorContains(t, err, "not allowed")
+
+	// now try with the allow duplicates
+	_, err = d.Decode(bytes.NewReader(contents), false, true)
+	require.NoError(t, err)
 }
 
 func BenchmarkDecoderV1Alpha1Config(b *testing.B) {
@@ -396,7 +482,7 @@ func BenchmarkDecoderV1Alpha1Config(b *testing.B) {
 
 	for b.Loop() {
 		d := decoder.NewDecoder()
-		_, err = d.Decode(bytes.NewReader(contents), false)
+		_, err = d.Decode(bytes.NewReader(contents), false, false)
 
 		assert.NoError(b, err)
 	}

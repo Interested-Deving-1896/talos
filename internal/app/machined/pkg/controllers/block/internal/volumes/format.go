@@ -5,9 +5,9 @@
 package volumes
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,11 +17,9 @@ import (
 	"github.com/siderolabs/go-blockdevice/v2/swap"
 	"go.uber.org/zap"
 
-	mountv3 "github.com/siderolabs/talos/internal/pkg/mount/v3"
 	"github.com/siderolabs/talos/pkg/machinery/imager/quirks"
 	"github.com/siderolabs/talos/pkg/machinery/resources/block"
 	"github.com/siderolabs/talos/pkg/makefs"
-	"github.com/siderolabs/talos/pkg/xfs/fsopen"
 )
 
 // Format establishes a filesystem on a block device.
@@ -78,13 +76,8 @@ func Format(ctx context.Context, logger *zap.Logger, volumeContext ManagerContex
 		// swap volume, format always
 	case info.Name == volumeContext.Cfg.TypedSpec().Provisioning.FilesystemSpec.Type.String():
 		// filesystem already exists and matches the requested type
-		if volumeContext.Cfg.TypedSpec().Provisioning.PartitionSpec.Grow {
-			// if the partition is set to grow, we need to grow the filesystem
-			if err = GrowFilesystem(ctx, logger, volumeContext); err != nil {
-				return fmt.Errorf("error growing filesystem: %w", err)
-			}
-		}
-
+		//
+		// if the volume is set to grow, the filesystem is grown by the mount controller
 		volumeContext.Status.Phase = block.VolumePhaseReady
 		volumeContext.Status.Filesystem = volumeContext.Cfg.TypedSpec().Provisioning.FilesystemSpec.Type
 
@@ -100,10 +93,10 @@ func Format(ctx context.Context, logger *zap.Logger, volumeContext ManagerContex
 		zap.Stringer("filesystem", volumeContext.Cfg.TypedSpec().Provisioning.FilesystemSpec.Type),
 	)
 
+	makefsOptions := []makefs.Option{makefs.WithPrintf(logger.Sugar().Debugf)}
+
 	switch volumeContext.Cfg.TypedSpec().Provisioning.FilesystemSpec.Type { //nolint:exhaustive
 	case block.FilesystemTypeXFS:
-		var makefsOptions []makefs.Option
-
 		// xfs doesn't support by default filesystems < 300 MiB
 		if volumeContext.Status.Size <= 300*1024*1024 {
 			makefsOptions = append(makefsOptions, makefs.WithUnsupportedFSOption(true))
@@ -115,18 +108,33 @@ func Format(ctx context.Context, logger *zap.Logger, volumeContext ManagerContex
 
 		makefsOptions = append(makefsOptions, makefs.WithConfigFile(quirks.New("").XFSMkfsConfig()))
 
+		// mkfs.xfs only scales the allocation group count (and the journal size) to the CPU count on
+		// non-rotational devices, so the minimum allocation group size is only relevant there.
+		if disk := volumeContext.FindDisk(cmp.Or(volumeContext.Status.ParentLocation, volumeContext.Status.Location)); disk != nil && !disk.Rotational {
+			makefsOptions = append(makefsOptions,
+				makefs.WithDeviceSize(volumeContext.Status.Size),
+				makefs.WithMinAllocationGroupSize(volumeContext.Cfg.TypedSpec().Provisioning.FilesystemSpec.MinAllocationGroupSize),
+			)
+		}
+
 		if err = makefs.XFS(ctx, volumeContext.Status.MountLocation, makefsOptions...); err != nil {
 			return xerrors.NewTaggedf[Retryable]("error formatting XFS: %w", err)
 		}
 	case block.FilesystemTypeEXT4:
-		var makefsOptions []makefs.Option
-
 		if volumeContext.Cfg.TypedSpec().Provisioning.FilesystemSpec.Label != "" {
 			makefsOptions = append(makefsOptions, makefs.WithLabel(volumeContext.Cfg.TypedSpec().Provisioning.FilesystemSpec.Label))
 		}
 
 		if err = makefs.Ext4(ctx, volumeContext.Status.MountLocation, makefsOptions...); err != nil {
 			return xerrors.NewTaggedf[Retryable]("error formatting ext4: %w", err)
+		}
+	case block.FilesystemTypeBtrfs:
+		if volumeContext.Cfg.TypedSpec().Provisioning.FilesystemSpec.Label != "" {
+			makefsOptions = append(makefsOptions, makefs.WithLabel(volumeContext.Cfg.TypedSpec().Provisioning.FilesystemSpec.Label))
+		}
+
+		if err = makefs.BTRFS(ctx, volumeContext.Status.MountLocation, makefsOptions...); err != nil {
+			return xerrors.NewTaggedf[Retryable]("error formatting btrfs: %w", err)
 		}
 	case block.FilesystemTypeSwap:
 		if err = swap.Format(volumeContext.Status.MountLocation, swap.FormatOptions{
@@ -143,54 +151,4 @@ func Format(ctx context.Context, logger *zap.Logger, volumeContext ManagerContex
 	volumeContext.Status.Filesystem = volumeContext.Cfg.TypedSpec().Provisioning.FilesystemSpec.Type
 
 	return nil
-}
-
-// GrowFilesystem grows the filesystem on the block device.
-func GrowFilesystem(ctx context.Context, logger *zap.Logger, volumeContext ManagerContext) error {
-	switch volumeContext.Cfg.TypedSpec().Provisioning.FilesystemSpec.Type { //nolint:exhaustive
-	case block.FilesystemTypeXFS:
-		// XFS requires partition to be mounted to grow
-		tmpDir, err := os.MkdirTemp("", "talos-growfs-")
-		if err != nil {
-			return fmt.Errorf("error creating temporary directory: %w", err)
-		}
-
-		defer os.Remove(tmpDir) //nolint:errcheck
-
-		manager := mountv3.NewManager(
-			mountv3.WithPrinter(logger.Sugar().Infof),
-			mountv3.WithTarget(tmpDir),
-			mountv3.WithFsopen(
-				volumeContext.Cfg.TypedSpec().Provisioning.FilesystemSpec.Type.String(),
-				fsopen.WithSource(volumeContext.Status.MountLocation),
-			),
-		)
-
-		if _, err := manager.Mount(); err != nil {
-			return fmt.Errorf("error mounting partition: %w", err)
-		}
-
-		defer manager.Unmount() //nolint:errcheck
-
-		logger.Info("growing XFS filesystem", zap.String("device", volumeContext.Status.MountLocation))
-
-		if err = makefs.XFSGrow(ctx, tmpDir); err != nil {
-			return fmt.Errorf("error growing XFS: %w", err)
-		}
-
-		return nil
-	case block.FilesystemTypeEXT4:
-		logger.Info("growing ext4 filesystem", zap.String("device", volumeContext.Status.MountLocation))
-
-		if err := makefs.Ext4Resize(ctx, volumeContext.Status.MountLocation); err != nil {
-			return fmt.Errorf("error growing ext4: %w", err)
-		}
-
-		return nil
-	case block.FilesystemTypeSwap:
-		// swap is always reformatted, so we don't need to grow it
-		return nil
-	default:
-		return fmt.Errorf("unsupported filesystem type to grow: %s", volumeContext.Cfg.TypedSpec().Provisioning.FilesystemSpec.Type)
-	}
 }
