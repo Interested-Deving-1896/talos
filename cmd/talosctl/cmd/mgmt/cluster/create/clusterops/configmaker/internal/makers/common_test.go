@@ -5,6 +5,7 @@
 package makers_test
 
 import (
+	"net/netip"
 	"regexp"
 	"testing"
 
@@ -16,9 +17,12 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/bundle"
 	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
+	"github.com/siderolabs/talos/pkg/machinery/config/container"
 	"github.com/siderolabs/talos/pkg/machinery/config/encoder"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/network"
+	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
 	"github.com/siderolabs/talos/pkg/machinery/version"
 	"github.com/siderolabs/talos/pkg/provision"
 )
@@ -27,7 +31,7 @@ type testProvisioner struct {
 	provision.Provisioner
 }
 
-func (p testProvisioner) GenOptions(r provision.NetworkRequest, _ *config.VersionContract) ([]generate.Option, []bundle.Option) {
+func (p testProvisioner) GenOptions(r provision.ClusterRequest, _ *config.VersionContract) ([]generate.Option, []bundle.Option) {
 	return []generate.Option{func(o *generate.Options) error { return nil }}, nil
 }
 
@@ -65,6 +69,51 @@ func getInitializedTestMaker(t *testing.T, cOps clusterops.Common) makers.Maker[
 }
 
 var nodeUUIDHostnameRegex = regexp.MustCompile("^machine-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+// defaultActionConfigPatchProvider adds a generated control plane patch, the way e.g. --with-firewall does.
+type defaultActionConfigPatchProvider struct {
+	nothingProvider
+
+	m *makers.Maker[any]
+}
+
+func (p *defaultActionConfigPatchProvider) AddExtraConfigBundleOpts() error {
+	def := network.NewDefaultActionConfigV1Alpha1()
+	def.Ingress = nethelpers.DefaultActionBlock
+
+	ctr, err := container.New(def)
+	if err != nil {
+		return err
+	}
+
+	p.m.ConfigBundleOps = append(p.m.ConfigBundleOps,
+		bundle.WithPatchControlPlane([]configpatcher.Patch{configpatcher.NewStrategicMergePatch(ctr)}))
+
+	return nil
+}
+
+func TestCommonMaker_UserPatchesApplyLast(t *testing.T) {
+	cOps := clusterops.GetCommon()
+	cOps.ConfigPatchControlPlane = []string{`apiVersion: v1alpha1
+kind: NetworkDefaultActionConfig
+ingress: accept
+$patch: delete
+`}
+
+	m, err := makers.New(makers.MakerOptions[any]{CommonOps: cOps, Provisioner: testProvisioner{}})
+	require.NoError(t, err)
+
+	m.SetExtraOptionsProvider(&defaultActionConfigPatchProvider{m: &m})
+	require.NoError(t, m.Init())
+
+	clusterConfigs, err := m.GetClusterConfigs()
+	require.NoError(t, err)
+
+	controlPlaneConfig, err := clusterConfigs.ClusterRequest.Nodes[0].Config.EncodeBytes()
+	require.NoError(t, err)
+
+	assert.NotContains(t, string(controlPlaneConfig), "kind: NetworkDefaultActionConfig")
+}
 
 func TestCommonMaker(t *testing.T) {
 	cOps := clusterops.GetCommon()
@@ -203,4 +252,77 @@ func assertMachineConfig(t *testing.T, in *generate.Input, node provision.NodeRe
 	require.NoError(t, err)
 
 	assert.Equal(t, string(cfgExpectedBytes), string(cfgGotBytes))
+}
+
+func TestCommonMaker_StaticEndpoints(t *testing.T) {
+	cOps := clusterops.GetCommon()
+	cOps.Controlplanes = 3
+	cOps.Workers = 2
+	cOps.NetworkIPv6 = true
+	cOps.WithInitNode = true
+	cOps.WithStaticEndpoints = true
+
+	m := getInitializedTestMaker(t, cOps)
+
+	clusterCfgs, err := m.GetClusterConfigs()
+	require.NoError(t, err)
+
+	require.Len(t, clusterCfgs.ClusterRequest.Nodes, 5)
+
+	for _, node := range clusterCfgs.ClusterRequest.Nodes {
+		staticEndpoints := node.Config.StaticEndpointsConfig()
+		require.NotNil(t, staticEndpoints, "node %s", node.Name)
+
+		assert.Equal(t,
+			[]netip.Addr{
+				netip.MustParseAddr("10.5.0.2"), netip.MustParseAddr("fd74:616c:a05::2"),
+				netip.MustParseAddr("10.5.0.3"), netip.MustParseAddr("fd74:616c:a05::3"),
+				netip.MustParseAddr("10.5.0.4"), netip.MustParseAddr("fd74:616c:a05::4"),
+			},
+			staticEndpoints.Addresses(),
+			"node %s", node.Name,
+		)
+		assert.Empty(t, staticEndpoints.Hostnames())
+	}
+}
+
+func TestCommonMaker_StaticEndpointsUnsupportedVersion(t *testing.T) {
+	cOps := clusterops.GetCommon()
+	cOps.TalosVersion = "v1.14"
+	cOps.WithStaticEndpoints = true
+
+	m, err := makers.New(makers.MakerOptions[any]{CommonOps: cOps, Provisioner: testProvisioner{}})
+	require.NoError(t, err)
+
+	m.SetExtraOptionsProvider(&nothingProvider{})
+
+	assert.ErrorContains(t, m.Init(), "static endpoints are not supported for Talos version \"v1.14\"")
+}
+
+func TestCommonMaker_StaticEndpointsSkipEtcdK8s(t *testing.T) {
+	cOps := clusterops.GetCommon()
+	cOps.Controlplanes = 2
+	cOps.Workers = 1
+	cOps.EnableClusterDiscovery = false
+	cOps.SkipEtcdK8sConfig = true
+	cOps.WithStaticEndpoints = true
+
+	m := getInitializedTestMaker(t, cOps)
+
+	clusterCfgs, err := m.GetClusterConfigs()
+	require.NoError(t, err)
+
+	workers := clusterCfgs.ClusterRequest.Nodes.WorkerNodes()
+	require.Len(t, workers, 1)
+
+	// the static endpoints are the only source of control plane endpoints on the worker
+	cfg := workers[0].Config
+	assert.Nil(t, cfg.K8sClusterConfig())
+	assert.Empty(t, cfg.DiscoveryServiceConfigs())
+
+	require.NotNil(t, cfg.StaticEndpointsConfig())
+	assert.Equal(t,
+		[]netip.Addr{netip.MustParseAddr("10.5.0.2"), netip.MustParseAddr("10.5.0.3")},
+		cfg.StaticEndpointsConfig().Addresses(),
+	)
 }

@@ -69,6 +69,13 @@ func (suite *HealthSuite) TestClientSideWithDiscovery() {
 
 // TestServerSide does successful health check run from server-side.
 func (suite *HealthSuite) TestServerSide() {
+	discoveryEnabled, err := suite.isDiscoveryEnabled()
+	suite.Require().NoError(err)
+
+	if !discoveryEnabled {
+		suite.T().Skipf("skipping test: discovery is not enabled on the cluster")
+	}
+
 	randomControlPlaneNodeInternalIP := suite.RandomDiscoveredNodeInternalIP(machine.TypeControlPlane)
 	suite.RunCLI(
 		[]string{"health", "--nodes", randomControlPlaneNodeInternalIP},
@@ -78,7 +85,14 @@ func (suite *HealthSuite) TestServerSide() {
 }
 
 func (suite *HealthSuite) testClientSide(extraArgs ...string) {
-	args := append([]string{"--server=false"}, extraArgs...)
+	randomControlPlaneNodeInternalIP := suite.RandomDiscoveredNodeInternalIP(machine.TypeControlPlane)
+	args := append(
+		[]string{
+			"--server=false",
+			"--nodes", randomControlPlaneNodeInternalIP,
+		},
+		extraArgs...,
+	)
 
 	if suite.K8sEndpoint != "" {
 		args = append(args, "--k8s-endpoint", suite.K8sEndpoint)
@@ -104,7 +118,7 @@ func (suite *HealthSuite) isDiscoveryEnabled() (bool, error) {
 		return false, err
 	}
 
-	return temp.Spec.DiscoveryEnabled, nil
+	return temp.Spec.RegistryKubernetesEnabled || len(temp.Spec.ServiceEndpoints) > 0, nil
 }
 
 func init() {

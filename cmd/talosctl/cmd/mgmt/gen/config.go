@@ -29,6 +29,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
+	"github.com/siderolabs/talos/pkg/machinery/fileutils"
 )
 
 const (
@@ -73,12 +74,13 @@ var genConfigCmdFlags struct {
 	withDocs                bool
 	withClusterDiscovery    bool
 	withKubeSpan            bool
+	skipK8sEtcd             bool
 	withSecrets             string
 }
 
 // NewConfigCmd builds the config generation subcommand with the given name.
 func NewConfigCmd(name string) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   fmt.Sprintf("%s <cluster name> <cluster endpoint>", name),
 		Short: "Generates a set of configuration files for Talos cluster",
 		Long: `The cluster endpoint is the URL for the Kubernetes API. If you decide to use
@@ -100,6 +102,10 @@ setup, usually involving a load balancer, use the IP and port of the load balanc
 			}
 		},
 	}
+
+	addConfigFlags(cmd)
+
+	return cmd
 }
 
 func fixControlPlaneEndpoint(u *url.URL) *url.URL {
@@ -192,16 +198,20 @@ func writeConfig(args []string) error {
 		genOptions = append(genOptions, generate.WithRegistryMirror(left, right))
 	}
 
-	if genConfigCmdFlags.talosVersion != "" {
-		var versionContract *config.VersionContract
+	var versionContract *config.VersionContract
 
+	if genConfigCmdFlags.talosVersion != "" {
 		versionContract, err = config.ParseContractFromVersion(genConfigCmdFlags.talosVersion)
 		if err != nil {
 			return fmt.Errorf("invalid talos-version: %w", err)
 		}
-
-		genOptions = append(genOptions, generate.WithVersionContract(versionContract))
 	}
+
+	if genConfigCmdFlags.skipK8sEtcd {
+		versionContract = versionContract.DisableEtcd().DisableKubernetes()
+	}
+
+	genOptions = append(genOptions, generate.WithVersionContract(versionContract))
 
 	// Add KubeSpan configuration based on version
 	if genConfigCmdFlags.withKubeSpan {
@@ -219,7 +229,7 @@ func writeConfig(args []string) error {
 			return fmt.Errorf("failed to load secrets bundle: %w", err)
 		}
 
-		if err = secretsBundle.Validate(); err != nil {
+		if err = secretsBundle.Validate(versionContract); err != nil {
 			return fmt.Errorf("failed to validate secrets bundle: %w", err)
 		}
 
@@ -299,7 +309,7 @@ func writeConfigBundle(configBundle *bundle.Bundle, outputPaths configOutputPath
 			return err
 		}
 
-		if err = writeToDestination(data, outputPaths.controlPlane, 0o644); err != nil {
+		if err = writeToDestination(data, outputPaths.controlPlane); err != nil {
 			return err
 		}
 	}
@@ -310,7 +320,7 @@ func writeConfigBundle(configBundle *bundle.Bundle, outputPaths configOutputPath
 			return err
 		}
 
-		if err = writeToDestination(data, outputPaths.worker, 0o644); err != nil {
+		if err = writeToDestination(data, outputPaths.worker); err != nil {
 			return err
 		}
 	}
@@ -321,7 +331,7 @@ func writeConfigBundle(configBundle *bundle.Bundle, outputPaths configOutputPath
 			return fmt.Errorf("failed to marshal config: %+v", err)
 		}
 
-		if err = writeToDestination(data, outputPaths.talosconfig, 0o644); err != nil {
+		if err = writeToDestination(data, outputPaths.talosconfig); err != nil {
 			return err
 		}
 	}
@@ -329,7 +339,7 @@ func writeConfigBundle(configBundle *bundle.Bundle, outputPaths configOutputPath
 	return nil
 }
 
-func writeToDestination(data []byte, destination string, permissions os.FileMode) error {
+func writeToDestination(data []byte, destination string) error {
 	if destination == stdoutOutput {
 		_, err := os.Stdout.Write(data)
 
@@ -343,11 +353,11 @@ func writeToDestination(data []byte, destination string, permissions os.FileMode
 	parentDir := filepath.Dir(destination)
 
 	// Create dir path, ignoring "already exists" messages
-	if err := os.MkdirAll(parentDir, os.ModePerm); err != nil {
+	if err := os.MkdirAll(parentDir, fileutils.SecretDirMode); err != nil {
 		return fmt.Errorf("failed to create output dir: %w", err)
 	}
 
-	err := os.WriteFile(destination, data, permissions)
+	err := fileutils.WriteSecret(destination, data)
 
 	fmt.Fprintf(os.Stderr, "Created %s\n", destination)
 
@@ -427,9 +437,7 @@ func validateClusterEndpoint(endpoint string) error {
 	return nil
 }
 
-func init() {
-	genConfigCmd := NewConfigCmd("config")
-
+func addConfigFlags(genConfigCmd *cobra.Command) {
 	genConfigCmd.Flags().StringVar(&genConfigCmdFlags.installDisk, "install-disk", "/dev/sda", "the disk to install to")
 	genConfigCmd.Flags().StringVar(&genConfigCmdFlags.installImage, "install-image", helpers.DefaultImage(images.InstallerImageRepository("metal")), "the image used to perform an installation")
 	genConfigCmd.Flags().StringSliceVar(&genConfigCmdFlags.additionalSANs, "additional-sans", []string{}, "additional Subject-Alt-Names for the APIServer certificate")
@@ -453,5 +461,10 @@ func init() {
 	genConfigCmd.Flags().StringVar(&genConfigCmdFlags.outputDir, "output-dir", "", "destination to output generated files") // kept for backwards compatibility
 	genConfigCmd.Flags().MarkHidden("output-dir")                                                                           //nolint:errcheck
 
-	Cmd.AddCommand(genConfigCmd)
+	genConfigCmd.Flags().BoolVar(&genConfigCmdFlags.skipK8sEtcd, "skip-k8s-etcd", false, "skip generating etcd & Kubernetes configuration (experimental)")
+	genConfigCmd.Flags().MarkHidden("skip-k8s-etcd") //nolint:errcheck
+}
+
+func init() {
+	Cmd.AddCommand(NewConfigCmd("config"))
 }

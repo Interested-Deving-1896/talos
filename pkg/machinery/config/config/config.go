@@ -27,6 +27,7 @@ type Config interface { //nolint:interfacebloat
 	NetworkKubeSpanConfig() NetworkKubeSpanConfig
 	NetworkCommonLinkConfigs() []NetworkCommonLinkConfig
 	NetworkLinkAliasConfigs() []NetworkLinkAliasConfig
+	NetworkLinkIngressConfigs() []NetworkLinkIngressConfig
 	NetworkDHCPConfigs() []NetworkDHCPConfig
 	NetworkDHCPv4Configs() []NetworkDHCPv4Config
 	NetworkDHCPv6Configs() []NetworkDHCPv6Config
@@ -34,10 +35,51 @@ type Config interface { //nolint:interfacebloat
 	NetworkProbeConfigs() []NetworkCommonProbeConfig
 	NetworkBlackholeRouteConfigs() []NetworkBlackholeRouteConfig
 	NetworkRoutingRuleConfigs() []NetworkRoutingRuleConfig
+	NetworkBGPInstanceConfigs() []NetworkBGPInstanceConfig
+
+	// - cluster
+	DiscoveryServiceConfigs() []DiscoveryServiceConfig
+	DiscoveryIdentityConfig() DiscoveryIdentityConfig
+	StaticEndpointsConfig() StaticEndpointsConfig
 
 	// - k8s:
+	K8sAPIServerCAConfig() K8sAPIServerCAConfig
+	K8sAggregatorCAConfig() K8sAggregatorCAConfig
+	K8sAdmissionControlPluginConfigs() []K8sAdmissionControlPluginConfig
+	K8sAuditPolicyConfig() K8sAuditPolicyConfig
+	K8sAuthenticationConfig() K8sAuthenticationConfig
+	K8sAuthenticationWebhookConfig() K8sAuthenticationWebhookConfig
+	K8sAuthorizerConfigs() []K8sAuthorizerConfig
 	K8sEtcdEncryptionConfig() K8sEtcdEncryptionConfig
+	K8sAPIServerConfig() K8sAPIServerConfig
+	K8sControllerManagerConfig() K8sControllerManagerConfig
 	K8sSchedulerConfig() K8sSchedulerConfig
+	K8sProxyConfig() K8sProxyConfig
+	K8sClusterConfig() K8sClusterConfig
+	K8sNetworkConfig() K8sNetworkConfig
+	K8sNodeConfig() K8sNodeConfig
+	K8sFlannelCNIConfig() K8sFlannelCNIConfig
+	K8sCoreDNSConfig() K8sCoreDNSConfig
+	K8sServiceAccountConfig() K8sServiceAccountConfig
+	K8sKubeletConfig() K8sKubeletConfig
+	K8sCredentialProviderConfig() K8sCredentialProviderConfig
+	K8sStaticPodConfigs() []K8sStaticPodConfig
+	K8sInlineManifestConfigs() []K8sInlineManifestConfig
+	K8sExternalManifestConfigs() []K8sExternalManifestConfig
+	K8sKubePrismConfig() K8sKubePrismConfig
+	K8sTalosAPIAccessConfig() K8sTalosAPIAccessConfig
+
+	// - etcd:
+	EtcdCAConfig() EtcdCAConfig
+	EtcdMemberConfig() EtcdMemberConfig
+
+	// - containers:
+	ContainerConfigs() []ContainerConfig
+
+	// - hypervisor:
+	ContentLibraryConfigs() []ContentLibraryConfig
+	VirtualMachineConfigs() []VirtualMachineConfig
+	VirtualMachineProfileConfigs() []VirtualMachineProfileConfig
 
 	// - block devices/storage:
 	Volumes() VolumesConfig
@@ -47,19 +89,39 @@ type Config interface { //nolint:interfacebloat
 	ExternalVolumeConfigs() []ExternalVolumeConfig
 	SwapVolumeConfigs() []SwapVolumeConfig
 	ZswapConfig() ZswapConfig
+	FilesystemTrimConfig() FilesystemTrimConfig
+	FilesystemScrubConfig() FilesystemScrubConfig
+	DiskSMARTConfig() DiskSMARTConfig
+	LVMVolumeGroupConfigs() []LVMVolumeGroupConfig
+	LVMLogicalVolumeConfigs() []LVMLogicalVolumeConfig
+	RAIDArrayConfigs() []RAIDArrayConfig
+	StoragePoolConfigs() []StoragePoolConfig
 
 	// - cri:
 	RegistryMirrorConfigs() map[string]RegistryMirrorConfig
 	RegistryAuthConfigs() map[string]RegistryAuthConfig
 	RegistryTLSConfigs() map[string]RegistryTLSConfig
 	ImageCacheConfig() ImageCacheConfig
+	CRIBaseRuntimeSpecConfig() CRIBaseRuntimeSpecConfig
+	CRICustomizationConfigs() []CRICustomizationConfig
+	SeccompProfiles() []SeccompProfile
 
 	// - misc:
 	ExtensionServiceConfigs() []ExtensionServiceConfig
 	Runtime() RuntimeConfig
 	Environment() EnvironmentConfig
+	EtcFileConfigs() []EtcFileConfig
+	UdevRulesConfig() UdevConfig
 	TrustedRoots() TrustedRootsConfig
 	PCIDriverRebindConfig() PCIDriverRebindConfig
+	CPUScalingConfigs() []CPUScalingConfig
+	CPUPartitionConfig() CPUPartitionConfig
+	WorkloadResourceConfig() WorkloadResourceConfig
 	OOMConfig() OOMConfig
 	ImageVerificationConfig() ImageVerificationConfig
+	SysctlConfig() map[string]string
+	SysfsConfig() map[string]string
+	KernelModuleConfigs() []KernelModuleConfig
+	UnattendedInstallConfig() UnattendedInstallConfig
+	SecurityProfileConfig() SecurityProfileConfig
 }

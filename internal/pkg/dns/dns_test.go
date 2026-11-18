@@ -5,6 +5,7 @@
 package dns_test
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"iter"
@@ -15,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coredns/coredns/plugin/pkg/proxy"
 	dnssrv "github.com/miekg/dns"
 	"github.com/siderolabs/gen/maps"
 	"github.com/siderolabs/gen/xiter"
@@ -25,13 +25,27 @@ import (
 	"github.com/thejerf/suture/v4"
 	"go.uber.org/goleak"
 	"go.uber.org/zap/zaptest"
+	"golang.org/x/sys/unix"
 
 	"github.com/siderolabs/talos/internal/pkg/dns"
+	"github.com/siderolabs/talos/internal/pkg/dns/proxy"
 	"github.com/siderolabs/talos/pkg/machinery/resources/cluster"
 )
 
 func TestDNS(t *testing.T) {
-	t.Cleanup(func() { goleak.VerifyNone(t) })
+	t.Cleanup(func() {
+		// Failed upstreams kick off health checks: stopping the proxy doesn't abort
+		// the health check in flight, so wait for it to terminate on its own.
+		for range 50 {
+			if goleak.Find() == nil {
+				break
+			}
+
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		goleak.VerifyNone(t)
+	})
 
 	tests := []struct {
 		name         string
@@ -39,6 +53,9 @@ func TestDNS(t *testing.T) {
 		nameservers  []string
 		expectedCode int
 		errCheck     check.Check
+		// timeout overrides the client timeout,
+		// default is 5s.
+		timeout time.Duration
 	}{
 		{
 			name:         "success",
@@ -52,6 +69,8 @@ func TestDNS(t *testing.T) {
 			hostname:    "google-fail.com",
 			nameservers: []string{"242.242.242.242"},
 			errCheck:    check.ErrorContains("i/o timeout"),
+			// Must give up before the server's own upstream request timeout answers SERVFAIL.
+			timeout: time.Second,
 		},
 		{
 			name:         "empty destinations",
@@ -85,7 +104,7 @@ func TestDNS(t *testing.T) {
 			// The first one will return SERVFAIL and the second will return REFUSED. We should try both.
 			name:         `should return "refused"`,
 			hostname:     "dnssec-failed.org",
-			nameservers:  []string{"1.1.1.1", "ns-1098.awsdns-09.org."},
+			nameservers:  []string{"1.1.1.1", "ns1.google.com."},
 			expectedCode: dnssrv.RcodeRefused,
 			errCheck:     check.NoError(),
 		},
@@ -99,8 +118,10 @@ func TestDNS(t *testing.T) {
 
 				time.Sleep(10 * time.Millisecond)
 
+				timeout := cmp.Or(test.timeout, 5*time.Second)
+
 				c := dnssrv.Client{
-					Timeout: time.Second,
+					Timeout: timeout,
 				}
 
 				r, _, err := c.Exchange(createQuery(test.hostname), dnsAddr)
@@ -168,6 +189,92 @@ func Test_ServeBackground(t *testing.T) {
 	require.NoError(t, m.ClearAll(false))
 }
 
+// TestRunnerRestart ensures a [dns.Runner] can be started, stopped, and
+// started again. Previously the runner reused a single dns.Server across
+// restarts, so the second start failed permanently with
+// "dns: server already started", leaving nothing bound to the listen address.
+func TestRunnerRestart(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	newOpts := func() (dns.RunnerOptions, error) {
+		pc, err := dns.NewUDPPacketConn("udp", "127.0.0.1:0", nil)
+		if err != nil {
+			return dns.RunnerOptions{}, err
+		}
+
+		return dns.RunnerOptions{
+			PacketConn: pc,
+			Handler:    dnssrv.HandlerFunc(func(dnssrv.ResponseWriter, *dnssrv.Msg) {}),
+		}, nil
+	}
+
+	runner := dns.NewRunner(newOpts, zaptest.NewLogger(t))
+
+	for i := range 2 {
+		ctx, cancel := context.WithCancel(t.Context())
+
+		errCh := make(chan error, 1)
+		go func() { errCh <- runner.Serve(ctx) }()
+
+		// Give the server time to come up, then assert below that it did not
+		// exit early (e.g. returning "already started" on the second start).
+		time.Sleep(200 * time.Millisecond)
+
+		select {
+		case err := <-errCh:
+			t.Fatalf("runner exited early on start %d: %v", i, err)
+		default:
+		}
+
+		cancel()
+
+		select {
+		case err := <-errCh:
+			if err != nil && strings.Contains(err.Error(), "already started") {
+				t.Fatalf("runner restart failed on start %d: %v", i, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timeout waiting for runner to stop on start %d", i)
+		}
+	}
+}
+
+// TestRunAllReportsBindFailure ensures that a socket bind failure is reported
+// synchronously through RunAll (wrapped in [dns.ErrCreatingRunner]) rather than
+// being deferred to the supervisor. This keeps the caller able to surface the
+// error, ignore IPv6-only failures, or retry, as it did before the runner was
+// changed to rebuild its listeners on restart.
+func TestRunAllReportsBindFailure(t *testing.T) {
+	t.Cleanup(func() { goleak.VerifyNone(t) })
+
+	// Hold the socket open so the bind fails regardless of other tests' interface addresses.
+	listener, err := (&net.ListenConfig{}).ListenPacket(t.Context(), "udp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, listener.Close()) })
+
+	addr, err := netip.ParseAddrPort(listener.LocalAddr().String())
+	require.NoError(t, err)
+
+	m := dns.NewManager(&testMemberReader{}, &testStaticHostReader{}, func(e suture.Event) { t.Log("dns-runners event:", e) }, zaptest.NewLogger(t))
+
+	m.ServeBackground(t.Context())
+
+	var gotErr error
+
+	for _, err := range m.RunAll(slices.Values([]dns.AddressPair{
+		{Network: "udp", Addr: addr},
+	}), false) {
+		if err != nil {
+			gotErr = err
+		}
+	}
+
+	require.ErrorIs(t, gotErr, dns.ErrCreatingRunner)
+	require.ErrorIs(t, gotErr, unix.EADDRINUSE)
+
+	require.NoError(t, m.ClearAll(false))
+}
+
 func newManager(t *testing.T, nameservers ...string) func() {
 	m := dns.NewManager(
 		&testMemberReader{},
@@ -185,7 +292,7 @@ func newManager(t *testing.T, nameservers ...string) func() {
 	})
 
 	pxs := xslices.Map(nameservers, func(ns string) *proxy.Proxy {
-		p := proxy.NewProxy(ns, net.JoinHostPort(ns, "53"), "dns")
+		p := proxy.New(net.JoinHostPort(ns, "53"), nil)
 		p.Start(500 * time.Millisecond)
 
 		return p
@@ -193,7 +300,7 @@ func newManager(t *testing.T, nameservers ...string) func() {
 
 	t.Cleanup(func() {
 		for _, p := range pxs {
-			p.Close() // We had to manually add this method to the coredns Proxy type.
+			p.Close()
 		}
 	})
 
@@ -242,10 +349,8 @@ func newManager(t *testing.T, nameservers ...string) func() {
 
 func createQuery(name string) *dnssrv.Msg {
 	return &dnssrv.Msg{
-		MsgHdr: dnssrv.MsgHdr{
-			Id:               dnssrv.Id(),
-			RecursionDesired: true,
-		},
+		Id:               dnssrv.Id(),
+		RecursionDesired: true,
 		Question: []dnssrv.Question{
 			{
 				Name:   dnssrv.Fqdn(name),

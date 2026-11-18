@@ -23,6 +23,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/fipsmode"
 	"github.com/siderolabs/talos/pkg/machinery/resources/block"
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
 )
 
 // LogMode prints the current mode.
@@ -70,6 +71,15 @@ func InitVolumeLifecycle(ctx context.Context, log *zap.Logger, rt runtime.Runtim
 	return next()(ctx, log, rt, next)
 }
 
+// InitContainerLifecycle initializes the container shutdown barrier resource.
+func InitContainerLifecycle(ctx context.Context, log *zap.Logger, rt runtime.Runtime, next NextTaskFunc) error {
+	if err := rt.State().V1Alpha2().Resources().Create(ctx, containers.NewContainerLifecycle(containers.NamespaceName, containers.ContainerLifecycleID)); err != nil {
+		return fmt.Errorf("initContainerLifecycle: %w", err)
+	}
+
+	return next()(ctx, log, rt, next)
+}
+
 // MountCgroups represents mounts the cgroupfs (only in !container).
 func MountCgroups(ctx context.Context, log *zap.Logger, rt runtime.Runtime, next NextTaskFunc) error {
 	if rt.State().Platform().Mode().InContainer() {
@@ -77,7 +87,7 @@ func MountCgroups(ctx context.Context, log *zap.Logger, rt runtime.Runtime, next
 	}
 
 	if pointer.SafeDeref(procfs.ProcCmdline().Get(constants.KernelParamCGroups).First()) == "0" {
-		log.Warn(fmt.Sprintf("kernel argument %v is no longer supported", constants.KernelParamCGroups))
+		log.Warn("kernel argument is no longer supported", zap.String("argument", constants.KernelParamCGroups))
 	}
 
 	cgroup := mount.NewCgroup2()

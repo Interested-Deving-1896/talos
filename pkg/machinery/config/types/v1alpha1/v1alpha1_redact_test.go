@@ -24,6 +24,7 @@ func TestRedactSecrets(t *testing.T) {
 	for _, versionContract := range []*config.VersionContract{
 		config.TalosVersion1_13,
 		config.TalosVersion1_14,
+		config.TalosVersion1_15,
 	} {
 		t.Run(versionContract.String(), func(t *testing.T) {
 			t.Parallel()
@@ -36,39 +37,48 @@ func TestRedactSecrets(t *testing.T) {
 				return
 			}
 
-			config := container.RawV1Alpha1()
+			config := container
 
-			require.NotEmpty(t, config.MachineConfig.MachineToken)
-			require.NotEmpty(t, config.MachineConfig.MachineCA.Key)
-			require.NotEmpty(t, config.ClusterConfig.ClusterSecret)
-			require.NotEmpty(t, config.ClusterConfig.BootstrapToken)
-			require.Empty(t, config.ClusterConfig.ClusterAESCBCEncryptionSecret)
+			require.NotEmpty(t, config.Machine().Security().Token())
+			require.NotEmpty(t, config.Machine().Security().IssuingCA().Key)
 
-			require.NotEmpty(t, config.ClusterConfig.ClusterCA.Key)
-			require.NotEmpty(t, config.ClusterConfig.EtcdConfig.RootCA.Key)
-			require.NotEmpty(t, config.ClusterConfig.ClusterServiceAccount.Key)
+			// for 1.14+ the cluster secret lives in a separate DiscoveryIdentityConfig document,
+			// so it is no longer part of the v1alpha1 config (redaction of that document is covered elsewhere).
+			if !versionContract.DiscoveryIdentityMultidocConfig() {
+				require.NotEmpty(t, config.DiscoveryIdentityConfig().ClusterSecret())
+			}
+
+			require.NotEmpty(t, config.Cluster().Token().Secret())
+			require.Empty(t, config.Cluster().AESCBCEncryptionSecret())
+
+			require.NotEmpty(t, config.EtcdCAConfig().IssuingCA().Key)
+			require.NotEmpty(t, config.K8sServiceAccountConfig().IssuingKey().Key)
 
 			if !versionContract.MultidocKubernetesConfigSupported() {
-				require.NotEmpty(t, config.ClusterConfig.ClusterSecretboxEncryptionSecret)
+				require.NotEmpty(t, config.Cluster().SecretboxEncryptionSecret())
 			}
 
 			replacement := "**.***"
 
-			config.Redact(replacement)
+			redacted := config.RedactSecrets(replacement)
 
-			require.Equal(t, replacement, config.Machine().Security().Token())
-			require.Equal(t, replacement, string(config.Machine().Security().IssuingCA().Key))
-			require.Equal(t, replacement, config.Cluster().Secret())
-			require.Equal(t, "***", config.Cluster().Token().Secret())
-			require.Equal(t, "", config.Cluster().AESCBCEncryptionSecret())
-			require.Equal(t, replacement, string(config.Cluster().IssuingCA().Key))
-			require.Equal(t, replacement, string(config.Cluster().Etcd().CA().Key))
-			require.Equal(t, replacement, string(config.Cluster().ServiceAccount().Key))
+			require.Equal(t, replacement, redacted.Machine().Security().Token())
+			require.Equal(t, replacement, string(redacted.Machine().Security().IssuingCA().Key))
+
+			if !versionContract.DiscoveryIdentityMultidocConfig() {
+				require.Equal(t, replacement, redacted.DiscoveryIdentityConfig().ClusterSecret())
+			}
+
+			require.Equal(t, "***", redacted.Cluster().Token().Secret())
+			require.Equal(t, "", redacted.Cluster().AESCBCEncryptionSecret())
+			require.Equal(t, replacement, string(redacted.K8sAPIServerCAConfig().IssuingCA().Key))
+			require.Equal(t, replacement, string(redacted.EtcdCAConfig().IssuingCA().Key))
+			require.Equal(t, replacement, string(redacted.K8sServiceAccountConfig().IssuingKey().Key))
 
 			if versionContract.MultidocKubernetesConfigSupported() {
-				require.Empty(t, config.Cluster().SecretboxEncryptionSecret())
+				require.Empty(t, redacted.Cluster().SecretboxEncryptionSecret())
 			} else {
-				require.Equal(t, replacement, config.Cluster().SecretboxEncryptionSecret())
+				require.Equal(t, replacement, redacted.Cluster().SecretboxEncryptionSecret())
 			}
 		})
 	}

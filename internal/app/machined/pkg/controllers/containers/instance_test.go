@@ -1,0 +1,1769 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+package containers_test
+
+import (
+	"os"
+	"path/filepath"
+	"strconv"
+	"testing"
+	"time"
+
+	"github.com/cosi-project/runtime/pkg/resource"
+	"github.com/cosi-project/runtime/pkg/safe"
+	"github.com/cosi-project/runtime/pkg/state"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/suite"
+
+	containersctrl "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/containers"
+	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
+	"github.com/siderolabs/talos/pkg/machinery/config/config"
+	"github.com/siderolabs/talos/pkg/machinery/constants"
+	"github.com/siderolabs/talos/pkg/machinery/resources/block"
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
+	"github.com/siderolabs/talos/pkg/machinery/resources/network"
+	timeres "github.com/siderolabs/talos/pkg/machinery/resources/time"
+)
+
+const (
+	// testContainer is the container name every test in this suite uses.
+	testContainer = "nginx"
+	// clockContainer is an ungated container used to observe reconcile passes; see tick.
+	//
+	// The name has to sort after testContainer: a pass walks the specs in ID order, so the clock only
+	// means "the pass is done with testContainer" if it comes last.
+	clockContainer = "zz-clock"
+	// testImageRef is the image the test container spec declares.
+	testImageRef = "docker.io/library/nginx:latest"
+	// otherImageRef is a second reference, for tests that edit the spec's image.
+	otherImageRef = "docker.io/library/nginx:1.29"
+	// testDigest is the digest the faked image controller resolves testImageRef to.
+	testDigest = "sha256:abc"
+	// movedDigest is what a re-pull resolves to, standing in for a tag that has moved.
+	movedDigest = "sha256:def"
+)
+
+type InstanceSuite struct {
+	ctest.DefaultSuite
+
+	clockGeneration uint64
+}
+
+func TestInstanceSuite(t *testing.T) {
+	t.Parallel()
+
+	suite.Run(t, &InstanceSuite{
+		Timeout: 15 * time.Second,
+		AfterSetup: func(suite *ctest.DefaultSuite) {
+			suite.Require().NoError(suite.Runtime().RegisterController(&containersctrl.InstanceController{}))
+			suite.Require().NoError(suite.Runtime().RegisterController(&containersctrl.MountController{}))
+		},
+	})
+}
+
+// createSpec creates a ContainerSpec for testContainer, applying any mutators.
+func (suite *InstanceSuite) createSpec(mutate ...func(*containers.ContainerSpecSpec)) {
+	suite.createNamedSpec(testContainer, mutate...)
+}
+
+// createNamedSpec creates a ContainerSpec with a fixed image, applying any mutators.
+func (suite *InstanceSuite) createNamedSpec(name string, mutate ...func(*containers.ContainerSpecSpec)) {
+	spec := containers.NewContainerSpec(containers.NamespaceName, name)
+	spec.TypedSpec().Image = containers.ContainerImageSpec{Ref: testImageRef}
+
+	for _, m := range mutate {
+		m(spec.TypedSpec())
+	}
+
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), spec))
+}
+
+// markImageReady fakes the image controller's output for testContainer.
+func (suite *InstanceSuite) markImageReady() {
+	suite.markNamedImageReady(testContainer, testDigest)
+}
+
+// markNamedImageReady fakes the image controller's output, with digest as it resolved the tag.
+func (suite *InstanceSuite) markNamedImageReady(name, digest string) {
+	status := containers.NewContainerImageStatus(containers.NamespaceName, name)
+	status.TypedSpec().Phase = containers.ContainerImagePhaseReady
+	status.TypedSpec().Image = testImageRef
+	status.TypedSpec().Digest = digest
+
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), status))
+}
+
+// updateSpec applies a mutation to testContainer's ContainerSpec.
+func (suite *InstanceSuite) updateSpec(mutate func(*containers.ContainerSpecSpec)) {
+	ctest.UpdateWithConflicts(suite, containers.NewContainerSpec(containers.NamespaceName, testContainer),
+		func(spec *containers.ContainerSpec) error {
+			mutate(spec.TypedSpec())
+
+			return nil
+		})
+}
+
+// updateImageStatus applies a mutation to testContainer's ContainerImageStatus, standing in for a
+// re-pull by the image controller.
+func (suite *InstanceSuite) updateImageStatus(mutate func(*containers.ContainerImageStatusSpec)) {
+	ctest.UpdateWithConflicts(suite, containers.NewContainerImageStatus(containers.NamespaceName, testContainer),
+		func(status *containers.ContainerImageStatus) error {
+			mutate(status.TypedSpec())
+
+			return nil
+		})
+}
+
+// assertWaitingFor asserts the testContainer is waiting for the expected set of gates.
+func (suite *InstanceSuite) assertWaitingFor(waitingFor ...string) {
+	ctest.AssertResource(suite, testContainer,
+		func(dependencyStatus *containers.ContainerDependencyStatus, asrt *assert.Assertions) {
+			// The verdict is looked up by owning container through this label, so it has to be there
+			// on every write.
+			containerID, ok := dependencyStatus.Metadata().Labels().Get(containers.ContainerSpecIdLabel)
+			asrt.True(ok)
+			asrt.Equal(testContainer, containerID)
+
+			if len(waitingFor) == 0 {
+				asrt.Empty(dependencyStatus.TypedSpec().WaitingFor)
+
+				return
+			}
+
+			asrt.Equal(waitingFor, dependencyStatus.TypedSpec().WaitingFor)
+		})
+}
+
+// TestDependencyStatusReportsUnmetGates tests that:
+// - while a gate is unmet, ContainerDependencyStatus list the unmet gates.
+// - when the gate is met, ContainerDependencyStatus reflects that through empty WaitingFor, and that the container instance has been created.
+func (suite *InstanceSuite) TestDependencyStatusReportsUnmetGates() {
+	suite.createSpec()
+
+	suite.assertWaitingFor("image")
+
+	suite.markImageReady()
+
+	suite.assertWaitingFor()
+	suite.assertInstance(0)
+}
+
+// TestDependencyStatusEmptyWhileInstanceRuns covers a gate going unmet under a container that is
+// already running.
+func (suite *InstanceSuite) TestDependencyStatusEmptyWhileInstanceRuns() {
+	path := filepath.Join(suite.T().TempDir(), "gate")
+
+	suite.Require().NoError(os.WriteFile(path, nil, 0o600))
+
+	suite.createSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.DependsOn.Paths = []string{path}
+	})
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+	suite.assertWaitingFor()
+
+	suite.Require().NoError(os.Remove(path))
+
+	// The clock container proves a pass ran after the gate went away, so an empty verdict here is a
+	// decision rather than a status nobody has revisited yet.
+	suite.tick()
+
+	suite.assertWaitingFor()
+}
+
+// assertInstance asserts that the given generation of testContainer's instance exists.
+func (suite *InstanceSuite) assertInstance(generation uint64) {
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, generation),
+		func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+			asrt.Equal(generation, instance.TypedSpec().Generation)
+
+			// Instances are looked up by owning container through this label, so it has to be there
+			// from the moment the instance is created.
+			containerID, ok := instance.Metadata().Labels().Get(containers.ContainerSpecIdLabel)
+			asrt.True(ok)
+			asrt.Equal(testContainer, containerID)
+		})
+}
+
+// setInstanceStatus fakes the runtime controller's output for a generation of testContainer's
+// instance, creating or updating the status as needed.
+func (suite *InstanceSuite) setInstanceStatus(generation uint64, phase containers.ContainerInstancePhase, finishedAt time.Time) {
+	id := containers.InstanceID(testContainer, generation)
+
+	status := containers.NewContainerInstanceStatus(containers.NamespaceName, id)
+	status.TypedSpec().ContainerID = testContainer
+	status.TypedSpec().Generation = generation
+	status.TypedSpec().Phase = phase
+	status.TypedSpec().FinishedAt = finishedAt
+
+	if err := suite.State().Create(suite.Ctx(), status); err == nil {
+		return
+	}
+
+	ctest.UpdateWithConflicts(suite, status, func(res *containers.ContainerInstanceStatus) error {
+		*res.TypedSpec() = *status.TypedSpec()
+
+		return nil
+	})
+}
+
+// executionHash returns the execution hash of testContainer's ContainerSpec.
+func (suite *InstanceSuite) executionHash() string {
+	spec, err := safe.StateGetByID[*containers.ContainerSpec](suite.Ctx(), suite.State(), testContainer)
+	suite.Require().NoError(err)
+
+	return spec.TypedSpec().ExecutionHash()
+}
+
+// assertNoInstance asserts that the given generation of testContainer's instance does not exist.
+//
+// On its own this proves little: a resource that has not been created yet looks exactly like one
+// that never will be, so it also passes before the controller has run at all. Pair it with tick when
+// the point is that the container was considered and rejected.
+func (suite *InstanceSuite) assertNoInstance(generation uint64) {
+	ctest.AssertNoResource[*containers.ContainerInstanceSpec](suite, containers.InstanceID(testContainer, generation))
+}
+
+// tick returns once the controller has provably completed a reconcile pass over the current state.
+//
+// It works by changing the spec of an ungated container and waiting for the next generation of its
+// instance to appear. A pass reads every spec and status fresh, so a pass that produced that
+// generation also evaluated everything else written before this call, which is what makes a
+// subsequent assertNoInstance mean "considered and rejected" rather than "not yet reached".
+//
+// This relies on clockContainer sorting last: a pass walks the specs in ID order, so a clock instance
+// appearing mid-pass would say nothing about specs the pass had yet to reach.
+func (suite *InstanceSuite) tick() {
+	if suite.clockGeneration == 0 {
+		suite.createNamedSpec(clockContainer)
+		suite.markNamedImageReady(clockContainer, testDigest)
+	} else {
+		ctest.UpdateWithConflicts(suite, containers.NewContainerSpec(containers.NamespaceName, clockContainer),
+			func(spec *containers.ContainerSpec) error {
+				// Unique per tick, so the spec genuinely differs and the generation advances.
+				spec.TypedSpec().Args = []string{strconv.FormatUint(suite.clockGeneration, 10)}
+
+				return nil
+			})
+	}
+
+	ctest.AssertResource(suite, containers.InstanceID(clockContainer, suite.clockGeneration),
+		func(*containers.ContainerInstanceSpec, *assert.Assertions) {})
+
+	suite.clockGeneration++
+}
+
+// SetupTest resets the per-test clock on top of the default setup.
+func (suite *InstanceSuite) SetupTest() {
+	suite.DefaultSuite.SetupTest()
+
+	suite.clockGeneration = 0
+
+	// MountController treats a missing barrier as the node going down and does nothing, so nothing
+	// would ever become ready without it.
+	suite.Require().NoError(suite.State().Create(suite.Ctx(),
+		containers.NewContainerLifecycle(containers.NamespaceName, containers.ContainerLifecycleID)))
+
+	// MountController resolves volume names against the machine config.
+	declareTestVolume(&suite.DefaultSuite)
+}
+
+func (suite *InstanceSuite) TestNoInstanceUntilImageReady() {
+	suite.createSpec()
+
+	// No image status yet: the container stays pending.
+	suite.tick()
+	suite.assertNoInstance(0)
+
+	suite.markImageReady()
+
+	// Once ready, the instance appears; see TestInstanceMirrorsMinimalSpec for its contents.
+	suite.assertInstance(0)
+}
+
+// TestInstanceMirrorsFullSpec asserts the whole resulting instance at once, for a spec with every
+// field populated.
+//
+// Comparing the entire struct is the point: a field the controller forgets to carry over is not a
+// crash, it is a container quietly running without the setting the user asked for, and a
+// field-by-field test only covers the fields someone thought to list.
+func (suite *InstanceSuite) TestInstanceMirrorsFullSpec() {
+	suite.createSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Entrypoint = []string{"/docker-entrypoint.sh"}
+		spec.Args = []string{"nginx", "-g", "daemon off;"}
+		spec.WorkingDir = "/srv"
+		spec.RunAs = containers.ContainerRunAsSpec{UID: new(int32(65534)), GID: new(int32(65533))}
+		spec.Environment = []string{"NGINX_PORT=8080", "TZ=UTC"}
+		spec.Mounts = []containers.ContainerMountSpec{
+			{
+				Kind:        containers.MountKindHostPath,
+				Source:      "/dev",
+				Destination: "/host/dev",
+				Options:     []string{"ro"},
+			},
+			{
+				Kind:        containers.MountKindTmpfs,
+				Destination: "/tmp",
+				Size:        64 << 20,
+				Options:     []string{"nosuid"},
+			},
+		}
+		spec.Security = containers.ContainerSecuritySpec{
+			Privileged:       true,
+			CapabilitiesAdd:  []string{"NET_ADMIN"},
+			CapabilitiesDrop: []string{"ALL"},
+		}
+		spec.Network = containers.ContainerNetworkSpec{HostNetwork: true}
+		spec.Resources = containers.ContainerResourcesSpec{MemoryLimit: 1 << 29, CPULimit: 1500, SwapLimit: new(uint64(0))}
+		// DependsOn gates whether the instance exists; it is not carried onto it.
+		spec.DependsOn = containers.ContainerDependsOnSpec{Time: true}
+	})
+	suite.markImageReady()
+
+	timeStatus := timeres.NewStatus()
+	timeStatus.TypedSpec().Synced = true
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), timeStatus))
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 0), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		asrt.Equal(containers.ContainerInstanceSpecSpec{
+			ContainerID: testContainer,
+			Generation:  0,
+			// The resolved digest, not the reference the spec names.
+			Image:       testDigest,
+			Entrypoint:  []string{"/docker-entrypoint.sh"},
+			Args:        []string{"nginx", "-g", "daemon off;"},
+			WorkingDir:  "/srv",
+			RunAs:       containers.ContainerRunAsSpec{UID: new(int32(65534)), GID: new(int32(65533))},
+			Environment: []string{"NGINX_PORT=8080", "TZ=UTC"},
+			Mounts: []containers.ResolvedMountSpec{
+				{
+					Kind:        containers.MountKindHostPath,
+					Source:      "/dev",
+					Destination: "/host/dev",
+					Options:     []string{"ro"},
+				},
+				{
+					Kind:        containers.MountKindTmpfs,
+					Destination: "/tmp",
+					Size:        64 << 20,
+					Options:     []string{"nosuid"},
+				},
+			},
+			Security: containers.ContainerSecuritySpec{
+				Privileged:       true,
+				CapabilitiesAdd:  []string{"NET_ADMIN"},
+				CapabilitiesDrop: []string{"ALL"},
+			},
+			Network:       containers.ContainerNetworkSpec{HostNetwork: true},
+			Resources:     containers.ContainerResourcesSpec{MemoryLimit: 1 << 29, CPULimit: 1500, SwapLimit: new(uint64(0))},
+			ExecutionHash: suite.executionHash(),
+		}, *instance.TypedSpec())
+	})
+}
+
+// TestInstanceMirrorsMinimalSpec is the same assertion for a spec that sets nothing beyond the
+// image, so an invented default shows up as a difference.
+func (suite *InstanceSuite) TestInstanceMirrorsMinimalSpec() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 0), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		asrt.Equal(containers.ContainerInstanceSpecSpec{
+			ContainerID:   testContainer,
+			Image:         testDigest,
+			ExecutionHash: suite.executionHash(),
+		}, *instance.TypedSpec())
+	})
+}
+
+// TestGenerationCarriesOntoInstance pins the generation in the resource ID and the one in the spec
+// together: the ID is what the runtime keys off, the field is what it reports.
+func (suite *InstanceSuite) TestGenerationCarriesOntoInstance() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	for generation := uint64(1); generation <= 3; generation++ {
+		suite.updateSpec(func(spec *containers.ContainerSpecSpec) {
+			spec.Args = []string{strconv.FormatUint(generation, 10)}
+		})
+
+		ctest.AssertResource(suite, containers.InstanceID(testContainer, generation), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+			asrt.Equal(generation, instance.TypedSpec().Generation)
+			asrt.Equal(testContainer, instance.TypedSpec().ContainerID)
+			asrt.Equal([]string{strconv.FormatUint(generation, 10)}, instance.TypedSpec().Args)
+		})
+	}
+}
+
+// TestFailedImageStatusStaysPending pins the phase half of what "resolved" means.
+//
+// A digest alone must not start a container: a status that reports a failure has not produced
+// anything runnable, whatever digest it happens to still carry from an earlier pull.
+func (suite *InstanceSuite) TestFailedImageStatusStaysPending() {
+	suite.createSpec()
+
+	status := containers.NewContainerImageStatus(containers.NamespaceName, testContainer)
+	status.TypedSpec().Phase = containers.ContainerImagePhaseFailed
+	status.TypedSpec().Image = testImageRef
+	status.TypedSpec().Digest = testDigest
+	status.TypedSpec().Error = "signature verification denied"
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), status))
+
+	suite.tick()
+	suite.assertNoInstance(0)
+
+	// A later pull succeeds, and only now may the container start.
+	suite.updateImageStatus(func(status *containers.ContainerImageStatusSpec) {
+		status.Phase = containers.ContainerImagePhaseReady
+		status.Error = ""
+	})
+
+	suite.assertInstance(0)
+}
+
+// TestReadyWithoutDigestStaysPending covers a ready image status that carries no digest.
+//
+// A ready phase is not on its own something to start from: the instance runs a digest, so until there
+// is one the container waits rather than falling back to the mutable reference.
+func (suite *InstanceSuite) TestReadyWithoutDigestStaysPending() {
+	suite.createSpec()
+	suite.markNamedImageReady(testContainer, "")
+
+	suite.tick()
+	suite.assertNoInstance(0)
+
+	// The digest lands, and only now is there something to run.
+	suite.updateImageStatus(func(status *containers.ContainerImageStatusSpec) {
+		status.Digest = testDigest
+	})
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 0), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		asrt.Equal(testDigest, instance.TypedSpec().Image)
+	})
+}
+
+func (suite *InstanceSuite) TestGatesOnNetworkAndTime() {
+	suite.createSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.DependsOn.Networks = []string{"addresses"}
+		spec.DependsOn.Time = true
+	})
+	suite.markImageReady()
+
+	suite.tick()
+	suite.assertNoInstance(0)
+
+	netStatus := network.NewStatus(network.NamespaceName, network.StatusID)
+	netStatus.TypedSpec().AddressReady = true
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), netStatus))
+
+	// Network alone is not enough while time is also required.
+	suite.tick()
+	suite.assertNoInstance(0)
+
+	timeStatus := timeres.NewStatus()
+	timeStatus.TypedSpec().Synced = true
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), timeStatus))
+
+	suite.assertInstance(0)
+}
+
+// TestGatesOnHealthCheckedDependency covers dependsOn.containers on a container with a health check:
+// its process running is not enough, its check has to pass; once it has, there is no stability
+// window on top.
+func (suite *InstanceSuite) TestGatesOnHealthCheckedDependency() {
+	const dependency = "db"
+
+	// No image status for the dependency: this suite has no RuntimeController, so its instance and
+	// status are faked below instead.
+	suite.createNamedSpec(dependency, func(spec *containers.ContainerSpecSpec) {
+		spec.HealthCheck = containers.ContainerHealthCheckSpec{Kind: string(config.ContainerHealthCheckKindTCP), Port: 5432}
+	})
+
+	dependencyInstanceStatus := containers.NewContainerInstanceStatus(containers.NamespaceName, containers.InstanceID(dependency, 0))
+	dependencyInstanceStatus.TypedSpec().ContainerID = dependency
+	dependencyInstanceStatus.TypedSpec().Phase = containers.ContainerInstancePhaseRunning
+	dependencyInstanceStatus.TypedSpec().StartedAt = time.Now()
+	dependencyInstanceStatus.Metadata().Labels().Set(containers.ContainerSpecIdLabel, dependency)
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), dependencyInstanceStatus))
+
+	// What StatusController writes while the check has not passed yet.
+	dependencyStatus := containers.NewContainerStatus(containers.NamespaceName, dependency)
+	dependencyStatus.TypedSpec().State = containers.ContainerStateRunning
+	dependencyStatus.TypedSpec().Health = containers.ContainerHealthPending
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), dependencyStatus))
+
+	suite.createSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.DependsOn.Containers = []containers.ContainerDependencySpec{{Name: dependency}}
+	})
+	suite.markImageReady()
+
+	suite.tick()
+	suite.assertNoInstance(0)
+	suite.assertWaitingFor("container: " + dependency)
+
+	// ContainerStatus reporting healthy is not proof of a passed check: it may still be the health the
+	// dependency had before its check was enabled. Without a passed check the window applies.
+	ctest.UpdateWithConflicts(suite, dependencyStatus, func(res *containers.ContainerStatus) error {
+		res.TypedSpec().Health = containers.ContainerHealthHealthy
+
+		return nil
+	})
+
+	md := containers.NewContainerInstanceSpec(containers.NamespaceName, containers.InstanceID(testContainer, 0)).Metadata()
+	ctx, st := suite.Ctx(), suite.State()
+
+	suite.Never(func() bool {
+		_, err := st.Get(ctx, md)
+
+		return err == nil
+	}, 300*time.Millisecond, 10*time.Millisecond)
+
+	// What HealthController publishes once the check of the running instance has passed.
+	healthStatus := containers.NewContainerHealthStatus(containers.NamespaceName, containers.InstanceID(dependency, 0))
+	healthStatus.TypedSpec().Healthy = true
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), healthStatus))
+
+	// Well within the stability window the dependency only just started in: had the window applied,
+	// the instance would not exist yet.
+	suite.Eventually(func() bool {
+		_, err := st.Get(ctx, md)
+
+		return err == nil
+	}, 2*time.Second, 10*time.Millisecond)
+
+	suite.assertWaitingFor()
+}
+
+// assertNetworkConditionStarts pins one dependsOn.network condition to the network.Status field it
+// reads.
+//
+// Only that one field is ever set, so a condition reading the wrong field never becomes ready and
+// the container never starts. Asserting the whole set at once would not catch that: once every
+// field is true, a mis-wired condition is satisfied too.
+func (suite *InstanceSuite) assertNetworkConditionStarts(condition string, satisfy func(*network.StatusSpec)) {
+	suite.createSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.DependsOn.Networks = []string{condition}
+	})
+	suite.markImageReady()
+
+	suite.tick()
+	suite.assertNoInstance(0)
+
+	netStatus := network.NewStatus(network.NamespaceName, network.StatusID)
+	satisfy(netStatus.TypedSpec())
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), netStatus))
+
+	suite.assertInstance(0)
+}
+
+func (suite *InstanceSuite) TestGatesOnAddresses() {
+	suite.assertNetworkConditionStarts("addresses", func(status *network.StatusSpec) { status.AddressReady = true })
+}
+
+func (suite *InstanceSuite) TestGatesOnConnectivity() {
+	suite.assertNetworkConditionStarts("connectivity", func(status *network.StatusSpec) { status.ConnectivityReady = true })
+}
+
+func (suite *InstanceSuite) TestGatesOnHostname() {
+	suite.assertNetworkConditionStarts("hostname", func(status *network.StatusSpec) { status.HostnameReady = true })
+}
+
+func (suite *InstanceSuite) TestGatesOnEtcFiles() {
+	suite.assertNetworkConditionStarts("etcfiles", func(status *network.StatusSpec) { status.EtcFilesReady = true })
+}
+
+// TestTimeSyncDisabledBlocksTimeGate covers a node with time sync disabled: the dependsOn.time gate
+// was declared explicitly, so it stays unmet rather than silently letting the container start
+// without a synced clock.
+func (suite *InstanceSuite) TestTimeSyncDisabledBlocksTimeGate() {
+	suite.createSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.DependsOn.Time = true
+	})
+	suite.markImageReady()
+
+	timeStatus := timeres.NewStatus()
+	timeStatus.TypedSpec().SyncDisabled = true
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), timeStatus))
+
+	suite.tick()
+	suite.assertNoInstance(0)
+}
+
+// TestGatesOnPath covers the one dependency with no COSI equivalent, which the controller has to
+// poll for.
+func (suite *InstanceSuite) TestGatesOnPath() {
+	path := filepath.Join(suite.T().TempDir(), "ready")
+
+	suite.createSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.DependsOn.Paths = []string{path}
+	})
+	suite.markImageReady()
+
+	suite.tick()
+	suite.assertNoInstance(0)
+
+	suite.Require().NoError(os.WriteFile(path, nil, 0o600))
+
+	// Creating the file produces no resource event, so only the poll can make this pass.
+	suite.assertInstance(0)
+}
+
+func (suite *InstanceSuite) TestVolumeMountStaysPending() {
+	suite.createSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Mounts = []containers.ContainerMountSpec{
+			{
+				Kind:        containers.MountKindVolume,
+				VolumeName:  "web-content",
+				Destination: "/usr/share/nginx/html",
+			},
+		}
+	})
+	suite.markImageReady()
+
+	// The volume's host path is only known once it is actually mounted, so the container waits.
+	suite.tick()
+	suite.assertNoInstance(0)
+}
+
+// TestStartsOnceUserVolumeIsMounted is the other half: the container starts once the volume is
+// mounted, with the resolved host path on the instance it runs from.
+func (suite *InstanceSuite) TestStartsOnceUserVolumeIsMounted() {
+	suite.createSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Mounts = []containers.ContainerMountSpec{
+			{
+				Kind:        containers.MountKindVolume,
+				VolumeName:  "web-content",
+				Destination: "/usr/share/nginx/html",
+			},
+		}
+	})
+	suite.markImageReady()
+
+	requestID := "containers.MountController/" + testContainer + "/u-web-content"
+
+	ctest.AssertResource(suite, requestID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+
+	mountStatus := block.NewVolumeMountStatus(block.NamespaceName, requestID)
+	mountStatus.TypedSpec().VolumeID = "u-web-content"
+	mountStatus.TypedSpec().Requester = "containers.MountController"
+	mountStatus.TypedSpec().Target = "/var/mnt/web-content"
+
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), mountStatus))
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 0), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		if !asrt.Len(instance.TypedSpec().Mounts, 1) {
+			return
+		}
+
+		asrt.Equal("/var/mnt/web-content", instance.TypedSpec().Mounts[0].Source)
+		asrt.Equal("/usr/share/nginx/html", instance.TypedSpec().Mounts[0].Destination)
+	})
+}
+
+// TestVolumeRemountWaitsForContainerToStop covers a volume the block subsystem wants to unmount from
+// under a running container, e.g. an external volume to be remounted with new mount parameters.
+//
+// The running container comes first: it keeps the volume mounted as it is, and the remount happens
+// only once the container has stopped on its own, after which it restarts on the new mount.
+func (suite *InstanceSuite) TestVolumeRemountWaitsForContainerToStop() {
+	suite.createSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Mounts = []containers.ContainerMountSpec{
+			{
+				Kind:        containers.MountKindVolume,
+				VolumeName:  "web-content",
+				Destination: "/usr/share/nginx/html",
+			},
+		}
+	})
+	suite.markImageReady()
+
+	requestID := "containers.MountController/" + testContainer + "/u-web-content"
+
+	ctest.AssertResource(suite, requestID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+
+	mount := func() {
+		mountStatus := block.NewVolumeMountStatus(block.NamespaceName, requestID)
+		mountStatus.TypedSpec().VolumeID = "u-web-content"
+		mountStatus.TypedSpec().Requester = "containers.MountController"
+		mountStatus.TypedSpec().Target = "/var/mnt/web-content"
+
+		suite.Require().NoError(suite.State().Create(suite.Ctx(), mountStatus))
+	}
+
+	mount()
+
+	suite.assertInstance(0)
+	suite.setInstanceStatus(0, containers.ContainerInstancePhaseRunning, time.Time{})
+
+	// The block subsystem asks for the volume to be unmounted.
+	statusMD := block.NewVolumeMountStatus(block.NamespaceName, requestID).Metadata()
+
+	_, err := suite.State().Teardown(suite.Ctx(), statusMD)
+	suite.Require().NoError(err)
+
+	// The container keeps running, and keeps the volume held.
+	suite.tick()
+	suite.assertInstance(0)
+
+	ctest.AssertResource(suite, requestID, func(status *block.VolumeMountStatus, asrt *assert.Assertions) {
+		asrt.True(status.Metadata().Finalizers().Has("containers.MountController"))
+	})
+
+	// The container exits on its own, which releases the volume.
+	suite.setInstanceStatus(0, containers.ContainerInstancePhaseTerminated, time.Now().Add(-2*constants.ContainerDefaultRestartDelay))
+
+	ctest.AssertResource(suite, requestID, func(status *block.VolumeMountStatus, asrt *assert.Assertions) {
+		asrt.Empty(status.Metadata().Finalizers())
+	})
+
+	// It is not restarted until the volume is mounted again.
+	suite.tick()
+	suite.assertNoInstance(1)
+
+	suite.Require().NoError(suite.State().Destroy(suite.Ctx(), statusMD))
+	mount()
+
+	suite.assertInstance(1)
+	suite.assertNoInstance(0)
+}
+
+// TestResolvesTmpfsAndHostPathMounts covers the mount kinds that need no MountController.
+//
+// Asserting the resolved slice exactly is the point: each kind carries a different subset of the
+// fields, and the instance is what a runtime would build an OCI spec from.
+func (suite *InstanceSuite) TestResolvesTmpfsAndHostPathMounts() {
+	suite.createSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Mounts = []containers.ContainerMountSpec{
+			{
+				Kind:        containers.MountKindHostPath,
+				Source:      "/dev",
+				Destination: "/host/dev",
+				Options:     []string{"ro"},
+			},
+			{
+				Kind:        containers.MountKindTmpfs,
+				Destination: "/tmp",
+				Size:        64 << 20,
+				Options:     []string{"nosuid"},
+			},
+		}
+	})
+	suite.markImageReady()
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 0), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		asrt.Equal([]containers.ResolvedMountSpec{
+			{
+				Kind:        containers.MountKindHostPath,
+				Source:      "/dev",
+				Destination: "/host/dev",
+				Options:     []string{"ro"},
+			},
+			{
+				Kind:        containers.MountKindTmpfs,
+				Destination: "/tmp",
+				Size:        64 << 20,
+				Options:     []string{"nosuid"},
+			},
+		}, instance.TypedSpec().Mounts)
+	})
+}
+
+func (suite *InstanceSuite) TestSpecChangeReplacesInstance() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	suite.updateSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Args = []string{"--verbose"}
+	})
+
+	// The existing instance must be destroyed rather than mutated, and the next generation created
+	// from the new spec.
+	suite.assertNoInstance(0)
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 1), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		asrt.Equal(uint64(1), instance.TypedSpec().Generation)
+		asrt.Equal([]string{"--verbose"}, instance.TypedSpec().Args)
+	})
+}
+
+// TestEveryComparedFieldReplacesInstance walks every field the spec-to-instance comparison covers.
+//
+// A field left out of that comparison is not a visible failure: the container keeps running on the
+// old settings and the config change silently never takes effect. Each mutation must therefore
+// advance the generation.
+func (suite *InstanceSuite) TestEveryComparedFieldReplacesInstance() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	mutations := []func(*containers.ContainerSpecSpec){
+		func(spec *containers.ContainerSpecSpec) { spec.Entrypoint = []string{"/entrypoint.sh"} },
+		func(spec *containers.ContainerSpecSpec) { spec.Args = []string{"nginx", "-g", "daemon off;"} },
+		func(spec *containers.ContainerSpecSpec) { spec.WorkingDir = "/srv" },
+		func(spec *containers.ContainerSpecSpec) { spec.Environment = []string{"NGINX_PORT=8080"} },
+		// Each RunAs half separately: nil is meaningful there, so a comparison that only looks at
+		// one half would miss the other.
+		func(spec *containers.ContainerSpecSpec) { spec.RunAs.UID = new(int32(65534)) },
+		func(spec *containers.ContainerSpecSpec) { spec.RunAs.GID = new(int32(65534)) },
+		func(spec *containers.ContainerSpecSpec) { spec.Security.Privileged = true },
+		func(spec *containers.ContainerSpecSpec) { spec.Security.CapabilitiesAdd = []string{"NET_ADMIN"} },
+		func(spec *containers.ContainerSpecSpec) { spec.Security.CapabilitiesDrop = []string{"ALL"} },
+		func(spec *containers.ContainerSpecSpec) { spec.Network.HostNetwork = true },
+		func(spec *containers.ContainerSpecSpec) { spec.Resources.MemoryLimit = 1 << 29 },
+		func(spec *containers.ContainerSpecSpec) { spec.Resources.CPULimit = 1500 },
+		// nil and zero differ for the swap limit, so the comparison must see the pointer appear.
+		func(spec *containers.ContainerSpecSpec) { spec.Resources.SwapLimit = new(uint64(0)) },
+		func(spec *containers.ContainerSpecSpec) { spec.StopTimeout = time.Minute },
+		func(spec *containers.ContainerSpecSpec) {
+			spec.Mounts = []containers.ContainerMountSpec{{Kind: containers.MountKindTmpfs, Destination: "/tmp"}}
+		},
+	}
+
+	for i, mutate := range mutations {
+		suite.updateSpec(mutate)
+
+		suite.assertInstance(uint64(i + 1))
+	}
+}
+
+// TestMovedDigestReplacesInstance covers the drift that is invisible in the container spec: the
+// reference is untouched, but the tag now points at different bytes.
+//
+// The instance runs a digest, so comparing references would report no change and the container would
+// keep running the old image for the life of the node.
+func (suite *InstanceSuite) TestMovedDigestReplacesInstance() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 0), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		asrt.Equal(testDigest, instance.TypedSpec().Image)
+	})
+
+	// Same reference, re-pulled to different bytes.
+	suite.updateImageStatus(func(status *containers.ContainerImageStatusSpec) {
+		status.Digest = movedDigest
+	})
+
+	suite.assertNoInstance(0)
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 1), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		asrt.Equal(uint64(1), instance.TypedSpec().Generation)
+		asrt.Equal(movedDigest, instance.TypedSpec().Image)
+	})
+}
+
+// TestImageRefChangeWaitsForRepull covers an edited image reference, which reaches the instance only
+// once something has resolved it.
+//
+// Replacing the instance the moment the reference changes would stop the container before there is
+// anything to replace it with, so the old instance has to survive until the pull lands.
+func (suite *InstanceSuite) TestImageRefChangeWaitsForRepull() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	// The reference changes, but the image status still describes the old pull.
+	suite.updateSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Image = containers.ContainerImageSpec{Ref: otherImageRef}
+	})
+
+	suite.tick()
+	suite.assertNoInstance(1)
+	suite.assertInstance(0)
+
+	// The pull lands, and only now is there a new image to run.
+	suite.updateImageStatus(func(status *containers.ContainerImageStatusSpec) {
+		status.Image = otherImageRef
+		status.Digest = movedDigest
+	})
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 1), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		asrt.Equal(movedDigest, instance.TypedSpec().Image)
+	})
+}
+
+// TestUnresolvedImageKeepsInstance covers the image status disappearing under a running instance.
+//
+// There is nothing to replace it with, so churning the container would only take away a working one.
+func (suite *InstanceSuite) TestUnresolvedImageKeepsInstance() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	suite.Require().NoError(suite.State().Destroy(suite.Ctx(),
+		containers.NewContainerImageStatus(containers.NamespaceName, testContainer).Metadata()))
+
+	suite.tick()
+	suite.assertNoInstance(1)
+	suite.assertInstance(0)
+}
+
+// TestClearedDigestKeepsInstance covers a re-pull that reports no digest under a running instance.
+//
+// The instance is left alone rather than replaced: there is no digest to run instead, and stopping a
+// working container over a status that says nothing would be the worse of the two outcomes.
+func (suite *InstanceSuite) TestClearedDigestKeepsInstance() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	suite.updateImageStatus(func(status *containers.ContainerImageStatusSpec) {
+		status.Digest = ""
+	})
+
+	suite.tick()
+	suite.assertNoInstance(1)
+	suite.assertInstance(0)
+}
+
+// TestStaleImageStatusIsIgnored covers an image status that still describes the previous reference.
+//
+// ImageController keeps one status per container, so an edited reference leaves the old reference's
+// ready status in place until the re-pull lands. Those are the previous image's bytes, and starting
+// them under the new configuration would run an image nobody asked for.
+func (suite *InstanceSuite) TestStaleImageStatusIsIgnored() {
+	suite.createSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Image = containers.ContainerImageSpec{Ref: otherImageRef}
+	})
+
+	// Ready and carrying a digest, but for testImageRef rather than the reference the spec names.
+	suite.markImageReady()
+
+	suite.tick()
+	suite.assertNoInstance(0)
+
+	// The pull of the reference the spec does name lands.
+	suite.updateImageStatus(func(status *containers.ContainerImageStatusSpec) {
+		status.Image = otherImageRef
+		status.Digest = movedDigest
+	})
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 0), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		asrt.Equal(movedDigest, instance.TypedSpec().Image)
+	})
+}
+
+// TestGatedSpecChangeKeepsInstance covers a spec change made while the image gate is shut.
+//
+// Stopping the container the moment its spec changes leaves nothing to start in its place for as
+// long as the gate stays shut, so the running instance has to survive until the replacement can
+// actually be created.
+//
+// The generation the replacement lands on is what proves it: destroying first and creating in a
+// later pass throws away the only record of the current number, and the replacement comes back as
+// generation 0, reusing the ID of the instance that was just destroyed.
+func (suite *InstanceSuite) TestGatedSpecChangeKeepsInstance() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	// Shut the gate first: with the digest still resolved, the edit below would be a legitimate
+	// immediate replacement and this would test nothing.
+	suite.updateImageStatus(func(status *containers.ContainerImageStatusSpec) {
+		status.Digest = ""
+	})
+
+	suite.tick()
+	suite.assertInstance(0)
+
+	suite.updateSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Args = []string{"--verbose"}
+	})
+
+	suite.tick()
+	suite.assertInstance(0)
+	suite.assertNoInstance(1)
+
+	// The re-pull lands, and only now is there something to replace it with.
+	suite.updateImageStatus(func(status *containers.ContainerImageStatusSpec) {
+		status.Digest = movedDigest
+	})
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 1), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		asrt.Equal([]string{"--verbose"}, instance.TypedSpec().Args)
+		asrt.Equal(movedDigest, instance.TypedSpec().Image)
+	})
+
+	suite.assertNoInstance(0)
+}
+
+// TestGatedSpecChangeKeepsInstanceOnUnresolvableMount is the same case for a gate that never opens.
+//
+// Nothing resolves a volume yet, so replacing the instance over this edit would stop the
+// container permanently rather than briefly.
+func (suite *InstanceSuite) TestGatedSpecChangeKeepsInstanceOnUnresolvableMount() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	suite.updateSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Args = []string{"--verbose"}
+		spec.Mounts = []containers.ContainerMountSpec{
+			{
+				Kind:        containers.MountKindVolume,
+				VolumeName:  "web-content",
+				Destination: "/usr/share/nginx/html",
+			},
+		}
+	})
+
+	suite.tick()
+	suite.assertInstance(0)
+	suite.assertNoInstance(1)
+}
+
+// TestTearingDownInstanceIsReplaced covers a spec that reverts while the instance it invalidated is
+// still stopping.
+//
+// A stop already under way cannot be taken back: whatever holds the finalizer is bringing that
+// container down. Comparing the tearing-down instance against the reverted spec would report it in
+// sync, and it would sit there half-destroyed with nothing running in its place.
+func (suite *InstanceSuite) TestTearingDownInstanceIsReplaced() {
+	suite.createSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Args = []string{"nginx"}
+	})
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	instanceMD := containers.NewContainerInstanceSpec(containers.NamespaceName, containers.InstanceID(testContainer, 0)).Metadata()
+
+	// Stands in for the runtime controller having taken charge of the instance: the teardown below
+	// cannot complete until it releases.
+	suite.AddFinalizer(instanceMD, "test")
+
+	suite.updateSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Args = []string{"--verbose"}
+	})
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 0), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		asrt.Equal(resource.PhaseTearingDown, instance.Metadata().Phase())
+	})
+
+	// The spec goes back to exactly what the still-stopping instance was built from.
+	suite.updateSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Args = []string{"nginx"}
+	})
+
+	suite.tick()
+
+	suite.RemoveFinalizer(instanceMD, "test")
+
+	suite.assertNoInstance(0)
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 1), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		asrt.Equal([]string{"nginx"}, instance.TypedSpec().Args)
+	})
+}
+
+// TestNoChangeKeepsInstance is the other half of the comparison: a spec write that changes nothing
+// must not churn the container.
+//
+// The no-op write is followed by a real one, and the generation the real one lands on is what proves
+// the no-op was ignored: an over-eager comparison would have spent generation 1 on the no-op, so the
+// real change would land on 2 and this generation 1 would either be gone or carry the old args.
+// Asserting only that generation 1 is absent right after the no-op would pass either way, since a
+// resource that has not been created yet is indistinguishable from one that never will be.
+func (suite *InstanceSuite) TestNoChangeKeepsInstance() {
+	suite.createSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Args = []string{"nginx"}
+	})
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	// RunAs halves stay nil and mounts stay empty here, which is where an over-eager comparison
+	// would report a change on every pass and restart the container forever.
+	suite.updateSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Args = []string{"nginx"}
+	})
+
+	suite.updateSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Args = []string{"nginx", "-g", "daemon off;"}
+	})
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 1), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		asrt.Equal([]string{"nginx", "-g", "daemon off;"}, instance.TypedSpec().Args)
+	})
+
+	suite.tick()
+	suite.assertNoInstance(2)
+}
+
+func (suite *InstanceSuite) TestRemovesInstancesWhenSpecGoesAway() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	suite.Require().NoError(suite.State().Destroy(suite.Ctx(),
+		containers.NewContainerSpec(containers.NamespaceName, testContainer).Metadata()))
+
+	suite.assertNoInstance(0)
+}
+
+// TestRestartsAfterTermination covers the runtime controller's status feeding back into a restart,
+// once RestartInterval has elapsed since the instance finished.
+func (suite *InstanceSuite) TestRestartsAfterTermination() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	suite.setInstanceStatus(0, containers.ContainerInstancePhaseTerminated, time.Now().Add(-2*constants.ContainerDefaultRestartDelay))
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 1), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		asrt.Equal(uint64(1), instance.TypedSpec().Generation)
+	})
+
+	// The terminated instance is destroyed rather than kept around: nothing is retained.
+	suite.assertNoInstance(0)
+}
+
+// TestDoesNotRestartBeforeInterval covers the other half: a broken controller that restarts
+// immediately would also pass TestRestartsAfterTermination alone.
+func (suite *InstanceSuite) TestDoesNotRestartBeforeInterval() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	suite.setInstanceStatus(0, containers.ContainerInstancePhaseTerminated, time.Now())
+
+	suite.tick()
+	suite.assertNoInstance(1)
+
+	suite.setInstanceStatus(0, containers.ContainerInstancePhaseTerminated, time.Now().Add(-2*constants.ContainerDefaultRestartDelay))
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 1), func(*containers.ContainerInstanceSpec, *assert.Assertions) {})
+}
+
+// TestFailedInstanceRestarts covers the failed phase restarting exactly like a terminated one.
+func (suite *InstanceSuite) TestFailedInstanceRestarts() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	suite.setInstanceStatus(0, containers.ContainerInstancePhaseFailed, time.Now().Add(-2*constants.ContainerDefaultRestartDelay))
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 1), func(*containers.ContainerInstanceSpec, *assert.Assertions) {})
+}
+
+// TestRestartWaitsForInstanceToStop covers a restart while something still holds the instance.
+//
+// Destroying the terminated instance before creating its replacement is what keeps none around, and
+// that destruction is not instant: the runtime controller holds a finalizer until the task is stopped
+// and its runtime state cleaned up. Creating the replacement without waiting for that would run two
+// containers of the same name at once, and giving up on the wait would leave the container down for
+// good.
+func (suite *InstanceSuite) TestRestartWaitsForInstanceToStop() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	instanceMD := containers.NewContainerInstanceSpec(containers.NamespaceName, containers.InstanceID(testContainer, 0)).Metadata()
+
+	// Stands in for the runtime controller still stopping the task.
+	suite.AddFinalizer(instanceMD, "test")
+
+	suite.setInstanceStatus(0, containers.ContainerInstancePhaseTerminated, time.Now().Add(-2*constants.ContainerDefaultRestartDelay))
+
+	// The restart is due, so the instance is on its way out, but it cannot be replaced yet.
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 0), func(instance *containers.ContainerInstanceSpec, asrt *assert.Assertions) {
+		asrt.Equal(resource.PhaseTearingDown, instance.Metadata().Phase())
+	})
+
+	suite.tick()
+	suite.assertNoInstance(1)
+
+	suite.RemoveFinalizer(instanceMD, "test")
+
+	ctest.AssertResource(suite, containers.InstanceID(testContainer, 1), func(*containers.ContainerInstanceSpec, *assert.Assertions) {})
+	suite.assertNoInstance(0)
+}
+
+// TestKeepsNoOldInstances covers the invariant across a run of restarts: a container is only ever
+// represented by one instance, and terminated ones are not accumulated.
+//
+// Checking it after several restarts rather than one is the point: a leak of one instance per restart
+// is invisible in a single-restart test, and this is the shape that catches it.
+func (suite *InstanceSuite) TestKeepsNoOldInstances() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	const restarts = 5
+
+	for generation := range uint64(restarts) {
+		suite.setInstanceStatus(generation, containers.ContainerInstancePhaseTerminated, time.Now().Add(-2*constants.ContainerDefaultRestartDelay))
+
+		ctest.AssertResource(suite, containers.InstanceID(testContainer, generation+1), func(*containers.ContainerInstanceSpec, *assert.Assertions) {})
+
+		// Every generation before the current one is gone, not merely the oldest.
+		for older := range generation + 1 {
+			suite.assertNoInstance(older)
+		}
+	}
+
+	instances, err := safe.StateListAll[*containers.ContainerInstanceSpec](suite.Ctx(), suite.State())
+	suite.Require().NoError(err)
+
+	count := 0
+
+	for instance := range instances.All() {
+		if instance.TypedSpec().ContainerID == testContainer {
+			count++
+		}
+	}
+
+	suite.Require().Equal(1, count, "expected exactly one instance for %q", testContainer)
+}
+
+// setInstanceOutcome fakes how a generation of testContainer's instance ended.
+func (suite *InstanceSuite) setInstanceOutcome(generation uint64, phase containers.ContainerInstancePhase, exitCode int32, startedAt, finishedAt time.Time) {
+	id := containers.InstanceID(testContainer, generation)
+
+	status := containers.NewContainerInstanceStatus(containers.NamespaceName, id)
+	status.TypedSpec().ContainerID = testContainer
+	status.TypedSpec().Generation = generation
+	status.TypedSpec().Phase = phase
+	status.TypedSpec().ExitCode = exitCode
+	status.TypedSpec().StartedAt = startedAt
+	status.TypedSpec().FinishedAt = finishedAt
+
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), status))
+}
+
+// finishInstance fakes a generation of testContainer's instance exiting with exitCode long enough ago
+// for any restart to be due.
+func (suite *InstanceSuite) finishInstance(generation uint64, exitCode int32) {
+	finishedAt := time.Now().Add(-time.Hour)
+
+	suite.setInstanceOutcome(generation, containers.ContainerInstancePhaseTerminated, exitCode, finishedAt.Add(-time.Second), finishedAt)
+}
+
+func (suite *InstanceSuite) assertRunStatus(check func(*containers.ContainerRunStatusSpec, *assert.Assertions)) {
+	ctest.AssertResource(suite, testContainer, func(runStatus *containers.ContainerRunStatus, asrt *assert.Assertions) {
+		check(runStatus.TypedSpec(), asrt)
+	})
+}
+
+// assertOutcome checks the outcome InstanceController published for the finished first generation.
+func (suite *InstanceSuite) assertOutcome(want containers.ContainerState) {
+	suite.assertRunStatus(func(runStatus *containers.ContainerRunStatusSpec, asrt *assert.Assertions) {
+		outcome, ok := runStatus.Outcome(0)
+		asrt.True(ok)
+		asrt.Equal(want, outcome)
+	})
+}
+
+func withRestart(restart containers.ContainerRestartSpec) func(*containers.ContainerSpecSpec) {
+	return func(spec *containers.ContainerSpecSpec) { spec.Restart = restart }
+}
+
+// assertNotRestarted asserts that testContainer's finished instance stays and nothing replaces it.
+func (suite *InstanceSuite) assertNotRestarted(generation uint64) {
+	suite.tick()
+
+	suite.assertNoInstance(generation + 1)
+	suite.assertInstance(generation)
+}
+
+// TestNeverIsNotRestarted covers the never policy after a success.
+func (suite *InstanceSuite) TestNeverIsNotRestarted() {
+	suite.createSpec(withRestart(containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyNever}))
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+	suite.finishInstance(0, 0)
+
+	suite.assertNotRestarted(0)
+	suite.assertOutcome(containers.ContainerStateSucceeded)
+}
+
+// TestRefusedIsReplaced covers an instance Talos refused to start: it is replaced right away despite
+// the never policy and a long delay, without charging a restart.
+func (suite *InstanceSuite) TestRefusedIsReplaced() {
+	suite.createSpec(withRestart(containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyNever, Delay: time.Hour}))
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	status := containers.NewContainerInstanceStatus(containers.NamespaceName, containers.InstanceID(testContainer, 0))
+	status.TypedSpec().ContainerID = testContainer
+	status.TypedSpec().Phase = containers.ContainerInstancePhaseFailed
+	status.TypedSpec().Error = "mounts or devices changed before the container was started"
+	status.TypedSpec().FinishedAt = time.Now()
+	status.TypedSpec().Refused = true
+
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), status))
+
+	suite.assertInstance(1)
+	suite.assertRunStatus(func(runStatus *containers.ContainerRunStatusSpec, asrt *assert.Assertions) {
+		asrt.EqualValues(0, runStatus.Restarts)
+		asrt.EqualValues(0, runStatus.BackoffStep)
+	})
+}
+
+// TestNeverFailureIsNotRestarted covers the never policy after a failure.
+func (suite *InstanceSuite) TestNeverFailureIsNotRestarted() {
+	suite.createSpec(withRestart(containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyNever}))
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+	suite.finishInstance(0, 3)
+
+	suite.assertNotRestarted(0)
+	suite.assertOutcome(containers.ContainerStateFailed)
+}
+
+// TestOnFailure covers the on-failure policy: a failure is restarted until maxRetries, a success is not.
+func (suite *InstanceSuite) TestOnFailure() {
+	suite.createSpec(withRestart(containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyOnFailure, MaxRetries: new(uint32(2))}))
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+	suite.finishInstance(0, 3)
+
+	suite.assertInstance(1)
+	// a failed start is a failure, despite its zero exit code
+	finishedAt := time.Now().Add(-time.Hour)
+	suite.setInstanceOutcome(1, containers.ContainerInstancePhaseFailed, 0, time.Time{}, finishedAt)
+
+	suite.assertInstance(2)
+	suite.finishInstance(2, 3)
+
+	suite.assertNotRestarted(2)
+
+	suite.assertRunStatus(func(runStatus *containers.ContainerRunStatusSpec, asrt *assert.Assertions) {
+		asrt.EqualValues(2, runStatus.Restarts)
+		asrt.EqualValues(3, runStatus.NextGeneration)
+	})
+}
+
+// TestOnFailureSuccessIsNotRestarted covers an on-failure container which ran successfully.
+func (suite *InstanceSuite) TestOnFailureSuccessIsNotRestarted() {
+	suite.createSpec(withRestart(containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyOnFailure}))
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+	suite.finishInstance(0, 0)
+
+	suite.assertNotRestarted(0)
+}
+
+// TestRestartIsChargedOnce covers a restart whose replacement can't be created right away: the
+// restart is charged once, and the replacement gets the next generation once it can start.
+func (suite *InstanceSuite) TestRestartIsChargedOnce() {
+	suite.createSpec(withRestart(containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyOnFailure, MaxRetries: new(uint32(1))}))
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	// the image goes away, so the replacement waits on it after the instance is destroyed
+	suite.updateImageStatus(func(status *containers.ContainerImageStatusSpec) {
+		status.Phase = containers.ContainerImagePhasePending
+		status.Digest = ""
+	})
+
+	suite.finishInstance(0, 3)
+
+	suite.assertWaitingFor("image")
+
+	for range 3 {
+		suite.tick()
+	}
+
+	suite.assertNoInstance(1)
+	suite.assertRunStatus(func(runStatus *containers.ContainerRunStatusSpec, asrt *assert.Assertions) {
+		asrt.EqualValues(1, runStatus.Restarts)
+		asrt.EqualValues(1, runStatus.NextGeneration)
+	})
+
+	suite.updateImageStatus(func(status *containers.ContainerImageStatusSpec) {
+		status.Phase = containers.ContainerImagePhaseReady
+		status.Digest = testDigest
+	})
+
+	suite.assertInstance(1)
+	suite.finishInstance(1, 3)
+
+	suite.assertNotRestarted(1)
+}
+
+// TestDriftKeepsOutcome covers the image digest moving under a container which isn't restarted: it
+// is not run again.
+func (suite *InstanceSuite) TestDriftKeepsOutcome() {
+	suite.createSpec(withRestart(containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyNever}))
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+	suite.finishInstance(0, 0)
+
+	suite.updateImageStatus(func(status *containers.ContainerImageStatusSpec) {
+		status.Digest = "sha256:moved"
+	})
+
+	suite.assertNotRestarted(0)
+}
+
+// TestStopTimeoutChangeKeepsOutcome covers a stop timeout change of a container which isn't
+// restarted: it is not part of what the container runs, so the container isn't run again.
+func (suite *InstanceSuite) TestStopTimeoutChangeKeepsOutcome() {
+	suite.createSpec(withRestart(containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyNever}))
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+	suite.finishInstance(0, 0)
+
+	suite.assertNotRestarted(0)
+
+	suite.updateSpec(func(spec *containers.ContainerSpecSpec) { spec.StopTimeout = time.Minute })
+
+	suite.assertNotRestarted(0)
+	suite.assertOutcome(containers.ContainerStateSucceeded)
+}
+
+// TestDependsOnChangeKeepsOutcome covers a dependsOn change of a container which isn't restarted: it
+// gates the start of the container, but isn't part of what it runs, so the container isn't run again.
+func (suite *InstanceSuite) TestDependsOnChangeKeepsOutcome() {
+	// The new gate is met, so a replacement wrongly created for the change wouldn't sit waiting on it.
+	timeStatus := timeres.NewStatus()
+	timeStatus.TypedSpec().Synced = true
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), timeStatus))
+
+	suite.createSpec(withRestart(containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyNever}))
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+	suite.finishInstance(0, 0)
+
+	suite.assertNotRestarted(0)
+
+	suite.updateSpec(func(spec *containers.ContainerSpecSpec) { spec.DependsOn.Time = true })
+
+	suite.assertNotRestarted(0)
+	suite.assertOutcome(containers.ContainerStateSucceeded)
+}
+
+// TestStopTimeoutChangeKeepsRestartAccounting covers a stop timeout change of a running container: the
+// instance is replaced to carry it, but as the same configuration, so the restarts and the backoff
+// carry on rather than starting over.
+func (suite *InstanceSuite) TestStopTimeoutChangeKeepsRestartAccounting() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+	suite.finishInstance(0, 3)
+
+	suite.assertInstance(1)
+	suite.assertRunStatus(func(runStatus *containers.ContainerRunStatusSpec, asrt *assert.Assertions) {
+		asrt.EqualValues(1, runStatus.Restarts)
+		asrt.EqualValues(1, runStatus.BackoffStep)
+	})
+
+	hash := suite.executionHash()
+
+	suite.updateSpec(func(spec *containers.ContainerSpecSpec) { spec.StopTimeout = time.Minute })
+
+	suite.assertInstance(2)
+	suite.assertRunStatus(func(runStatus *containers.ContainerRunStatusSpec, asrt *assert.Assertions) {
+		asrt.Equal(hash, runStatus.ExecutionHash)
+		asrt.EqualValues(1, runStatus.Restarts)
+		asrt.EqualValues(1, runStatus.BackoffStep)
+		asrt.EqualValues(3, runStatus.NextGeneration)
+	})
+}
+
+// TestDeclaredChangeRunsAgain covers a change of the configuration of a container which isn't
+// restarted: it runs again, with its restarts starting over.
+func (suite *InstanceSuite) TestDeclaredChangeRunsAgain() {
+	suite.createSpec(withRestart(containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyOnFailure, MaxRetries: new(uint32(1))}))
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+	suite.finishInstance(0, 3)
+
+	suite.assertInstance(1)
+	suite.finishInstance(1, 3)
+
+	suite.assertNotRestarted(1)
+
+	suite.updateSpec(func(spec *containers.ContainerSpecSpec) { spec.Args = []string{"--fixed"} })
+
+	suite.assertInstance(2)
+	suite.assertRunStatus(func(runStatus *containers.ContainerRunStatusSpec, asrt *assert.Assertions) {
+		asrt.Zero(runStatus.Restarts)
+		asrt.EqualValues(3, runStatus.NextGeneration)
+	})
+
+	// the restarts start over
+	suite.finishInstance(2, 3)
+
+	suite.assertInstance(3)
+}
+
+// TestPolicyChangeAppliesToFinished covers a restart policy change on a container which wasn't
+// restarted: the new policy restarts it.
+func (suite *InstanceSuite) TestPolicyChangeAppliesToFinished() {
+	suite.createSpec(withRestart(containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyNever}))
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+	suite.finishInstance(0, 0)
+
+	suite.assertNotRestarted(0)
+
+	suite.updateSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.Restart.Policy = containers.ContainerRestartPolicyAlways
+	})
+
+	suite.assertInstance(1)
+}
+
+// TestPolicyChangeStartsRetriesOver covers a switch to on-failure: the restarts made under always
+// don't count against maxRetries, and the running instance is kept.
+func (suite *InstanceSuite) TestPolicyChangeStartsRetriesOver() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+	suite.finishInstance(0, 3)
+
+	suite.assertInstance(1)
+	suite.finishInstance(1, 3)
+
+	suite.assertInstance(2)
+	suite.assertRunStatus(func(runStatus *containers.ContainerRunStatusSpec, asrt *assert.Assertions) {
+		asrt.EqualValues(2, runStatus.Restarts)
+	})
+
+	suite.updateSpec(withRestart(containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyOnFailure, MaxRetries: new(uint32(1))}))
+
+	suite.assertRunStatus(func(runStatus *containers.ContainerRunStatusSpec, asrt *assert.Assertions) {
+		asrt.Equal(containers.ContainerRestartPolicyOnFailure, runStatus.Policy)
+		asrt.EqualValues(0, runStatus.Restarts)
+	})
+
+	suite.assertInstance(2)
+	suite.finishInstance(2, 3)
+
+	suite.assertInstance(3)
+	suite.finishInstance(3, 3)
+
+	suite.assertNotRestarted(3)
+
+	suite.assertRunStatus(func(runStatus *containers.ContainerRunStatusSpec, asrt *assert.Assertions) {
+		asrt.EqualValues(1, runStatus.Restarts)
+	})
+}
+
+// TestRestartBackoff covers the restart delay: it isn't restarted before the delay is over, and the
+// delay doubles with each restart.
+func (suite *InstanceSuite) TestRestartBackoff() {
+	suite.createSpec(withRestart(containers.ContainerRestartSpec{Delay: 500 * time.Millisecond, MaxDelay: 10 * time.Second}))
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	now := time.Now()
+	suite.setInstanceOutcome(0, containers.ContainerInstancePhaseTerminated, 1, now.Add(-100*time.Millisecond), now)
+
+	suite.assertInstance(1)
+	suite.assertRunStatus(func(runStatus *containers.ContainerRunStatusSpec, asrt *assert.Assertions) {
+		asrt.EqualValues(1, runStatus.BackoffStep)
+	})
+
+	now = time.Now()
+	suite.setInstanceOutcome(1, containers.ContainerInstancePhaseTerminated, 1, now.Add(-100*time.Millisecond), now)
+
+	// the second restart waits 1s
+	suite.tick()
+	suite.assertNoInstance(2)
+
+	suite.assertInstance(2)
+	suite.Assert().GreaterOrEqual(time.Since(now), time.Second)
+}
+
+// TestChargedRestartIsNotChargedAgain covers a restart which was charged, but whose instance wasn't
+// destroyed yet, e.g. across a controller restart: it goes ahead without charging it again, even
+// though the retries are used up by now.
+func (suite *InstanceSuite) TestChargedRestartIsNotChargedAgain() {
+	restart := containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyOnFailure, MaxRetries: new(uint32(1))}
+
+	spec := containers.ContainerSpecSpec{Image: containers.ContainerImageSpec{Ref: testImageRef}, Restart: restart}
+
+	runStatus := containers.NewContainerRunStatus(containers.NamespaceName, testContainer)
+	*runStatus.TypedSpec() = containers.ContainerRunStatusSpec{
+		ExecutionHash: spec.ExecutionHash(),
+		Policy:        restart.Policy,
+		Restarts:      1,
+		Restarted:     true,
+	}
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), runStatus, state.WithCreateOwner((&containersctrl.InstanceController{}).Name())))
+
+	suite.createSpec(withRestart(restart))
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+	suite.finishInstance(0, 3)
+
+	suite.assertInstance(1)
+	suite.assertRunStatus(func(runStatus *containers.ContainerRunStatusSpec, asrt *assert.Assertions) {
+		asrt.EqualValues(1, runStatus.Restarts)
+	})
+}
+
+// TestRunStatusKeptWhileInstanceStops covers a removed container whose instance is still being
+// stopped: its run status, and so its generations, are kept until the instance is gone.
+func (suite *InstanceSuite) TestRunStatusKeptWhileInstanceStops() {
+	suite.createSpec()
+	suite.markImageReady()
+
+	suite.assertInstance(0)
+
+	instanceMD := containers.NewContainerInstanceSpec(containers.NamespaceName, containers.InstanceID(testContainer, 0)).Metadata()
+	suite.Require().NoError(suite.State().AddFinalizer(suite.Ctx(), instanceMD, "test"))
+
+	suite.Require().NoError(suite.State().Destroy(suite.Ctx(), containers.NewContainerSpec(containers.NamespaceName, testContainer).Metadata()))
+
+	suite.tick()
+
+	suite.assertRunStatus(func(runStatus *containers.ContainerRunStatusSpec, asrt *assert.Assertions) {
+		asrt.EqualValues(1, runStatus.NextGeneration)
+	})
+
+	suite.Require().NoError(suite.State().RemoveFinalizer(suite.Ctx(), instanceMD, "test"))
+
+	ctest.AssertNoResource[*containers.ContainerRunStatus](suite, testContainer)
+}
+
+const initContainer = "init"
+
+// finishInitInstance fakes a generation of the init container's instance exiting with exitCode.
+func (suite *InstanceSuite) finishInitInstance(generation uint64, exitCode int32) {
+	name := initContainer
+	finishedAt := time.Now().Add(-time.Hour)
+
+	status := containers.NewContainerInstanceStatus(containers.NamespaceName, containers.InstanceID(name, generation))
+	status.TypedSpec().ContainerID = name
+	status.TypedSpec().Generation = generation
+	status.TypedSpec().Phase = containers.ContainerInstancePhaseTerminated
+	status.TypedSpec().ExitCode = exitCode
+	status.TypedSpec().StartedAt = finishedAt.Add(-time.Second)
+	status.TypedSpec().FinishedAt = finishedAt
+	status.Metadata().Labels().Set(containers.ContainerSpecIdLabel, name)
+
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), status))
+}
+
+// createInitAndDependent declares an init container run once, and testContainer depending on it
+// having succeeded.
+func (suite *InstanceSuite) createInitAndDependent() {
+	suite.createNamedSpec(initContainer, withRestart(containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyNever}))
+	suite.markNamedImageReady(initContainer, testDigest)
+
+	suite.createSpec(func(spec *containers.ContainerSpecSpec) {
+		spec.DependsOn.Containers = []containers.ContainerDependencySpec{
+			{Name: initContainer, Condition: containers.ContainerDependencyConditionSucceeded},
+		}
+	})
+
+	ctest.AssertResource(suite, containers.InstanceID(initContainer, 0), func(*containers.ContainerInstanceSpec, *assert.Assertions) {})
+}
+
+// TestDependsOnSucceeded covers a container started only once the container it depends on succeeded.
+func (suite *InstanceSuite) TestDependsOnSucceeded() {
+	suite.createInitAndDependent()
+	suite.markImageReady()
+
+	suite.assertWaitingFor("container: init to succeed")
+	suite.assertNoInstance(0)
+
+	suite.finishInitInstance(0, 0)
+
+	suite.assertInstance(0)
+	suite.assertWaitingFor()
+}
+
+// TestDependsOnFailed covers a container whose dependency failed: it keeps waiting.
+func (suite *InstanceSuite) TestDependsOnFailed() {
+	suite.createInitAndDependent()
+	suite.markImageReady()
+
+	suite.finishInitInstance(0, 3)
+
+	suite.tick()
+
+	suite.assertWaitingFor("container: init to succeed")
+	suite.assertNoInstance(0)
+}
+
+// TestDependencyRunAgainKeepsDependent covers the dependency running again after a change of its
+// configuration: the running dependent is left alone.
+func (suite *InstanceSuite) TestDependencyRunAgainKeepsDependent() {
+	suite.createInitAndDependent()
+	suite.markImageReady()
+
+	suite.finishInitInstance(0, 0)
+
+	suite.assertInstance(0)
+
+	ctest.UpdateWithConflicts(suite, containers.NewContainerSpec(containers.NamespaceName, initContainer),
+		func(spec *containers.ContainerSpec) error {
+			spec.TypedSpec().Args = []string{"--again"}
+
+			return nil
+		})
+
+	ctest.AssertResource(suite, containers.InstanceID(initContainer, 1), func(*containers.ContainerInstanceSpec, *assert.Assertions) {})
+
+	suite.tick()
+
+	suite.assertNoInstance(1)
+	suite.assertInstance(0)
+}
+
+// TestDependsOnStaleSuccess covers a dependency which succeeded, but whose configuration changed
+// before the dependent could start: it waits for the new run to succeed.
+func (suite *InstanceSuite) TestDependsOnStaleSuccess() {
+	suite.createInitAndDependent()
+
+	suite.finishInitInstance(0, 0)
+
+	ctest.UpdateWithConflicts(suite, containers.NewContainerSpec(containers.NamespaceName, initContainer),
+		func(spec *containers.ContainerSpec) error {
+			spec.TypedSpec().Args = []string{"--again"}
+
+			return nil
+		})
+
+	ctest.AssertResource(suite, containers.InstanceID(initContainer, 1), func(*containers.ContainerInstanceSpec, *assert.Assertions) {})
+
+	suite.markImageReady()
+
+	suite.tick()
+
+	suite.assertWaitingFor("container: init to succeed")
+	suite.assertNoInstance(0)
+
+	suite.finishInitInstance(1, 0)
+
+	suite.assertInstance(0)
+}

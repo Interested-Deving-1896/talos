@@ -8,6 +8,7 @@ package extensions
 
 import (
 	"fmt"
+	"path"
 
 	"github.com/siderolabs/gen/xslices"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/merge"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
 	"github.com/siderolabs/talos/pkg/machinery/config/validation"
+	"github.com/siderolabs/talos/pkg/machinery/extensions/services"
 )
 
 // ServiceConfigKind is a Extension config document kind.
@@ -128,9 +130,15 @@ func (e *ServiceConfigV1Alpha1) Clone() config.Document {
 }
 
 // Validate implements config.Validatator interface.
+//
+//nolint:gocyclo
 func (e *ServiceConfigV1Alpha1) Validate(validation.RuntimeMode, ...validation.Option) ([]string, error) {
 	if e.ServiceName == "" {
 		return nil, fmt.Errorf("name is required")
+	}
+
+	if !services.IsValidName(e.ServiceName) {
+		return nil, fmt.Errorf("name %q is invalid", e.ServiceName)
 	}
 
 	if len(e.ServiceConfigFiles) == 0 && len(e.ServiceEnvironment) == 0 {
@@ -143,17 +151,55 @@ func (e *ServiceConfigV1Alpha1) Validate(validation.RuntimeMode, ...validation.O
 		}
 	}
 
+	mountPaths := make(map[string]struct{}, len(e.ServiceConfigFiles))
+
 	for _, file := range e.ServiceConfigFiles {
 		if file.ConfigFileContent == "" {
 			return nil, fmt.Errorf("extension content is required for extension %q", e.ServiceName)
 		}
 
-		if file.ConfigFileMountPath == "" {
-			return nil, fmt.Errorf("extension mount path is required for extension %q", e.ServiceName)
+		if err := validateMountPath(file.ConfigFileMountPath, e.ServiceName); err != nil {
+			return nil, err
+		}
+
+		if _, ok := mountPaths[file.ConfigFileMountPath]; ok {
+			return nil, fmt.Errorf("extension mount path %q is duplicated for extension %q", file.ConfigFileMountPath, e.ServiceName)
+		}
+
+		mountPaths[file.ConfigFileMountPath] = struct{}{}
+	}
+
+	// files are stored at their mount paths, so one can't be a directory of another
+	for _, file := range e.ServiceConfigFiles {
+		for dir := path.Dir(file.ConfigFileMountPath); dir != "/"; dir = path.Dir(dir) {
+			if _, ok := mountPaths[dir]; ok {
+				return nil, fmt.Errorf("extension mount path %q is under %q for extension %q", file.ConfigFileMountPath, dir, e.ServiceName)
+			}
 		}
 	}
 
 	return nil, nil
+}
+
+func validateMountPath(mountPath, serviceName string) error {
+	if mountPath == "" {
+		return fmt.Errorf("extension mount path is required for extension %q", serviceName)
+	}
+
+	_, err := ConfigFileName(serviceName, mountPath)
+
+	return err
+}
+
+// ConfigFileName returns the name of the config file for mountPath relative to the extension service directory.
+//
+// The file is stored at its mount path under the service directory, so the mount path must be absolute and clean.
+func ConfigFileName(serviceName, mountPath string) (string, error) {
+	if !path.IsAbs(mountPath) || mountPath != path.Clean(mountPath) || mountPath == "/" {
+		return "", fmt.Errorf("extension mount path %q is invalid for extension %q", mountPath, serviceName)
+	}
+
+	return mountPath[1:], nil
 }
 
 // Name implements config.ExtensionServiceConfig interface.

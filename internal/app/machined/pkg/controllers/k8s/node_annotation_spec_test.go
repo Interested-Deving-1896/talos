@@ -32,11 +32,9 @@ func TestNodeAnnotationsSuite(t *testing.T) {
 	t.Parallel()
 
 	suite.Run(t, &NodeAnnotationsSuite{
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 5 * time.Second,
-			AfterSetup: func(s *ctest.DefaultSuite) {
-				s.Require().NoError(s.Runtime().RegisterController(&k8sctrl.NodeAnnotationSpecController{}))
-			},
+		Timeout: 5 * time.Second,
+		AfterSetup: func(s *ctest.DefaultSuite) {
+			s.Require().NoError(s.Runtime().RegisterController(&k8sctrl.NodeAnnotationSpecController{}))
 		},
 	})
 }
@@ -51,13 +49,13 @@ func (suite *NodeAnnotationsSuite) updateMachineConfig(annotations map[string]st
 		cfg = config.NewMachineConfig(container.NewV1Alpha1(&v1alpha1.Config{
 			MachineConfig: &v1alpha1.MachineConfig{
 				MachineType:            "controlplane",
-				MachineNodeAnnotations: annotations,
+				MachineNodeAnnotations: annotations, //nolint:staticcheck // testing deprecated field
 			},
 		}))
 
 		suite.Require().NoError(suite.State().Create(suite.Ctx(), cfg))
 	} else {
-		cfg.Container().RawV1Alpha1().MachineConfig.MachineNodeAnnotations = annotations
+		cfg.Container().RawV1Alpha1().MachineConfig.MachineNodeAnnotations = annotations //nolint:staticcheck // testing legacy config
 		suite.Require().NoError(suite.State().Update(suite.Ctx(), cfg))
 	}
 }

@@ -72,6 +72,15 @@ func (o EtcdRootSpec) DeepCopy() EtcdRootSpec {
 	if o.EtcdCA != nil {
 		cp.EtcdCA = o.EtcdCA.DeepCopy()
 	}
+	if o.AcceptedCAs != nil {
+		cp.AcceptedCAs = make([]*x509.PEMEncodedCertificate, len(o.AcceptedCAs))
+		copy(cp.AcceptedCAs, o.AcceptedCAs)
+		for i2 := range o.AcceptedCAs {
+			if o.AcceptedCAs[i2] != nil {
+				cp.AcceptedCAs[i2] = o.AcceptedCAs[i2].DeepCopy()
+			}
+		}
+	}
 	return cp
 }
 
@@ -168,11 +177,37 @@ func (o KubernetesRootSpec) DeepCopy() KubernetesRootSpec {
 			}
 		}
 	}
+	if o.AggregatorCA != nil {
+		cp.AggregatorCA = o.AggregatorCA.DeepCopy()
+	}
+	if o.AcceptedAggregatorCAs != nil {
+		cp.AcceptedAggregatorCAs = make([]*x509.PEMEncodedCertificate, len(o.AcceptedAggregatorCAs))
+		copy(cp.AcceptedAggregatorCAs, o.AcceptedAggregatorCAs)
+		for i2 := range o.AcceptedAggregatorCAs {
+			if o.AcceptedAggregatorCAs[i2] != nil {
+				cp.AcceptedAggregatorCAs[i2] = o.AcceptedAggregatorCAs[i2].DeepCopy()
+			}
+		}
+	}
 	if o.ServiceAccount != nil {
 		cp.ServiceAccount = o.ServiceAccount.DeepCopy()
 	}
-	if o.AggregatorCA != nil {
-		cp.AggregatorCA = o.AggregatorCA.DeepCopy()
+	if o.ServiceAccountAcceptedKeys != nil {
+		cp.ServiceAccountAcceptedKeys = make([]*x509.PEMEncodedKey, len(o.ServiceAccountAcceptedKeys))
+		copy(cp.ServiceAccountAcceptedKeys, o.ServiceAccountAcceptedKeys)
+		for i2 := range o.ServiceAccountAcceptedKeys {
+			if o.ServiceAccountAcceptedKeys[i2] != nil {
+				cp.ServiceAccountAcceptedKeys[i2] = o.ServiceAccountAcceptedKeys[i2].DeepCopy()
+			}
+		}
+	}
+	if o.AcceptedIssuers != nil {
+		cp.AcceptedIssuers = make([]string, len(o.AcceptedIssuers))
+		copy(cp.AcceptedIssuers, o.AcceptedIssuers)
+	}
+	if o.APIAudiences != nil {
+		cp.APIAudiences = make([]string, len(o.APIAudiences))
+		copy(cp.APIAudiences, o.APIAudiences)
 	}
 	if o.EtcdEncryptionConfig != nil {
 		cp.EtcdEncryptionConfig = make(map[string]any, len(o.EtcdEncryptionConfig))

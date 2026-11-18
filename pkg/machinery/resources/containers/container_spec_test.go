@@ -1,0 +1,695 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+package containers_test
+
+import (
+	"cmp"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/cosi-project/runtime/pkg/state"
+	"github.com/cosi-project/runtime/pkg/state/impl/inmem"
+	"github.com/siderolabs/gen/xslices"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/siderolabs/talos/pkg/machinery/config/config"
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
+	"github.com/siderolabs/talos/pkg/machinery/resources/network"
+	timeres "github.com/siderolabs/talos/pkg/machinery/resources/time"
+)
+
+func TestTimeReady(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	tests := []struct {
+		name  string
+		time  bool
+		setup func(*timeres.Status)
+		want  bool
+	}{
+		{
+			name: "time not declared",
+			time: false,
+			want: true,
+		},
+		{
+			name: "status missing",
+			time: true,
+			want: false,
+		},
+		{
+			name: "synced true",
+			time: true,
+			setup: func(status *timeres.Status) {
+				status.TypedSpec().Synced = true
+			},
+			want: true,
+		},
+		{
+			name: "sync disabled blocks forever",
+			time: true,
+			setup: func(status *timeres.Status) {
+				status.TypedSpec().SyncDisabled = true
+			},
+			want: false,
+		},
+		{
+			name: "synced false sync disabled false",
+			time: true,
+			setup: func(status *timeres.Status) {
+				// Both false by default
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := state.WrapCore(inmem.NewState())
+
+			if tt.setup != nil {
+				status := timeres.NewStatus()
+				tt.setup(status)
+				require.NoError(t, st.Create(ctx, status))
+			}
+
+			got, err := containers.ContainerDependsOnSpec{Time: tt.time}.TimeReady(ctx, st)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestNetworkConditionMet(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		setup     func(*network.Status)
+		condition string
+		want      bool
+	}{
+		{
+			name:      "nil status",
+			setup:     nil,
+			condition: "addresses",
+			want:      false,
+		},
+		{
+			name: "addresses ready",
+			setup: func(status *network.Status) {
+				status.TypedSpec().AddressReady = true
+			},
+			condition: "addresses",
+			want:      true,
+		},
+		{
+			name: "addresses not ready",
+			setup: func(status *network.Status) {
+				status.TypedSpec().AddressReady = false
+			},
+			condition: "addresses",
+			want:      false,
+		},
+		{
+			name: "connectivity ready",
+			setup: func(status *network.Status) {
+				status.TypedSpec().ConnectivityReady = true
+			},
+			condition: "connectivity",
+			want:      true,
+		},
+		{
+			name: "connectivity not ready",
+			setup: func(status *network.Status) {
+				status.TypedSpec().ConnectivityReady = false
+			},
+			condition: "connectivity",
+			want:      false,
+		},
+		{
+			name: "hostname ready",
+			setup: func(status *network.Status) {
+				status.TypedSpec().HostnameReady = true
+			},
+			condition: "hostname",
+			want:      true,
+		},
+		{
+			name: "hostname not ready",
+			setup: func(status *network.Status) {
+				status.TypedSpec().HostnameReady = false
+			},
+			condition: "hostname",
+			want:      false,
+		},
+		{
+			name: "etcfiles ready",
+			setup: func(status *network.Status) {
+				status.TypedSpec().EtcFilesReady = true
+			},
+			condition: "etcfiles",
+			want:      true,
+		},
+		{
+			name: "etcfiles not ready",
+			setup: func(status *network.Status) {
+				status.TypedSpec().EtcFilesReady = false
+			},
+			condition: "etcfiles",
+			want:      false,
+		},
+		{
+			name: "unknown condition",
+			setup: func(status *network.Status) {
+				status.TypedSpec().AddressReady = true
+			},
+			condition: "unknown",
+			want:      false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var status *network.Status
+			if tt.setup != nil {
+				status = network.NewStatus(network.NamespaceName, network.StatusID)
+				tt.setup(status)
+			}
+
+			got := containers.ContainerDependsOnSpec{}.NetworkConditionMet(status, tt.condition)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestContainersReady(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	tests := []struct {
+		name            string
+		containers      []string
+		setup           func(*containers.ContainerStatus)
+		setupInstance   func(*containers.ContainerInstanceStatus)
+		healthChecked   bool
+		healthStatus    func(*containers.ContainerHealthStatus)
+		want            []string
+		wantWakeUpAfter bool
+	}{
+		{
+			name:       "no containers declared",
+			containers: nil,
+			want:       nil,
+		},
+		{
+			name:       "status missing",
+			containers: []string{"other"},
+			want:       []string{"container: other"},
+		},
+		{
+			name:       "healthy but just started",
+			containers: []string{"other"},
+			setup: func(status *containers.ContainerStatus) {
+				status.TypedSpec().Health = containers.ContainerHealthHealthy
+				status.TypedSpec().State = containers.ContainerStateRunning
+			},
+			setupInstance: func(status *containers.ContainerInstanceStatus) {
+				status.TypedSpec().Phase = containers.ContainerInstancePhaseRunning
+				status.TypedSpec().StartedAt = time.Now()
+			},
+			want:            []string{"container: other"},
+			wantWakeUpAfter: true,
+		},
+		{
+			// Passing its health check is proof enough: no stability window on top of it.
+			name:          "health checked and just started",
+			containers:    []string{"other"},
+			healthChecked: true,
+			setup: func(status *containers.ContainerStatus) {
+				status.TypedSpec().Health = containers.ContainerHealthHealthy
+				status.TypedSpec().State = containers.ContainerStateRunning
+			},
+			setupInstance: func(status *containers.ContainerInstanceStatus) {
+				status.TypedSpec().Phase = containers.ContainerInstancePhaseRunning
+				status.TypedSpec().StartedAt = time.Now()
+			},
+			healthStatus: func(status *containers.ContainerHealthStatus) {
+				status.TypedSpec().Healthy = true
+			},
+			want: nil,
+		},
+		{
+			// The health check was just enabled, and ContainerStatus still reports the health from
+			// before it: no check has passed, so the stability window still applies.
+			name:          "health check enabled but not decided yet",
+			containers:    []string{"other"},
+			healthChecked: true,
+			setup: func(status *containers.ContainerStatus) {
+				status.TypedSpec().Health = containers.ContainerHealthHealthy
+				status.TypedSpec().State = containers.ContainerStateRunning
+			},
+			setupInstance: func(status *containers.ContainerInstanceStatus) {
+				status.TypedSpec().Phase = containers.ContainerInstancePhaseRunning
+				status.TypedSpec().StartedAt = time.Now()
+			},
+			want:            []string{"container: other"},
+			wantWakeUpAfter: true,
+		},
+		{
+			// ContainerStatus has not caught up with a failing check yet: the failure is no proof.
+			name:          "health check failing but status not caught up",
+			containers:    []string{"other"},
+			healthChecked: true,
+			setup: func(status *containers.ContainerStatus) {
+				status.TypedSpec().Health = containers.ContainerHealthHealthy
+				status.TypedSpec().State = containers.ContainerStateRunning
+			},
+			setupInstance: func(status *containers.ContainerInstanceStatus) {
+				status.TypedSpec().Phase = containers.ContainerInstancePhaseRunning
+				status.TypedSpec().StartedAt = time.Now()
+			},
+			healthStatus: func(status *containers.ContainerHealthStatus) {
+				status.TypedSpec().Healthy = false
+			},
+			want:            []string{"container: other"},
+			wantWakeUpAfter: true,
+		},
+		{
+			// Running, but its health check has not passed yet: the process alone does not satisfy the gate.
+			name:          "health checked but not passed yet",
+			containers:    []string{"other"},
+			healthChecked: true,
+			setup: func(status *containers.ContainerStatus) {
+				status.TypedSpec().Health = containers.ContainerHealthPending
+				status.TypedSpec().State = containers.ContainerStateRunning
+			},
+			setupInstance: func(status *containers.ContainerInstanceStatus) {
+				status.TypedSpec().Phase = containers.ContainerInstancePhaseRunning
+				status.TypedSpec().StartedAt = time.Now().Add(-time.Hour)
+			},
+			want: []string{"container: other"},
+		},
+		{
+			// ContainerStatus has not caught up with an instance that has already exited: a stale read
+			// between two controllers' outputs, waited out rather than trusted.
+			name:          "healthy but newest instance exited",
+			containers:    []string{"other"},
+			healthChecked: true,
+			setup: func(status *containers.ContainerStatus) {
+				status.TypedSpec().Health = containers.ContainerHealthHealthy
+				status.TypedSpec().State = containers.ContainerStateRunning
+			},
+			setupInstance: func(status *containers.ContainerInstanceStatus) {
+				status.TypedSpec().Phase = containers.ContainerInstancePhaseTerminated
+				status.TypedSpec().StartedAt = time.Now().Add(-time.Hour)
+			},
+			want: []string{"container: other"},
+		},
+		{
+			name:       "healthy and stable",
+			containers: []string{"other"},
+			setup: func(status *containers.ContainerStatus) {
+				status.TypedSpec().Health = containers.ContainerHealthHealthy
+				status.TypedSpec().State = containers.ContainerStateRunning
+			},
+			setupInstance: func(status *containers.ContainerInstanceStatus) {
+				status.TypedSpec().Phase = containers.ContainerInstancePhaseRunning
+				status.TypedSpec().StartedAt = time.Now().Add(-time.Hour)
+			},
+			want: nil,
+		},
+		{
+			name:       "stopping keeps its health",
+			containers: []string{"other"},
+			setup: func(status *containers.ContainerStatus) {
+				// What StatusController writes for an instance that is on its way out: the health it had
+				// last, carried over, with the state saying what is actually happening to it.
+				status.TypedSpec().Health = containers.ContainerHealthHealthy
+				status.TypedSpec().State = containers.ContainerStateStopping
+			},
+			setupInstance: func(status *containers.ContainerInstanceStatus) {
+				status.TypedSpec().Phase = containers.ContainerInstancePhaseRunning
+				status.TypedSpec().StartedAt = time.Now().Add(-time.Hour)
+			},
+			want: []string{"container: other"},
+		},
+		{
+			name:       "healthy but no instance status",
+			containers: []string{"other"},
+			setup: func(status *containers.ContainerStatus) {
+				status.TypedSpec().Health = containers.ContainerHealthHealthy
+				status.TypedSpec().State = containers.ContainerStateRunning
+			},
+			want: []string{"container: other"},
+		},
+		{
+			name:       "degraded",
+			containers: []string{"other"},
+			setup: func(status *containers.ContainerStatus) {
+				status.TypedSpec().Health = containers.ContainerHealthDegraded
+			},
+			want: []string{"container: other"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := state.WrapCore(inmem.NewState())
+
+			if tt.healthChecked {
+				spec := containers.NewContainerSpec(containers.NamespaceName, "other")
+				spec.TypedSpec().HealthCheck = containers.ContainerHealthCheckSpec{Kind: string(config.ContainerHealthCheckKindTCP), Port: 80}
+				require.NoError(t, st.Create(ctx, spec))
+			}
+
+			if tt.setup != nil {
+				status := containers.NewContainerStatus(containers.NamespaceName, "other")
+				tt.setup(status)
+				require.NoError(t, st.Create(ctx, status))
+			}
+
+			if tt.setupInstance != nil {
+				instanceStatus := containers.NewContainerInstanceStatus(containers.NamespaceName, containers.InstanceID("other", 0))
+				instanceStatus.TypedSpec().ContainerID = "other"
+				instanceStatus.Metadata().Labels().Set(containers.ContainerSpecIdLabel, "other")
+				tt.setupInstance(instanceStatus)
+				require.NoError(t, st.Create(ctx, instanceStatus))
+			}
+
+			if tt.healthStatus != nil {
+				healthStatus := containers.NewContainerHealthStatus(containers.NamespaceName, containers.InstanceID("other", 0))
+				tt.healthStatus(healthStatus)
+				require.NoError(t, st.Create(ctx, healthStatus))
+			}
+
+			got, wakeUpAfter, err := containers.ContainerDependsOnSpec{Containers: xslices.Map(tt.containers, func(name string) containers.ContainerDependencySpec {
+				return containers.ContainerDependencySpec{Name: name}
+			})}.ContainersReady(ctx, st)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+
+			_, wakeUpAfterSet := wakeUpAfter.Get()
+			assert.Equal(t, tt.wantWakeUpAfter, wakeUpAfterSet)
+		})
+	}
+}
+
+func TestReady(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	st := state.WrapCore(inmem.NewState())
+
+	networkStatus := network.NewStatus(network.NamespaceName, network.StatusID)
+	networkStatus.TypedSpec().AddressReady = true
+	require.NoError(t, st.Create(ctx, networkStatus))
+
+	timeStatus := timeres.NewStatus()
+	timeStatus.TypedSpec().Synced = true
+	require.NoError(t, st.Create(ctx, timeStatus))
+
+	existingPath := filepath.Join(t.TempDir(), "exists")
+	require.NoError(t, os.WriteFile(existingPath, nil, 0o644))
+
+	missingPath := filepath.Join(t.TempDir(), "missing")
+
+	for _, tt := range []struct {
+		name            string
+		dependsOn       containers.ContainerDependsOnSpec
+		wantWaitingFor  []string
+		wantWakeUpAfter bool
+	}{
+		{
+			name:      "no gates declared",
+			dependsOn: containers.ContainerDependsOnSpec{},
+		},
+		{
+			name: "network condition met",
+			dependsOn: containers.ContainerDependsOnSpec{
+				Networks: []string{"addresses"},
+			},
+		},
+		{
+			name: "network condition unmet",
+			dependsOn: containers.ContainerDependsOnSpec{
+				Networks: []string{"connectivity"},
+			},
+			wantWaitingFor: []string{"network: connectivity"},
+		},
+		{
+			name: "time condition met",
+			dependsOn: containers.ContainerDependsOnSpec{
+				Time: true,
+			},
+		},
+		{
+			name: "path exists",
+			dependsOn: containers.ContainerDependsOnSpec{
+				Paths: []string{existingPath},
+			},
+			wantWakeUpAfter: true,
+		},
+		{
+			name: "path missing",
+			dependsOn: containers.ContainerDependsOnSpec{
+				Paths: []string{missingPath},
+			},
+			wantWaitingFor:  []string{"path: " + missingPath},
+			wantWakeUpAfter: true,
+		},
+		{
+			name: "container dependency unmet",
+			dependsOn: containers.ContainerDependsOnSpec{
+				Containers: []containers.ContainerDependencySpec{{Name: "other"}},
+			},
+			wantWaitingFor: []string{"container: other"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			waitingFor, wakeUpAfter, err := tt.dependsOn.Ready(ctx, st)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantWaitingFor, waitingFor)
+
+			_, wakeUpAfterSet := wakeUpAfter.Get()
+			assert.Equal(t, tt.wantWakeUpAfter, wakeUpAfterSet)
+		})
+	}
+}
+
+func TestReadyMissingStatuses(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	// No network or time Status resources exist in this state, exercising the not-found path.
+	st := state.WrapCore(inmem.NewState())
+
+	dependsOn := containers.ContainerDependsOnSpec{
+		Networks:   []string{"addresses"},
+		Time:       true,
+		Containers: []containers.ContainerDependencySpec{{Name: "other"}},
+	}
+
+	waitingFor, wakeUpAfter, err := dependsOn.Ready(ctx, st)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"network: addresses", "time", "container: other"}, waitingFor)
+
+	_, wakeUpAfterSet := wakeUpAfter.Get()
+	assert.False(t, wakeUpAfterSet)
+}
+
+func TestExecutionHash(t *testing.T) {
+	t.Parallel()
+
+	base := containers.ContainerSpecSpec{
+		Image:       containers.ContainerImageSpec{Ref: "docker.io/library/nginx:latest"},
+		Environment: []string{"A=1"},
+	}
+
+	hash := base.ExecutionHash()
+
+	same := base
+	same.Restart = containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyNever, Delay: time.Minute}
+	same.DependsOn = containers.ContainerDependsOnSpec{Containers: []containers.ContainerDependencySpec{{Name: "db"}}}
+	same.StopTimeout = time.Minute
+
+	assert.Equal(t, hash, same.ExecutionHash())
+
+	for _, mutate := range []func(*containers.ContainerSpecSpec){
+		func(spec *containers.ContainerSpecSpec) { spec.Image.Ref = "docker.io/library/nginx:1.27" },
+		func(spec *containers.ContainerSpecSpec) { spec.Environment = []string{"A=2"} },
+		func(spec *containers.ContainerSpecSpec) { spec.Args = []string{"-v"} },
+		func(spec *containers.ContainerSpecSpec) { spec.Network.HostNetwork = true },
+		func(spec *containers.ContainerSpecSpec) {
+			spec.Mounts = []containers.ContainerMountSpec{{Kind: containers.MountKindTmpfs, Destination: "/tmp"}}
+		},
+	} {
+		changed := base
+		mutate(&changed)
+
+		assert.NotEqual(t, hash, changed.ExecutionHash())
+	}
+}
+
+// TestHealthCheckSameCheck covers which edits of a health check leave its outcome standing: only
+// those of its schedule.
+func TestHealthCheckSameCheck(t *testing.T) {
+	t.Parallel()
+
+	base := containers.ContainerHealthCheckSpec{
+		Kind:             string(config.ContainerHealthCheckKindHTTP),
+		Port:             8080,
+		Path:             "/healthz",
+		InitialDelay:     time.Second,
+		Interval:         10 * time.Second,
+		Timeout:          time.Second,
+		FailureThreshold: 3,
+	}
+
+	for name, mutate := range map[string]func(*containers.ContainerHealthCheckSpec){
+		"initial delay":     func(hc *containers.ContainerHealthCheckSpec) { hc.InitialDelay = time.Hour },
+		"interval":          func(hc *containers.ContainerHealthCheckSpec) { hc.Interval = time.Minute },
+		"timeout":           func(hc *containers.ContainerHealthCheckSpec) { hc.Timeout = 5 * time.Second },
+		"failure threshold": func(hc *containers.ContainerHealthCheckSpec) { hc.FailureThreshold = 10 },
+	} {
+		changed := base
+		mutate(&changed)
+
+		assert.True(t, base.SameCheck(changed), name)
+	}
+
+	for name, mutate := range map[string]func(*containers.ContainerHealthCheckSpec){
+		"kind":         func(hc *containers.ContainerHealthCheckSpec) { hc.Kind = string(config.ContainerHealthCheckKindTCP) },
+		"port":         func(hc *containers.ContainerHealthCheckSpec) { hc.Port = 8081 },
+		"path":         func(hc *containers.ContainerHealthCheckSpec) { hc.Path = "/readyz" },
+		"grpc service": func(hc *containers.ContainerHealthCheckSpec) { hc.GRPCService = "api" },
+		"disabled":     func(hc *containers.ContainerHealthCheckSpec) { *hc = containers.ContainerHealthCheckSpec{} },
+	} {
+		changed := base
+		mutate(&changed)
+
+		assert.False(t, base.SameCheck(changed), name)
+	}
+}
+
+func TestContainersReadySucceeded(t *testing.T) {
+	t.Parallel()
+
+	initSpec := containers.ContainerSpecSpec{
+		Image:   containers.ContainerImageSpec{Ref: "ghcr.io/example/init:v1.0.0"},
+		Restart: containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyNever},
+	}
+
+	for _, test := range []struct {
+		name       string
+		restart    containers.ContainerRestartSpec
+		phase      containers.ContainerInstancePhase
+		exitCode   int32
+		hash       string
+		charged    bool
+		noInstance bool
+		succeeded  bool
+
+		noSpec      bool
+		noRunStatus bool
+		tearingDown bool
+	}{
+		{name: "completed", restart: initSpec.Restart, phase: containers.ContainerInstancePhaseTerminated, succeeded: true},
+		{name: "on-failure completed", restart: containers.ContainerRestartSpec{Policy: containers.ContainerRestartPolicyOnFailure}, phase: containers.ContainerInstancePhaseTerminated, succeeded: true},
+		{name: "not run yet", noInstance: true},
+		{name: "running", restart: initSpec.Restart, phase: containers.ContainerInstancePhaseRunning},
+		{name: "failed", restart: initSpec.Restart, phase: containers.ContainerInstancePhaseTerminated, exitCode: 3},
+		{name: "failed start", restart: initSpec.Restart, phase: containers.ContainerInstancePhaseFailed},
+		{name: "run of a changed configuration", restart: initSpec.Restart, phase: containers.ContainerInstancePhaseTerminated, hash: "previous"},
+		{name: "restart pending", restart: initSpec.Restart, phase: containers.ContainerInstancePhaseTerminated, charged: true},
+		{name: "restarted anyway", restart: containers.ContainerRestartSpec{}, phase: containers.ContainerInstancePhaseTerminated},
+		{name: "not configured", restart: initSpec.Restart, phase: containers.ContainerInstancePhaseTerminated, noSpec: true},
+		{name: "outcome not decided", restart: initSpec.Restart, phase: containers.ContainerInstancePhaseTerminated, noRunStatus: true},
+		{name: "instance being replaced", restart: initSpec.Restart, phase: containers.ContainerInstancePhaseTerminated, tearingDown: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := t.Context()
+			st := state.WrapCore(inmem.NewState())
+
+			spec := initSpec
+			spec.Restart = test.restart
+
+			if !test.noSpec {
+				containerSpec := containers.NewContainerSpec(containers.NamespaceName, "init")
+				*containerSpec.TypedSpec() = spec
+				require.NoError(t, st.Create(ctx, containerSpec))
+			}
+
+			var finished *containers.ContainerInstanceStatusSpec
+
+			if !test.noInstance {
+				instanceSpec := containers.NewContainerInstanceSpec(containers.NamespaceName, containers.InstanceID("init", 0))
+				instanceSpec.TypedSpec().ContainerID = "init"
+				instanceSpec.TypedSpec().ExecutionHash = cmp.Or(test.hash, spec.ExecutionHash())
+				instanceSpec.Metadata().Labels().Set(containers.ContainerSpecIdLabel, "init")
+				require.NoError(t, st.Create(ctx, instanceSpec))
+
+				if test.tearingDown {
+					_, err := st.Teardown(ctx, instanceSpec.Metadata())
+					require.NoError(t, err)
+				}
+
+				instanceStatus := containers.NewContainerInstanceStatus(containers.NamespaceName, containers.InstanceID("init", 0))
+				instanceStatus.TypedSpec().ContainerID = "init"
+				instanceStatus.TypedSpec().Phase = test.phase
+				instanceStatus.TypedSpec().ExitCode = test.exitCode
+				instanceStatus.Metadata().Labels().Set(containers.ContainerSpecIdLabel, "init")
+				require.NoError(t, st.Create(ctx, instanceStatus))
+
+				if test.phase.Done() {
+					finished = instanceStatus.TypedSpec()
+				}
+			}
+
+			runStatus := containers.NewContainerRunStatus(containers.NamespaceName, "init")
+			runStatus.TypedSpec().ExecutionHash = spec.ExecutionHash()
+			runStatus.TypedSpec().Policy = spec.Restart.Policy
+			runStatus.TypedSpec().Restarted = test.charged
+
+			// what InstanceController decides for a finished instance
+			if finished != nil {
+				runStatus.TypedSpec().FinishedState = spec.Restart.FinishedState(*runStatus.TypedSpec(), *finished)
+			}
+
+			if !test.noRunStatus {
+				require.NoError(t, st.Create(ctx, runStatus))
+			}
+
+			waitingFor, _, err := containers.ContainerDependsOnSpec{
+				Containers: []containers.ContainerDependencySpec{{Name: "init", Condition: containers.ContainerDependencyConditionSucceeded}},
+			}.ContainersReady(ctx, st)
+			require.NoError(t, err)
+
+			if test.succeeded {
+				assert.Empty(t, waitingFor)
+			} else {
+				assert.Equal(t, []string{"container: init to succeed"}, waitingFor)
+			}
+		})
+	}
+}

@@ -6,8 +6,10 @@ package kobject_test
 
 import (
 	"errors"
+	"slices"
 	"sync"
 	"testing"
+	"testing/synctest"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
@@ -58,6 +60,36 @@ func (f *fakeReceiver) Close() error {
 	f.once.Do(func() { close(f.events) })
 
 	return nil
+}
+
+func TestWatcherMultipleSubsystems(t *testing.T) {
+	fake := newFakeReceiver(
+		&kobject.Event{Subsystem: "cpu"},
+		&kobject.Event{Subsystem: "block"},
+		&kobject.Event{Subsystem: "node"},
+		&kobject.Event{Subsystem: "memory"},
+	)
+	watcher := kobject.NewWatcherFromReceiver(fake, zaptest.NewLogger(t))
+	events := watcher.Run("cpu", "node", "memory")
+	require.NoError(t, watcher.Close())
+
+	var subsystems []string
+	for event := range events {
+		subsystems = append(subsystems, event.Subsystem)
+	}
+
+	require.Equal(t, []string{"cpu", "node", "memory"}, subsystems)
+}
+
+func TestWatcherCloseWithUnreadEvents(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// More events than the channel buffers: without a reader the goroutine blocks on send.
+		fake := newFakeReceiver(slices.Repeat([]*kobject.Event{{Subsystem: "cpu"}}, 256)...)
+		watcher := kobject.NewWatcherFromReceiver(fake, zaptest.NewLogger(t))
+		watcher.Run("cpu")
+
+		require.NoError(t, watcher.Close())
+	})
 }
 
 func TestWatcherSubsystemFilter(t *testing.T) {

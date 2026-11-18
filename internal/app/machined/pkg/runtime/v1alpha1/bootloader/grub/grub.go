@@ -6,6 +6,7 @@
 package grub
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -13,6 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/cosi-project/runtime/pkg/safe"
+	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/siderolabs/gen/xslices"
 
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime"
@@ -21,15 +24,33 @@ import (
 	"github.com/siderolabs/talos/internal/pkg/partition"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/imager/quirks"
+	runtimeres "github.com/siderolabs/talos/pkg/machinery/resources/runtime"
 	"github.com/siderolabs/talos/pkg/machinery/version"
 )
 
+// BootPartitionVariable is the GRUB variable holding the partition UUID of the partition GRUB was loaded from (BOOT).
+//
+// It is set by `probe --part-uuid $root` in the generated config, and passed to the kernel via constants.KernelParamBootPartitionUUID.
+const BootPartitionVariable = "talos_bootpart"
+
+// bootPartitionCmdlineArg is the kernel argument appended to the `linux` command, expanded by GRUB at boot.
+const bootPartitionCmdlineArg = constants.KernelParamBootPartitionUUID + "=$" + BootPartitionVariable
+
 // Config represents a grub configuration file (grub.cfg).
 type Config struct {
-	Default        BootLabel
-	Fallback       BootLabel
+	Default  BootLabel
+	Fallback BootLabel
+	// Booted is the entry the system is running from right now (if known).
+	//
+	// It is detected on probe from the kernel command line, and it is not persisted in the config.
+	// It differs from Default e.g. when an operator selected a non-default entry in the GRUB menu,
+	// or right after an upgrade before the reboot.
+	Booted         BootLabel
 	Entries        map[BootLabel]MenuEntry
 	AddResetOption bool
+	// AppendBootPartitionUUID makes GRUB probe the partition it was loaded from (BOOT) and pass its UUID
+	// to the kernel via the `talos.boot.partuuid` argument.
+	AppendBootPartitionUUID bool
 }
 
 // MenuEntry represents a grub menu entry in the grub config file.
@@ -47,9 +68,10 @@ func (e bootloaderNotInstalledError) Error() string {
 // NewConfig creates a new grub configuration (nothing is written to disk).
 func NewConfig() *Config {
 	return &Config{
-		Default:        BootA,
-		Entries:        map[BootLabel]MenuEntry{},
-		AddResetOption: true,
+		Default:                 BootA,
+		Entries:                 map[BootLabel]MenuEntry{},
+		AddResetOption:          true,
+		AppendBootPartitionUUID: true,
 	}
 }
 
@@ -81,6 +103,16 @@ func (c *Config) KexecLoad(r runtime.Runtime, disk string) error {
 
 		cmdline := strings.TrimSpace(defaultEntry.Cmdline)
 
+		// GRUB is skipped on kexec, so the kernel path it would have passed is set explicitly,
+		// so that the booted entry can be detected after kexec
+		cmdline = kexec.AppendBootImage(cmdline, defaultEntry.Linux)
+
+		// GRUB is skipped on kexec, so the boot partition UUID it would have probed is round-tripped
+		// from the current boot (if it is known)
+		if c.AppendBootPartitionUUID {
+			cmdline = kexec.AppendBootPartitionUUID(cmdline, bootPartitionUUID(r))
+		}
+
 		if err = kexec.Load(r, kernel, int(initrd.Fd()), cmdline); err != nil {
 			return err
 		}
@@ -93,24 +125,31 @@ func (c *Config) KexecLoad(r runtime.Runtime, disk string) error {
 	return err
 }
 
-// GenerateAssets generates the bootloader assets and returns partition options to create the bootloader partitions.
-func (c *Config) GenerateAssets(opts options.InstallOptions) ([]partition.Options, error) {
-	if err := c.generateAssets(opts); err != nil {
-		return nil, err
-	}
-
+// PrepareBootPartitions prepares the set of partitions to create for the bootloader.
+//
+// In image mode, this also pre-populates the assets to be written to the bootloader partitions
+// when formatting the filesystem.
+// In install mode, this only returns a list of partitions to create, and the assets are written to the partitions during Install.
+func (c *Config) PrepareBootPartitions(opts options.InstallOptions) ([]partition.Options, error) {
 	quirk := quirks.New(opts.Version)
 
 	efiFormatOptions := []partition.FormatOption{
 		partition.WithLabel(constants.EFIPartitionLabel),
 	}
 
+	bootFormatOptions := []partition.FormatOption{
+		partition.WithLabel(constants.BootPartitionLabel),
+	}
+
 	if opts.ImageMode {
-		// in bios install mode grub generated assets only contains the grub config file and kernel and initramfs
-		// so we don't need to set the source directory for the EFI partition
 		efiFormatOptions = append(
 			efiFormatOptions,
 			partition.WithSourceDirectory(filepath.Join(opts.MountPrefix, "EFI")),
+		)
+
+		bootFormatOptions = append(
+			bootFormatOptions,
+			partition.WithSourceDirectory(filepath.Join(opts.MountPrefix, constants.BootMountPoint)),
 		)
 	}
 
@@ -124,8 +163,7 @@ func (c *Config) GenerateAssets(opts options.InstallOptions) ([]partition.Option
 		partition.NewPartitionOptions(
 			false,
 			quirk,
-			partition.WithLabel(constants.BootPartitionLabel),
-			partition.WithSourceDirectory(filepath.Join(opts.MountPrefix, constants.BootMountPoint)),
+			bootFormatOptions...,
 		),
 	}
 
@@ -135,11 +173,22 @@ func (c *Config) GenerateAssets(opts options.InstallOptions) ([]partition.Option
 
 			return o
 		})
-	}
 
-	if opts.ExtraInstallStep != nil {
-		if err := opts.ExtraInstallStep(); err != nil {
+		if err := c.copyAssets(opts); err != nil {
 			return nil, err
+		}
+
+		if opts.ExtraInstallStep != nil {
+			if err := opts.ExtraInstallStep(); err != nil {
+				return nil, err
+			}
+		}
+
+		// the EFI assets (both GRUB's own, and the ones written by the overlay installer) are staged
+		// under constants.EFIMountPoint to match the layout of the install mode, so move them out of
+		// the BOOT partition source directory into the EFI partition source directory
+		if err := os.Rename(filepath.Join(opts.MountPrefix, constants.EFIMountPoint), filepath.Join(opts.MountPrefix, "EFI")); err != nil {
+			return nil, fmt.Errorf("failed to move EFI directory: %w", err)
 		}
 	}
 
@@ -178,4 +227,18 @@ func buildMenuEntry(entry BootLabel, cmdline, versionTag string) MenuEntry {
 		Cmdline: cmdline,
 		Initrd:  filepath.Join("/", string(entry), constants.InitramfsAsset),
 	}
+}
+
+// bootPartitionUUID returns the boot partition UUID detected on the current boot, or an empty string if it's not known.
+func bootPartitionUUID(r runtime.Runtime) string {
+	status, err := safe.StateGetByID[*runtimeres.BootPartitionStatus](context.Background(), r.State().V1Alpha2().Resources(), runtimeres.BootPartitionStatusID)
+	if err != nil {
+		if !state.IsNotFoundError(err) {
+			log.Printf("error getting the boot partition status: %s", err)
+		}
+
+		return ""
+	}
+
+	return status.TypedSpec().PartitionUUID
 }

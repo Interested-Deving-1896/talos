@@ -7,6 +7,7 @@ package kobject
 
 import (
 	"fmt"
+	"slices"
 	"sync"
 
 	"github.com/mdlayher/kobject"
@@ -37,10 +38,12 @@ type receiver interface {
 
 // Watcher is a kobject uevent watcher.
 type Watcher struct {
-	wg     sync.WaitGroup
-	cli    receiver
-	logger *zap.Logger
-	errCh  chan error
+	wg        sync.WaitGroup
+	cli       receiver
+	logger    *zap.Logger
+	errCh     chan error
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // NewWatcher creates a new kobject watcher.
@@ -64,11 +67,15 @@ func NewWatcherFromReceiver(r receiver, logger *zap.Logger) *Watcher {
 		cli:    r,
 		logger: logger,
 		errCh:  make(chan error, 1),
+		done:   make(chan struct{}),
 	}
 }
 
 // Close the watcher.
 func (w *Watcher) Close() error {
+	// Releases a Run goroutine blocked on a full event channel nobody reads anymore.
+	w.closeOnce.Do(func() { close(w.done) })
+
 	if err := w.cli.Close(); err != nil {
 		return err
 	}
@@ -79,8 +86,8 @@ func (w *Watcher) Close() error {
 }
 
 // Run the watcher, returns the channel of events.
-// subsystem is used to filter events by subsystem.
-func (w *Watcher) Run(subsystem string) <-chan *Event {
+// Only events matching one of the subsystems are forwarded.
+func (w *Watcher) Run(subsystems ...string) <-chan *Event {
 	ch := make(chan *kobject.Event, 128)
 
 	w.wg.Go(func() {
@@ -101,11 +108,22 @@ func (w *Watcher) Run(subsystem string) <-chan *Event {
 				return
 			}
 
-			if ev.Subsystem != subsystem {
+			if !slices.Contains(subsystems, ev.Subsystem) {
 				continue
 			}
 
-			ch <- ev
+			// Try the send alone first, so events fitting the buffer stay readable after Close.
+			select {
+			case ch <- ev:
+				continue
+			default:
+			}
+
+			select {
+			case ch <- ev:
+			case <-w.done:
+				return
+			}
 		}
 	})
 

@@ -5,7 +5,6 @@
 package kubeconfig
 
 import (
-	"bytes"
 	stdlibx509 "crypto/x509"
 	"fmt"
 	"io"
@@ -13,19 +12,19 @@ import (
 	"time"
 
 	"github.com/siderolabs/crypto/x509"
-	"github.com/siderolabs/gen/xslices"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/siderolabs/talos/pkg/machinery/config/config"
+	"github.com/siderolabs/talos/pkg/machinery/pemutils"
 )
 
 // GenerateAdminInput is the interface for the GenerateAdmin function.
 //
 // This interface is implemented by config.Cluster().
 type GenerateAdminInput interface {
-	Name() string
-	Endpoint() *url.URL
+	ClusterName() string
+	ClusterEndpoint() *url.URL
 	IssuingCA() *x509.PEMEncodedCertificateAndKey
 	AcceptedCAs() []*x509.PEMEncodedCertificate
 	AdminKubeconfig() config.AdminKubeconfig
@@ -33,23 +32,21 @@ type GenerateAdminInput interface {
 
 // GenerateAdmin generates admin kubeconfig for the cluster.
 func GenerateAdmin(config GenerateAdminInput, out io.Writer) error {
-	acceptedCAs := config.AcceptedCAs()
-
-	if config.IssuingCA() != nil {
-		acceptedCAs = append(acceptedCAs, &x509.PEMEncodedCertificate{Crt: config.IssuingCA().Crt})
+	if config.IssuingCA() == nil {
+		return fmt.Errorf("issuing CA is not set")
 	}
 
 	return Generate(
 		&GenerateInput{
-			ClusterName:         config.Name(),
+			ClusterName:         config.ClusterName(),
 			IssuingCA:           config.IssuingCA(),
-			AcceptedCAs:         acceptedCAs,
+			AcceptedCAs:         config.AcceptedCAs(),
 			CertificateLifetime: config.AdminKubeconfig().CertLifetime(),
 
 			CommonName:   config.AdminKubeconfig().CommonName(),
 			Organization: config.AdminKubeconfig().CertOrganization(),
 
-			Endpoint:    config.Endpoint().String(),
+			Endpoint:    config.ClusterEndpoint().String(),
 			Username:    "admin",
 			ContextName: "admin",
 		},
@@ -99,7 +96,7 @@ func Generate(in *GenerateInput, out io.Writer) error {
 
 	clientCertPEM := x509.NewCertificateAndKeyFromKeyPair(clientCert)
 
-	serverCAs := bytes.Join(xslices.Map(in.AcceptedCAs, func(ca *x509.PEMEncodedCertificate) []byte { return ca.Crt }), nil)
+	serverCAs := pemutils.JoinCertificates(in.AcceptedCAs)
 
 	cfg := clientcmdapi.Config{
 		APIVersion: "v1",

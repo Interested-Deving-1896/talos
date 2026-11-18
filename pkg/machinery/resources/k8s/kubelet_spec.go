@@ -12,6 +12,7 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/siderolabs/talos/pkg/machinery/proto"
+	"github.com/siderolabs/talos/pkg/machinery/redactable"
 )
 
 // KubeletSpecType is type of KubeletSpec resource.
@@ -30,6 +31,8 @@ type KubeletSpecSpec struct {
 	ExpectedNodename         string         `yaml:"expectedNodename,omitempty" protobuf:"4"`
 	Config                   map[string]any `yaml:"config" protobuf:"5"`
 	CredentialProviderConfig map[string]any `yaml:"credentialProviderConfig,omitempty" protobuf:"6"`
+	// CredentialProviderFiles maps file names to the contents of the credential provider plugin configuration files.
+	CredentialProviderFiles map[string]string `yaml:"credentialProviderFiles,omitempty" protobuf:"7"`
 }
 
 // NewKubeletSpec initializes an empty KubeletSpec resource.
@@ -49,6 +52,7 @@ func (KubeletSpecExtension) ResourceDefinition() meta.ResourceDefinitionSpec {
 		Type:             KubeletSpecType,
 		Aliases:          []resource.Type{},
 		DefaultNamespace: NamespaceName,
+		Sensitivity:      meta.Sensitive,
 	}
 }
 
@@ -59,4 +63,7 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+
+	// the spec is sensitive, but it is safe to be read in the redacted form
+	redactable.Register[KubeletSpecSpec, KubeletSpecExtension]()
 }

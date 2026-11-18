@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
+	"github.com/cenkalti/backoff/v7"
 	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/siderolabs/gen/xslices"
@@ -27,6 +27,7 @@ import (
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime/v1alpha1/platform/errors"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime/v1alpha1/platform/internal/address"
+	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime/v1alpha1/platform/internal/blockutils"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime/v1alpha1/platform/internal/netutils"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/imager/quirks"
@@ -202,6 +203,11 @@ func (o *OpenStack) ParseMetadata(
 
 			if netLink.Mac != "" {
 				for hostInterface := range hostInterfaces.All() {
+					// logical links can carry the MAC address of a physical one, e.g. a bond
+					if !hostInterface.TypedSpec().Physical() {
+						continue
+					}
+
 					macAddress := hostInterface.TypedSpec().PermanentAddr.String()
 					if macAddress == "" {
 						macAddress = hostInterface.TypedSpec().HardwareAddr.String()
@@ -423,7 +429,7 @@ func (o *OpenStack) ParseMetadata(
 
 // Configuration implements the runtime.Platform interface.
 func (o *OpenStack) Configuration(ctx context.Context, r state.State) (machineConfig []byte, err error) {
-	_, _, machineConfig, err = o.configFromCD(ctx, r)
+	_, _, machineConfig, err = o.configFromCD(ctx, r, blockutils.RequesterConfig)
 	if err != nil {
 		if err = netutils.Wait(ctx, r); err != nil {
 			return nil, err
@@ -468,7 +474,7 @@ func (o *OpenStack) NetworkConfiguration(ctx context.Context, st state.State, ch
 
 	networkSource := false
 
-	metadataConfigDl, metadataNetworkConfigDl, _, err := o.configFromCD(ctx, st)
+	metadataConfigDl, metadataNetworkConfigDl, _, err := o.configFromCD(ctx, st, blockutils.RequesterNetwork)
 	if err != nil {
 		metadataConfigDl, metadataNetworkConfigDl, _, err = o.configFromNetwork(ctx)
 		if stderrors.Is(err, errors.ErrNoConfigSource) {

@@ -21,7 +21,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
 	hardwareconfigtype "github.com/siderolabs/talos/pkg/machinery/config/types/hardware"
-	"github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1"
+	runtimecfg "github.com/siderolabs/talos/pkg/machinery/config/types/runtime"
 	"github.com/siderolabs/talos/pkg/machinery/resources/hardware"
 )
 
@@ -86,7 +86,7 @@ func (suite *PCIDriverRebindSuite) TestIOMMURebind() {
 
 	nodeCtx := client.WithNode(suite.ctx, node)
 
-	items, err := suite.Client.COSI.List(nodeCtx, resource.NewMetadata(hardware.NamespaceName, hardware.PCIDeviceType, "", resource.VersionUndefined))
+	items, err := suite.Client.State().List(nodeCtx, resource.NewMetadata(hardware.NamespaceName, hardware.PCIDeviceType, "", resource.VersionUndefined))
 	suite.Require().NoError(err)
 
 	var pciDeviceID string
@@ -109,33 +109,15 @@ func (suite *PCIDriverRebindSuite) TestIOMMURebind() {
 	cfgDocument.MetaName = pciDeviceID
 	cfgDocument.PCITargetDriver = "vfio-pci"
 
-	v1alpha1CfgDocument := &v1alpha1.Config{
-		MachineConfig: &v1alpha1.MachineConfig{
-			MachineKernel: &v1alpha1.KernelConfig{
-				KernelModules: []*v1alpha1.KernelModuleConfig{
-					{
-						ModuleName: "vfio-pci",
-					},
-				},
-			},
-		},
-	}
+	kernelModuleDocument := runtimecfg.NewKernelModuleConfigV1Alpha1("vfio-pci")
 
-	suite.PatchMachineConfig(nodeCtx, v1alpha1CfgDocument, cfgDocument)
+	suite.PatchMachineConfig(nodeCtx, kernelModuleDocument, cfgDocument)
 
-	_, err = suite.Client.COSI.WatchFor(nodeCtx, hardware.NewPCIDriverRebindStatus(pciDeviceID).Metadata(), state.WithEventTypes(state.Created, state.Updated))
+	_, err = suite.Client.State().WatchFor(nodeCtx, hardware.NewPCIDriverRebindStatus(pciDeviceID).Metadata(), state.WithEventTypes(state.Created, state.Updated))
 	suite.Require().NoError(err)
 
 	defer func() {
-		suite.RemoveMachineConfigDocuments(nodeCtx, cfgDocument.MetaKind)
-
-		suite.PatchMachineConfig(nodeCtx, map[string]any{
-			"machine": map[string]any{
-				"kernel": map[string]any{
-					"$patch": "delete",
-				},
-			},
-		})
+		suite.RemoveMachineConfigDocuments(nodeCtx, cfgDocument.MetaKind, runtimecfg.KernelModuleConfigKind)
 	}()
 
 	// after applying the patch the device should be bound to vfio-pci
@@ -145,7 +127,7 @@ func (suite *PCIDriverRebindSuite) TestIOMMURebind() {
 
 	suite.PatchMachineConfig(nodeCtx, cfgDocument)
 
-	_, err = suite.Client.COSI.WatchFor(nodeCtx, hardware.NewPCIDriverRebindStatus(pciDeviceID).Metadata(), state.WithEventTypes(state.Updated))
+	_, err = suite.Client.State().WatchFor(nodeCtx, hardware.NewPCIDriverRebindStatus(pciDeviceID).Metadata(), state.WithEventTypes(state.Updated))
 	suite.Require().NoError(err)
 
 	// verify that an update to the target driver takes effect
@@ -156,7 +138,7 @@ func (suite *PCIDriverRebindSuite) TestIOMMURebind() {
 
 	suite.PatchMachineConfig(nodeCtx, cfgDocument)
 
-	_, err = suite.Client.COSI.WatchFor(nodeCtx, hardware.NewPCIDriverRebindStatus(pciDeviceID).Metadata(), state.WithEventTypes(state.Updated))
+	_, err = suite.Client.State().WatchFor(nodeCtx, hardware.NewPCIDriverRebindStatus(pciDeviceID).Metadata(), state.WithEventTypes(state.Updated))
 	suite.Require().NoError(err)
 
 	// verify that the update has taken effect
@@ -165,7 +147,7 @@ func (suite *PCIDriverRebindSuite) TestIOMMURebind() {
 	// now remove the pci driver rebind config
 	suite.RemoveMachineConfigDocuments(nodeCtx, cfgDocument.MetaKind)
 
-	_, err = suite.Client.COSI.WatchFor(nodeCtx, hardware.NewPCIDriverRebindStatus(pciDeviceID).Metadata(), state.WithEventTypes(state.Destroyed))
+	_, err = suite.Client.State().WatchFor(nodeCtx, hardware.NewPCIDriverRebindStatus(pciDeviceID).Metadata(), state.WithEventTypes(state.Destroyed))
 	suite.Require().NoError(err)
 
 	// verify that the device is back to original host driver

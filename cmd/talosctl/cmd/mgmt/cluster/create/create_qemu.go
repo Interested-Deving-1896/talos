@@ -7,7 +7,6 @@ package create
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -18,9 +17,11 @@ import (
 	"github.com/siderolabs/talos/cmd/talosctl/cmd/mgmt/cluster/create/clusterops"
 	"github.com/siderolabs/talos/cmd/talosctl/cmd/mgmt/cluster/create/clusterops/configmaker"
 	"github.com/siderolabs/talos/cmd/talosctl/cmd/mgmt/cluster/create/clusterops/configmaker/preset"
+	"github.com/siderolabs/talos/cmd/talosctl/pkg/talos/helpers"
 	"github.com/siderolabs/talos/pkg/machinery/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/encoder"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
+	"github.com/siderolabs/talos/pkg/machinery/fileutils"
 	"github.com/siderolabs/talos/pkg/provision"
 )
 
@@ -45,13 +46,9 @@ func createQemuCluster(
 		presetOptions.schematicID = constants.ImageFactoryEmptySchematicID
 	}
 
-	factoryURL, err := url.Parse(presetOptions.imageFactoryURL)
+	factoryURL, err := helpers.ParseImageFactoryURL(presetOptions.imageFactoryURL)
 	if err != nil {
-		return fmt.Errorf("malformed Image Factory URL: %q: %w", presetOptions.imageFactoryURL, err)
-	}
-
-	if factoryURL.Scheme == "" || factoryURL.Host == "" {
-		return fmt.Errorf("image Factory URL must include scheme and host: %q", presetOptions.imageFactoryURL)
+		return err
 	}
 
 	if slices.Contains(presetOptions.presets, preset.Maintenance{}.Name()) && cOps.OmniAPIEndpoint != "" {
@@ -145,7 +142,7 @@ func writeMachineconfig(clusterConfigs clusterops.ClusterConfigs, cOps clusterop
 	}
 
 	fullFilePath := filepath.Join(".", "machineconfig.yaml")
-	if err = os.WriteFile(fullFilePath, cfgBytes, 0o644); err != nil {
+	if err = fileutils.WriteSecret(fullFilePath, cfgBytes); err != nil {
 		return err
 	}
 

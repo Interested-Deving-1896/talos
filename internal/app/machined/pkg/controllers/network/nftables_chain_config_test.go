@@ -16,6 +16,7 @@ import (
 	netctrl "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/network"
 	configtypes "github.com/siderolabs/talos/pkg/machinery/config/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
 	networkcfg "github.com/siderolabs/talos/pkg/machinery/config/types/network"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
@@ -40,7 +41,7 @@ func (suite *NfTablesChainConfigTestSuite) injectConfig(block bool) {
 	kubeletIngressCfg.Ingress = []networkcfg.IngressRule{
 		{
 			Subnet: netip.MustParsePrefix("10.0.0.0/8"),
-			Except: networkcfg.Prefix{Prefix: netip.MustParsePrefix("10.3.0.0/16")},
+			Except: meta.Prefix{Prefix: netip.MustParsePrefix("10.3.0.0/16")},
 		},
 		{
 			Subnet: netip.MustParsePrefix("192.168.0.0/16"),
@@ -107,6 +108,25 @@ func (suite *NfTablesChainConfigTestSuite) TestDefaultAccept() {
 					},
 					AnonCounter: true,
 					Verdict:     new(nethelpers.VerdictAccept),
+				},
+				{
+					MatchConntrackState: &network.NfTablesConntrackStateMatch{
+						States: []nethelpers.ConntrackState{
+							nethelpers.ConntrackStateEstablished,
+							nethelpers.ConntrackStateRelated,
+						},
+					},
+					AnonCounter: true,
+					Verdict:     new(nethelpers.VerdictAccept),
+				},
+				{
+					MatchConntrackState: &network.NfTablesConntrackStateMatch{
+						States: []nethelpers.ConntrackState{
+							nethelpers.ConntrackStateInvalid,
+						},
+					},
+					AnonCounter: true,
+					Verdict:     new(nethelpers.VerdictDrop),
 				},
 				{
 					MatchSourceAddress: &network.NfTablesAddressMatch{
@@ -503,11 +523,187 @@ func TestNfTablesChainConfig(t *testing.T) {
 	t.Parallel()
 
 	suite.Run(t, &NfTablesChainConfigTestSuite{
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 5 * time.Second,
-			AfterSetup: func(s *ctest.DefaultSuite) {
-				s.Require().NoError(s.Runtime().RegisterController(&netctrl.NfTablesChainConfigController{}))
-			},
+		Timeout: 5 * time.Second,
+		AfterSetup: func(s *ctest.DefaultSuite) {
+			s.Require().NoError(s.Runtime().RegisterController(&netctrl.NfTablesChainConfigController{}))
 		},
 	})
+}
+
+// trustedLinksRule is the preamble rule of the prerouting chain, accepting the trusted links.
+func trustedLinksRule() network.NfTablesRule {
+	return network.NfTablesRule{
+		MatchIIfName: &network.NfTablesIfNameMatch{
+			InterfaceNames: []string{
+				"lo",
+				constants.SideroLinkName,
+				constants.KubeSpanLinkName,
+			},
+			Operator: nethelpers.OperatorEqual,
+		},
+		AnonCounter: true,
+		Verdict:     new(nethelpers.VerdictAccept),
+	}
+}
+
+func implicitLinkIngressDestinations() []netip.Prefix {
+	return []netip.Prefix{
+		netip.MustParsePrefix("255.255.255.255/32"), // IPv4 broadcast
+		netip.MustParsePrefix("224.0.0.0/4"),        // IPv4 multicast
+		netip.MustParsePrefix("ff00::/8"),           // IPv6 multicast
+		netip.MustParsePrefix("fe80::/10"),          // IPv6 link-local
+	}
+}
+
+func (suite *NfTablesChainConfigTestSuite) injectLinkIngressConfig(docs ...configtypes.Document) {
+	// "enp0s5" is aliased to "net0", "eth1" has no alias
+	linkStatus := network.NewLinkStatus(network.NamespaceName, "enp0s5")
+	linkStatus.TypedSpec().Alias = "net0"
+	suite.Create(linkStatus)
+	suite.Create(network.NewLinkStatus(network.NamespaceName, "eth1"))
+
+	cfg, err := container.New(docs...)
+	suite.Require().NoError(err)
+
+	suite.Create(config.NewMachineConfig(cfg))
+}
+
+// TestLinkIngress verifies the rules generated for the NetworkLinkIngressConfig documents.
+//
+// The machine config has no network rules, so the prerouting chain is built for the link ingress
+// filtering alone.
+func (suite *NfTablesChainConfigTestSuite) TestLinkIngress() {
+	nodeAddresses := network.NewNodeAddress(network.NamespaceName, network.NodeAddressRoutedID)
+	nodeAddresses.TypedSpec().Addresses = []netip.Prefix{netip.MustParsePrefix("10.3.4.5/24")}
+	suite.Create(nodeAddresses)
+
+	// the link is named by its alias, the rule should match on the actual link name
+	defaultDestinations := networkcfg.NewLinkIngressConfigV1Alpha1("net0")
+
+	// an explicitly empty list allows no destination at all
+	noDestinations := networkcfg.NewLinkIngressConfigV1Alpha1("eth1")
+	noDestinations.DestinationAddressesConfig = []meta.Prefix{}
+
+	explicitDestinations := networkcfg.NewLinkIngressConfigV1Alpha1("eth2")
+	explicitDestinations.DestinationAddressesConfig = []meta.Prefix{{Prefix: netip.MustParsePrefix("1.2.3.4/32")}}
+
+	suite.injectLinkIngressConfig(defaultDestinations, noDestinations, explicitDestinations)
+
+	ctest.AssertNoResource[*network.NfTablesChain](suite, netctrl.IngressChainName)
+
+	ctest.AssertResource(suite, netctrl.PreroutingChainName, func(chain *network.NfTablesChain, asrt *assert.Assertions) {
+		asrt.Equal(
+			[]network.NfTablesRule{
+				trustedLinksRule(),
+				// no destinations configured: the node's own addresses are allowed
+				{
+					MatchIIfName: &network.NfTablesIfNameMatch{
+						InterfaceNames: []string{"enp0s5"},
+						Operator:       nethelpers.OperatorEqual,
+					},
+					MatchDestinationAddress: &network.NfTablesAddressMatch{
+						IncludeSubnets: append(
+							[]netip.Prefix{netip.MustParsePrefix("10.3.4.5/32"), netip.MustParsePrefix("10.3.4.255/32")},
+							implicitLinkIngressDestinations()...,
+						),
+						Invert: true,
+					},
+					AnonCounter: true,
+					Verdict:     new(nethelpers.VerdictDrop),
+				},
+				// nothing is allowed: everything arriving on the link is dropped
+				{
+					MatchIIfName: &network.NfTablesIfNameMatch{
+						InterfaceNames: []string{"eth1"},
+						Operator:       nethelpers.OperatorEqual,
+					},
+					MatchDestinationAddress: &network.NfTablesAddressMatch{
+						IncludeSubnets: []netip.Prefix{},
+						Invert:         true,
+					},
+					AnonCounter: true,
+					Verdict:     new(nethelpers.VerdictDrop),
+				},
+				{
+					MatchIIfName: &network.NfTablesIfNameMatch{
+						InterfaceNames: []string{"eth2"},
+						Operator:       nethelpers.OperatorEqual,
+					},
+					MatchDestinationAddress: &network.NfTablesAddressMatch{
+						IncludeSubnets: []netip.Prefix{netip.MustParsePrefix("1.2.3.4/32")},
+						Invert:         true,
+					},
+					AnonCounter: true,
+					Verdict:     new(nethelpers.VerdictDrop),
+				},
+				// the link ingress rules are evaluated before this one, which would otherwise
+				// accept the very traffic they drop
+				{
+					MatchDestinationAddress: &network.NfTablesAddressMatch{
+						IncludeSubnets: []netip.Prefix{netip.MustParsePrefix("10.3.4.5/32")},
+						Invert:         true,
+					},
+					AnonCounter: true,
+					Verdict:     new(nethelpers.VerdictAccept),
+				},
+			},
+			chain.TypedSpec().Rules,
+		)
+	})
+}
+
+// TestLinkIngressWithoutNodeAddresses verifies that only the implicit destinations are allowed
+// while the node addresses are not known yet.
+func (suite *NfTablesChainConfigTestSuite) TestLinkIngressWithoutNodeAddresses() {
+	suite.injectLinkIngressConfig(networkcfg.NewLinkIngressConfigV1Alpha1("net0"))
+
+	ctest.AssertResource(suite, netctrl.PreroutingChainName, func(chain *network.NfTablesChain, asrt *assert.Assertions) {
+		asrt.Equal(
+			[]network.NfTablesRule{
+				trustedLinksRule(),
+				{
+					MatchIIfName: &network.NfTablesIfNameMatch{
+						InterfaceNames: []string{"enp0s5"},
+						Operator:       nethelpers.OperatorEqual,
+					},
+					MatchDestinationAddress: &network.NfTablesAddressMatch{
+						IncludeSubnets: implicitLinkIngressDestinations(),
+						Invert:         true,
+					},
+					AnonCounter: true,
+					Verdict:     new(nethelpers.VerdictDrop),
+				},
+				{
+					MatchDestinationAddress: &network.NfTablesAddressMatch{
+						// no IncludeSubnets as addresses are unknown
+						Invert: true,
+					},
+					AnonCounter: true,
+					Verdict:     new(nethelpers.VerdictAccept),
+				},
+			},
+			chain.TypedSpec().Rules,
+		)
+	})
+}
+
+func TestSubnetBroadcasts(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		subnet   string
+		expected []netip.Prefix
+	}{
+		{subnet: "10.3.4.5/24", expected: []netip.Prefix{netip.MustParsePrefix("10.3.4.255/32")}},
+		{subnet: "172.20.0.1/12", expected: []netip.Prefix{netip.MustParsePrefix("172.31.255.255/32")}},
+		{subnet: "10.3.4.5/31"},
+		{subnet: "10.3.4.5/32"},
+		{subnet: "2001:db8::1/64"},
+	} {
+		t.Run(test.subnet, func(t *testing.T) {
+			t.Parallel()
+
+			assert.Equal(t, test.expected, netctrl.SubnetBroadcastsForTest([]netip.Prefix{netip.MustParsePrefix(test.subnet)}))
+		})
+	}
 }

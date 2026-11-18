@@ -6,6 +6,7 @@ package k8s
 
 import (
 	"context"
+	"errors"
 	"strconv"
 
 	"github.com/cosi-project/runtime/pkg/controller"
@@ -23,7 +24,7 @@ import (
 // KubePrismConfigController creates config for KubePrism.
 type KubePrismConfigController = transform.Controller[*config.MachineConfig, *k8s.KubePrismConfig]
 
-// NewKubePrismConfigController instanciates the controller.
+// NewKubePrismConfigController instantiates the controller.
 func NewKubePrismConfigController() *KubePrismConfigController {
 	return transform.NewController(
 		transform.Settings[*config.MachineConfig, *k8s.KubePrismConfig]{
@@ -33,11 +34,7 @@ func NewKubePrismConfigController() *KubePrismConfigController {
 					return optional.None[*k8s.KubePrismConfig]()
 				}
 
-				if cfg.Config().Machine() == nil {
-					return optional.None[*k8s.KubePrismConfig]()
-				}
-
-				if !cfg.Config().Machine().Features().KubePrism().Enabled() {
+				if cfg.Config().K8sKubePrismConfig() == nil {
 					return optional.None[*k8s.KubePrismConfig]()
 				}
 
@@ -53,10 +50,25 @@ func NewKubePrismConfigController() *KubePrismConfigController {
 					return err
 				}
 
+				kubePrismConfig := cfg.Config().K8sKubePrismConfig()
+
 				spec := res.TypedSpec()
 				spec.Endpoints = endpt.TypedSpec().Endpoints
 				spec.Host = "127.0.0.1"
-				spec.Port = cfg.Config().Machine().Features().KubePrism().Port()
+				spec.Port = kubePrismConfig.Port()
+				spec.TLSServerName = kubePrismConfig.TLSServerName()
+				spec.ReadinessCheck = kubePrismConfig.ReadinessCheckEnabled()
+				spec.AcceptedCAs = nil
+
+				if spec.ReadinessCheck {
+					if k8sCAProvider := cfg.Config().K8sAPIServerCAConfig(); k8sCAProvider != nil {
+						spec.AcceptedCAs = k8sCAProvider.AcceptedCAs()
+					}
+
+					if len(spec.AcceptedCAs) == 0 {
+						return errors.New("missing accepted Kubernetes CAs for KubePrism readiness check")
+					}
+				}
 
 				return nil
 			},

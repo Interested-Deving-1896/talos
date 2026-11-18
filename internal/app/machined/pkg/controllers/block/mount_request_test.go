@@ -25,11 +25,9 @@ func TestMountRequestSuite(t *testing.T) {
 	t.Parallel()
 
 	suite.Run(t, &MountRequestSuite{
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 3 * time.Second,
-			AfterSetup: func(suite *ctest.DefaultSuite) {
-				suite.Require().NoError(suite.Runtime().RegisterController(&blockctrls.MountRequestController{}))
-			},
+		Timeout: 3 * time.Second,
+		AfterSetup: func(suite *ctest.DefaultSuite) {
+			suite.Require().NoError(suite.Runtime().RegisterController(&blockctrls.MountRequestController{}))
 		},
 	})
 }
@@ -39,6 +37,7 @@ func (suite *MountRequestSuite) TestReconcile() {
 	mountRequest1.TypedSpec().Requester = "requester1"
 	mountRequest1.TypedSpec().VolumeID = "volume1"
 	mountRequest1.TypedSpec().ReadOnly = true
+	mountRequest1.TypedSpec().Secure = true
 	suite.Create(mountRequest1)
 
 	// mount request is not created as the volume is not ready
@@ -57,6 +56,8 @@ func (suite *MountRequestSuite) TestReconcile() {
 	ctest.AssertResource(suite, "volume1", func(mr *block.MountRequest, asrt *assert.Assertions) {
 		asrt.Equal("volume1", mr.TypedSpec().VolumeID)
 		asrt.True(mr.TypedSpec().ReadOnly)
+		asrt.True(mr.TypedSpec().Secure)
+		asrt.False(mr.TypedSpec().NoExec)
 		asrt.ElementsMatch([]string{"requester1"}, mr.TypedSpec().Requesters)
 		asrt.ElementsMatch([]string{"mountRequest1"}, mr.TypedSpec().RequesterIDs)
 	})
@@ -66,11 +67,14 @@ func (suite *MountRequestSuite) TestReconcile() {
 	mountRequest2.TypedSpec().Requester = "requester2"
 	mountRequest2.TypedSpec().VolumeID = "volume1"
 	mountRequest2.TypedSpec().ReadOnly = false
+	mountRequest2.TypedSpec().NoExec = true
 	suite.Create(mountRequest2)
 
 	ctest.AssertResource(suite, "volume1", func(mr *block.MountRequest, asrt *assert.Assertions) {
 		asrt.Equal("volume1", mr.TypedSpec().VolumeID)
 		asrt.False(mr.TypedSpec().ReadOnly)
+		asrt.True(mr.TypedSpec().Secure)
+		asrt.True(mr.TypedSpec().NoExec)
 		asrt.ElementsMatch([]string{"requester1", "requester2"}, mr.TypedSpec().Requesters)
 		asrt.ElementsMatch([]string{"mountRequest1", "mountRequest2"}, mr.TypedSpec().RequesterIDs)
 	})
@@ -84,6 +88,8 @@ func (suite *MountRequestSuite) TestReconcile() {
 	ctest.AssertResource(suite, "volume1", func(mr *block.MountRequest, asrt *assert.Assertions) {
 		asrt.Equal("volume1", mr.TypedSpec().VolumeID)
 		asrt.True(mr.TypedSpec().ReadOnly)
+		asrt.True(mr.TypedSpec().Secure)
+		asrt.False(mr.TypedSpec().NoExec)
 		asrt.ElementsMatch([]string{"requester1"}, mr.TypedSpec().Requesters)
 		asrt.ElementsMatch([]string{"mountRequest1"}, mr.TypedSpec().RequesterIDs)
 	})

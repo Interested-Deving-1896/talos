@@ -54,7 +54,7 @@ func (suite *DebugSuite) TestRunAlpine() {
 	image := "docker.io/library/alpine:3.23"
 
 	for _, driver := range []common.ContainerDriver{common.ContainerDriver_CRI, common.ContainerDriver_CONTAINERD} {
-		rcv, err := suite.Client.ImageClient.Pull(ctx, &machine.ImageServicePullRequest{
+		rcv, err := suite.Client.ImageService().Pull(ctx, &machine.ImageServicePullRequest{
 			Containerd: &common.ContainerdInstance{
 				Driver:    driver,
 				Namespace: common.ContainerdNamespace_NS_SYSTEM,
@@ -79,7 +79,7 @@ func (suite *DebugSuite) TestRunAlpine() {
 			pulledImage = msg.GetName()
 		}
 
-		cli, err := suite.Client.DebugClient.ContainerRun(ctx)
+		cli, err := suite.Client.DebugService().ContainerRun(ctx)
 		suite.Require().NoError(err)
 
 		suite.Require().NoError(cli.Send(&machine.DebugContainerRunRequest{

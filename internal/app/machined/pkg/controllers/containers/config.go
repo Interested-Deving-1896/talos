@@ -1,0 +1,393 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+// Package containers implements controllers for containers declared via ContainerConfig.
+package containers
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/cosi-project/runtime/pkg/controller"
+	"github.com/cosi-project/runtime/pkg/safe"
+	"github.com/cosi-project/runtime/pkg/state"
+	"github.com/dustin/go-humanize"
+	"github.com/siderolabs/gen/optional"
+	"github.com/siderolabs/gen/xslices"
+	"go.uber.org/zap"
+
+	configcfg "github.com/siderolabs/talos/pkg/machinery/config/config"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/cri"
+	"github.com/siderolabs/talos/pkg/machinery/resources/config"
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
+)
+
+// ConfigController projects ContainerConfig documents into ContainerSpec resources.
+//
+// This controller owns no side effects: it is a pure function of the machine configuration. All it
+// does is validate, apply defaults and resolve names, so that every controller downstream works
+// against a fully resolved spec and never has to re-read the configuration.
+type ConfigController struct{}
+
+// Name implements controller.Controller interface.
+func (ctrl *ConfigController) Name() string {
+	return "containers.ConfigController"
+}
+
+// Inputs implements controller.Controller interface.
+func (ctrl *ConfigController) Inputs() []controller.Input {
+	return []controller.Input{
+		{
+			Namespace: config.NamespaceName,
+			Type:      config.MachineConfigType,
+			ID:        optional.Some(config.ActiveID),
+			Kind:      controller.InputWeak,
+		},
+	}
+}
+
+// Outputs implements controller.Controller interface.
+func (ctrl *ConfigController) Outputs() []controller.Output {
+	return []controller.Output{
+		{
+			Type: containers.ContainerSpecType,
+			Kind: controller.OutputExclusive,
+		},
+	}
+}
+
+// Run implements controller.Controller interface.
+func (ctrl *ConfigController) Run(ctx context.Context, runtime controller.Runtime, logger *zap.Logger) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-runtime.EventCh():
+		}
+
+		if err := ctrl.reconcile(ctx, runtime, logger); err != nil {
+			logger.Error("failed to project container configuration", zap.Error(err))
+
+			return err
+		}
+
+		runtime.ResetRestartBackoff()
+	}
+}
+
+//nolint:gocyclo
+func (ctrl *ConfigController) reconcile(ctx context.Context, runtime controller.Runtime, logger *zap.Logger) error {
+	// Read the specs already published, so that appearing and disappearing containers can be told
+	// apart from the steady state and logged only once each.
+	publishedSpecs, err := safe.ReaderListAll[*containers.ContainerSpec](ctx, runtime)
+	if err != nil {
+		return fmt.Errorf("failed to list container specs: %w", err)
+	}
+
+	stale := map[string]struct{}{}
+
+	for containerSpec := range publishedSpecs.All() {
+		stale[containerSpec.Metadata().ID()] = struct{}{}
+	}
+
+	runtime.StartTrackingOutputs()
+
+	machineConfig, err := safe.ReaderGetByID[*config.MachineConfig](ctx, runtime, config.ActiveID)
+	if err != nil && !state.IsNotFoundError(err) {
+		return fmt.Errorf("failed to get machine config: %w", err)
+	}
+
+	if machineConfig != nil {
+		var selinuxLevels map[string]string
+
+		if securityProfile := machineConfig.Config().SecurityProfileConfig(); securityProfile != nil && securityProfile.SELinuxCategories() {
+			selinuxLevels = allocateSELinuxLevels(machineConfig.Config().ContainerConfigs())
+		}
+
+		seccompProfiles := map[string]configcfg.SeccompProfile{}
+
+		for _, seccompProfile := range machineConfig.Config().SeccompProfiles() {
+			seccompProfiles[seccompProfile.Name()] = seccompProfile
+		}
+
+		for _, containerConfig := range machineConfig.Config().ContainerConfigs() {
+			containerSpecID := containerConfig.Name()
+
+			if _, known := stale[containerSpecID]; !known {
+				logger.Info(
+					"container declared",
+					zap.String("container", containerSpecID),
+					zap.String("image", containerConfig.Image()),
+				)
+			}
+
+			delete(stale, containerSpecID)
+
+			if err = safe.WriterModify(
+				ctx, runtime,
+				containers.NewContainerSpec(containers.NamespaceName, containerSpecID),
+				func(res *containers.ContainerSpec) error {
+					if err := applyConfig(res.TypedSpec(), containerConfig, seccompProfiles); err != nil {
+						return err
+					}
+
+					res.TypedSpec().Security.SELinuxLevel = selinuxLevels[containerSpecID]
+
+					return nil
+				},
+			); err != nil {
+				return fmt.Errorf("failed to write container spec %q: %w", containerSpecID, err)
+			}
+
+			logger.Debug("container spec projected", zap.String("container", containerSpecID))
+		}
+	}
+
+	for containerSpecID := range stale {
+		logger.Info("container removed from the machine configuration", zap.String("container", containerSpecID))
+	}
+
+	if err := safe.CleanupOutputs[*containers.ContainerSpec](ctx, runtime); err != nil {
+		return fmt.Errorf("failed to clean up outputs: %w", err)
+	}
+
+	return nil
+}
+
+// applyConfig resolves a ContainerConfig document into a ContainerSpec.
+//
+// seccompProfiles are the seccomp profiles declared in the machine configuration, by name.
+func applyConfig(containerSpecSpec *containers.ContainerSpecSpec, containerConfig configcfg.ContainerConfig, seccompProfiles map[string]configcfg.SeccompProfile) error {
+	// Image() already returns the canonical form: normalizing in the config layer rather than
+	// downstream keeps the reference identical to what the pull records, which is what image
+	// garbage collection matches against.
+	containerSpecSpec.Image = containers.ContainerImageSpec{Ref: containerConfig.Image()}
+
+	containerSpecSpec.Entrypoint = containerConfig.Entrypoint()
+	containerSpecSpec.Args = containerConfig.Args()
+	containerSpecSpec.WorkingDir = containerConfig.WorkingDir()
+
+	runAs := containerConfig.RunAs()
+	containerSpecSpec.RunAs = containers.ContainerRunAsSpec{
+		UID: runAs.UID().Ptr(),
+		GID: runAs.GID().Ptr(),
+	}
+
+	containerSpecSpec.Environment = containerConfig.Environment()
+
+	containerMountSpecs, err := resolveMounts(containerConfig.Mounts())
+	if err != nil {
+		return err
+	}
+
+	containerSpecSpec.Mounts = containerMountSpecs
+
+	containerDeviceSpecs, err := resolveDevices(containerConfig.Devices())
+	if err != nil {
+		return err
+	}
+
+	containerSpecSpec.Devices = containerDeviceSpecs
+
+	security := containerConfig.Security()
+	containerSpecSpec.Security = containers.ContainerSecuritySpec{
+		Privileged:        security.Profile() == configcfg.ContainerSecurityProfilePrivileged,
+		CapabilitiesAdd:   security.CapabilitiesAdd(),
+		CapabilitiesDrop:  security.CapabilitiesDrop(),
+		MachinedAccess:    security.MachinedAccess(),
+		SeccompUnconfined: security.SeccompProfile() == configcfg.ContainerSeccompProfileUnconfined,
+		ReadOnlyRootFS:    security.ReadOnlyRootFS(),
+	}
+
+	if security.SeccompProfile() == configcfg.ContainerSeccompProfileLocalhost {
+		content, err := resolveSeccompProfile(security.SeccompLocalhostProfile(), seccompProfiles)
+		if err != nil {
+			return err
+		}
+
+		containerSpecSpec.Security.SeccompLocalhostProfile = security.SeccompLocalhostProfile()
+		containerSpecSpec.Security.SeccompLocalhostProfileContent = content
+	}
+
+	containerSpecSpec.Network = containers.ContainerNetworkSpec{
+		HostNetwork: containerConfig.Network().Mode() == configcfg.ContainerNetworkModeHost,
+	}
+
+	resources := containerConfig.Resources()
+	containerSpecSpec.Resources = containers.ContainerResourcesSpec{
+		MemoryLimit: resources.MemoryLimit().ValueOrZero(),
+		CPULimit:    resources.CPULimit().ValueOrZero(),
+		SwapLimit:   resources.SwapLimit().Ptr(),
+	}
+
+	dependsOn := containerConfig.DependsOn()
+	containerSpecSpec.DependsOn = containers.ContainerDependsOnSpec{
+		Paths:    dependsOn.Paths(),
+		Networks: dependsOn.Network(),
+		Time:     dependsOn.Time(),
+		Containers: xslices.Map(dependsOn.Containers(), func(dependency configcfg.ContainerDependencyConfig) containers.ContainerDependencySpec {
+			condition := containers.ContainerDependencyConditionRunning
+
+			if dependency.Condition() == configcfg.ContainerDependencyConditionSucceeded {
+				condition = containers.ContainerDependencyConditionSucceeded
+			}
+
+			return containers.ContainerDependencySpec{Name: dependency.Name(), Condition: condition}
+		}),
+	}
+
+	containerSpecSpec.StopTimeout = containerConfig.StopTimeout()
+	restart := containerConfig.Restart()
+	containerSpecSpec.Restart = containers.ContainerRestartSpec{
+		Policy:   restartPolicy(restart.Policy()),
+		Delay:    restart.Delay(),
+		MaxDelay: restart.MaxDelay(),
+	}
+
+	if maxRetries, ok := restart.MaxRetries().Get(); ok {
+		containerSpecSpec.Restart.MaxRetries = new(uint32(maxRetries)) //nolint:gosec // validated to be non-negative
+	}
+
+	containerSpecSpec.HealthCheck = resolveHealthCheck(containerConfig.HealthCheck())
+
+	return nil
+}
+
+func restartPolicy(policy configcfg.ContainerRestartPolicy) containers.ContainerRestartPolicy {
+	switch policy {
+	case configcfg.ContainerRestartPolicyOnFailure:
+		return containers.ContainerRestartPolicyOnFailure
+	case configcfg.ContainerRestartPolicyNever:
+		return containers.ContainerRestartPolicyNever
+	case configcfg.ContainerRestartPolicyAlways:
+	}
+
+	// always, and anything else, which validation rejects
+	return containers.ContainerRestartPolicyAlways
+}
+
+// resolveHealthCheck turns the typed configuration health check into a health check spec.
+func resolveHealthCheck(healthCheckConfig optional.Optional[configcfg.ContainerHealthCheckConfig]) containers.ContainerHealthCheckSpec {
+	healthCheck, ok := healthCheckConfig.Get()
+	if !ok {
+		return containers.ContainerHealthCheckSpec{}
+	}
+
+	return containers.ContainerHealthCheckSpec{
+		Kind:             string(healthCheck.Kind()),
+		Port:             uint32(healthCheck.Port()),
+		Path:             healthCheck.HTTPPath(),
+		GRPCService:      healthCheck.GRPCService(),
+		InitialDelay:     healthCheck.InitialDelay(),
+		Interval:         healthCheck.Interval(),
+		Timeout:          healthCheck.Timeout(),
+		FailureThreshold: healthCheck.FailureThreshold(),
+	}
+}
+
+// resolveMounts turns typed configuration mounts into mount specs.
+func resolveMounts(configMounts []configcfg.ContainerMountConfig) ([]containers.ContainerMountSpec, error) {
+	if len(configMounts) == 0 {
+		return nil, nil
+	}
+
+	containerMountSpecs := make([]containers.ContainerMountSpec, 0, len(configMounts))
+
+	for i, containerMountConfig := range configMounts {
+		switch {
+		case containerMountConfig.Volume().IsPresent():
+			volume, _ := containerMountConfig.Volume().Get()
+
+			containerMountSpecs = append(containerMountSpecs, containers.ContainerMountSpec{
+				Kind:        containers.MountKindVolume,
+				VolumeName:  volume.Name(),
+				Destination: volume.Destination(),
+				Options:     volume.MountOptions(),
+			})
+		case containerMountConfig.Tmpfs().IsPresent():
+			tmpfs, _ := containerMountConfig.Tmpfs().Get()
+
+			var size uint64
+
+			if tmpfs.Size() != "" {
+				var err error
+
+				if size, err = humanize.ParseBytes(tmpfs.Size()); err != nil {
+					// Validation has already rejected this, so reaching here means the document
+					// bypassed validation somehow; fail loudly rather than silently dropping the size.
+					return nil, fmt.Errorf("mounts[%d]: invalid tmpfs size %q: %w", i, tmpfs.Size(), err)
+				}
+			}
+
+			containerMountSpecs = append(containerMountSpecs, containers.ContainerMountSpec{
+				Kind:        containers.MountKindTmpfs,
+				Destination: tmpfs.Destination(),
+				Size:        size,
+				Options:     tmpfs.MountOptions(),
+			})
+		case containerMountConfig.HostPath().IsPresent():
+			hostPath, _ := containerMountConfig.HostPath().Get()
+
+			containerMountSpecs = append(containerMountSpecs, containers.ContainerMountSpec{
+				Kind:        containers.MountKindHostPath,
+				Source:      hostPath.Source(),
+				Destination: hostPath.Destination(),
+				Options:     hostPath.MountOptions(),
+			})
+		default:
+			return nil, fmt.Errorf("mounts[%d]: no mount source set", i)
+		}
+	}
+
+	return containerMountSpecs, nil
+}
+
+// resolveDevices turns typed configuration devices into device specs.
+func resolveDevices(configDevices []configcfg.ContainerDeviceConfig) ([]containers.ContainerDeviceSpec, error) {
+	if len(configDevices) == 0 {
+		return nil, nil
+	}
+
+	containerDeviceSpecs := make([]containers.ContainerDeviceSpec, 0, len(configDevices))
+
+	for i, containerDeviceConfig := range configDevices {
+		rawVolume, ok := containerDeviceConfig.RawVolume().Get()
+		if !ok {
+			return nil, fmt.Errorf("devices[%d]: no device source set", i)
+		}
+
+		containerDeviceSpecs = append(containerDeviceSpecs, containers.ContainerDeviceSpec{
+			Kind:        containers.DeviceKindRawVolume,
+			VolumeName:  rawVolume.Name(),
+			Destination: rawVolume.Destination(),
+		})
+	}
+
+	return containerDeviceSpecs, nil
+}
+
+// resolveSeccompProfile looks up a seccomp profile by name, and returns it as canonical JSON.
+//
+// Round-tripping through the OCI runtime-spec type both validates the profile and drops any key
+// the runtime would ignore anyway, so that only a meaningful edit of the profile restarts the
+// container.
+func resolveSeccompProfile(name string, seccompProfiles map[string]configcfg.SeccompProfile) (string, error) {
+	seccompProfile, ok := seccompProfiles[name]
+	if !ok {
+		return "", fmt.Errorf("seccomp profile %q is not declared", name)
+	}
+
+	parsed, err := cri.ParseSeccompProfile(seccompProfile.Value())
+	if err != nil {
+		return "", fmt.Errorf("seccomp profile %q: %w", name, err)
+	}
+
+	content, err := json.Marshal(parsed)
+	if err != nil {
+		return "", fmt.Errorf("seccomp profile %q: failed to marshal: %w", name, err)
+	}
+
+	return string(content), nil
+}

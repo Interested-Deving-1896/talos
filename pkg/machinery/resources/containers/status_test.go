@@ -1,0 +1,701 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+package containers_test
+
+import (
+	"cmp"
+	"testing"
+
+	"github.com/cosi-project/runtime/pkg/resource"
+	"github.com/stretchr/testify/assert"
+
+	"github.com/siderolabs/talos/pkg/machinery/config/config"
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
+)
+
+func TestResolveContainerState(t *testing.T) {
+	t.Parallel()
+
+	newInstanceStatus := func(phase containers.ContainerInstancePhase) *containers.ContainerInstanceStatus {
+		status := containers.NewContainerInstanceStatus(containers.NamespaceName, "nginx-0")
+		status.TypedSpec().Phase = phase
+
+		return status
+	}
+
+	newImageStatus := func(phase containers.ContainerImagePhase) *containers.ContainerImageStatus {
+		status := containers.NewContainerImageStatus(containers.NamespaceName, "nginx")
+		status.TypedSpec().Phase = phase
+
+		return status
+	}
+
+	tests := []struct {
+		name                    string
+		containerInstanceStatus *containers.ContainerInstanceStatus
+		containerImageStatus    *containers.ContainerImageStatus
+		gatesReady              bool
+		isStopping              bool
+		finishedState           containers.ContainerState
+		want                    containers.ContainerState
+	}{
+		{
+			name: "no instance, no image, gates unmet",
+			want: containers.ContainerStatePending,
+		},
+		{
+			name:       "no instance, no image, gates met",
+			gatesReady: true,
+			want:       containers.ContainerStateStarting,
+		},
+		{
+			name:                 "no instance, image pulling",
+			containerImageStatus: newImageStatus(containers.ContainerImagePhasePulling),
+			gatesReady:           true,
+			want:                 containers.ContainerStatePulling,
+		},
+		{
+			name:                 "no instance, image failed",
+			containerImageStatus: newImageStatus(containers.ContainerImagePhaseFailed),
+			gatesReady:           true,
+			want:                 containers.ContainerStateBackoff,
+		},
+		{
+			name:                 "no instance, image pending, gates unmet",
+			containerImageStatus: newImageStatus(containers.ContainerImagePhasePending),
+			want:                 containers.ContainerStatePending,
+		},
+		{
+			name:                 "no instance, image ready, gates met",
+			containerImageStatus: newImageStatus(containers.ContainerImagePhaseReady),
+			gatesReady:           true,
+			want:                 containers.ContainerStateStarting,
+		},
+		{
+			name:                    "isStopping wins over instance phase",
+			containerInstanceStatus: newInstanceStatus(containers.ContainerInstancePhaseRunning),
+			isStopping:              true,
+			want:                    containers.ContainerStateStopping,
+		},
+		{
+			name:                    "instance created",
+			containerInstanceStatus: newInstanceStatus(containers.ContainerInstancePhaseCreated),
+			want:                    containers.ContainerStateStarting,
+		},
+		{
+			name:                    "instance running",
+			containerInstanceStatus: newInstanceStatus(containers.ContainerInstancePhaseRunning),
+			want:                    containers.ContainerStateRunning,
+		},
+		{
+			name:                    "instance terminated",
+			containerInstanceStatus: newInstanceStatus(containers.ContainerInstancePhaseTerminated),
+			want:                    containers.ContainerStateExited,
+		},
+		{
+			name:                    "instance failed",
+			containerInstanceStatus: newInstanceStatus(containers.ContainerInstancePhaseFailed),
+			want:                    containers.ContainerStateExited,
+		},
+		{
+			name:                    "instance terminated, not restarted",
+			containerInstanceStatus: newInstanceStatus(containers.ContainerInstancePhaseTerminated),
+			finishedState:           containers.ContainerStateSucceeded,
+			want:                    containers.ContainerStateSucceeded,
+		},
+		{
+			name:                    "instance running, not restarted once finished",
+			containerInstanceStatus: newInstanceStatus(containers.ContainerInstancePhaseRunning),
+			finishedState:           containers.ContainerStateFailed,
+			want:                    containers.ContainerStateRunning,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := containers.ResolveContainerState(tt.containerInstanceStatus, tt.containerImageStatus, tt.gatesReady, tt.isStopping, cmp.Or(tt.finishedState, containers.ContainerStateExited))
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestResolveReportedImage(t *testing.T) {
+	t.Parallel()
+
+	const ref = "docker.io/library/nginx:latest"
+
+	newContainerSpec := func() *containers.ContainerSpec {
+		spec := containers.NewContainerSpec(containers.NamespaceName, "nginx")
+		spec.TypedSpec().Image = containers.ContainerImageSpec{Ref: ref}
+
+		return spec
+	}
+
+	newInstanceSpec := func(image string) *containers.ContainerInstanceSpec {
+		spec := containers.NewContainerInstanceSpec(containers.NamespaceName, "nginx-0")
+		spec.TypedSpec().Image = image
+
+		return spec
+	}
+
+	tests := []struct {
+		name                  string
+		containerInstanceSpec *containers.ContainerInstanceSpec
+		imageDigest           string
+		want                  string
+	}{
+		{
+			name: "no instance, no digest: falls back to the reference",
+			want: ref,
+		},
+		{
+			name:        "no instance, digest resolved",
+			imageDigest: "sha256:new",
+			want:        "sha256:new",
+		},
+		{
+			name:                  "instance image wins over the resolved digest",
+			containerInstanceSpec: newInstanceSpec("sha256:old"),
+			imageDigest:           "sha256:new",
+			want:                  "sha256:old",
+		},
+		{
+			name:                  "instance present without an image falls through to the digest",
+			containerInstanceSpec: newInstanceSpec(""),
+			imageDigest:           "sha256:new",
+			want:                  "sha256:new",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := containers.ResolveReportedImage(newContainerSpec(), tt.containerInstanceSpec, tt.imageDigest)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestContainerStatusSpecUpdate(t *testing.T) {
+	t.Parallel()
+
+	const (
+		imageRef = "docker.io/library/nginx:latest"
+		digest   = "sha256:new"
+	)
+
+	newContainerSpec := func(healthChecked bool) *containers.ContainerSpec {
+		spec := containers.NewContainerSpec(containers.NamespaceName, "nginx")
+		spec.TypedSpec().Image = containers.ContainerImageSpec{Ref: imageRef}
+
+		if healthChecked {
+			spec.TypedSpec().HealthCheck = containers.ContainerHealthCheckSpec{Kind: string(config.ContainerHealthCheckKindTCP), Port: 80}
+		}
+
+		return spec
+	}
+
+	newHealthStatus := func(healthy bool, message string) *containers.ContainerHealthStatus {
+		status := containers.NewContainerHealthStatus(containers.NamespaceName, "nginx-0")
+		status.TypedSpec().Healthy = healthy
+		status.TypedSpec().Message = message
+
+		return status
+	}
+
+	runningInstance := func(spec *containers.ContainerInstanceStatusSpec) {
+		spec.Phase = containers.ContainerInstancePhaseRunning
+		spec.PID = 11
+	}
+
+	newInstanceStatus := func(mutate func(*containers.ContainerInstanceStatusSpec)) *containers.ContainerInstanceStatus {
+		status := containers.NewContainerInstanceStatus(containers.NamespaceName, "nginx-0")
+		mutate(status.TypedSpec())
+
+		return status
+	}
+
+	newImageStatus := func(phase containers.ContainerImagePhase, errorMessage string) *containers.ContainerImageStatus {
+		status := containers.NewContainerImageStatus(containers.NamespaceName, "nginx")
+		status.TypedSpec().Phase = phase
+		status.TypedSpec().Error = errorMessage
+
+		return status
+	}
+
+	newInstanceSpec := func(image string, phase resource.Phase) *containers.ContainerInstanceSpec {
+		spec := containers.NewContainerInstanceSpec(containers.NamespaceName, "nginx-0")
+		spec.TypedSpec().Image = image
+		spec.TypedSpec().ExecutionHash = newContainerSpec(false).TypedSpec().ExecutionHash()
+		spec.Metadata().SetPhase(phase)
+
+		return spec
+	}
+
+	tests := []struct {
+		name                    string
+		prev                    containers.ContainerStatusSpec
+		containerImageStatus    *containers.ContainerImageStatus
+		containerInstanceStatus *containers.ContainerInstanceStatus
+		containerInstanceSpec   *containers.ContainerInstanceSpec
+		imageDigest             string
+		waitingFor              []string
+		// Helps distinguish gates unmet, from gates that were not yet published.
+		gatesUnknown          bool
+		healthChecked         bool
+		containerHealthStatus *containers.ContainerHealthStatus
+		want                  containers.ContainerStatusSpec
+	}{
+		{
+			name:       "fresh container waiting on its gates",
+			waitingFor: []string{"image"},
+			want: containers.ContainerStatusSpec{
+				State:      containers.ContainerStatePending,
+				Health:     containers.ContainerHealthPending,
+				Image:      imageRef,
+				WaitingFor: []string{"image"},
+			},
+		},
+		{
+			name: "running instance is projected onto the aggregate",
+			containerInstanceStatus: newInstanceStatus(func(spec *containers.ContainerInstanceStatusSpec) {
+				spec.Phase = containers.ContainerInstancePhaseRunning
+				spec.Generation = 2
+				spec.PID = 42
+			}),
+			containerInstanceSpec: newInstanceSpec("", resource.PhaseRunning),
+			imageDigest:           digest,
+			want: containers.ContainerStatusSpec{
+				State:        containers.ContainerStateRunning,
+				Health:       containers.ContainerHealthHealthy,
+				Image:        digest,
+				PID:          42,
+				RestartCount: 0,
+				Generation:   2,
+			},
+		},
+		{
+			name: "PID is dropped for an instance that is no longer running",
+			containerInstanceStatus: newInstanceStatus(func(spec *containers.ContainerInstanceStatusSpec) {
+				spec.Phase = containers.ContainerInstancePhaseTerminated
+				spec.Generation = 1
+				spec.PID = 42
+				spec.ExitCode = 1
+			}),
+			containerInstanceSpec: newInstanceSpec("", resource.PhaseRunning),
+			want: containers.ContainerStatusSpec{
+				State:        containers.ContainerStateExited,
+				Health:       containers.ContainerHealthDegraded,
+				Image:        imageRef,
+				ExitCode:     1,
+				RestartCount: 0,
+				Generation:   1,
+			},
+		},
+		{
+			name: "waitingFor is dropped once the state is no longer pending",
+			prev: containers.ContainerStatusSpec{
+				State:      containers.ContainerStatePending,
+				Health:     containers.ContainerHealthPending,
+				WaitingFor: []string{"image"},
+			},
+			containerInstanceStatus: newInstanceStatus(func(spec *containers.ContainerInstanceStatusSpec) {
+				spec.Phase = containers.ContainerInstancePhaseRunning
+				spec.PID = 7
+			}),
+			containerInstanceSpec: newInstanceSpec("", resource.PhaseRunning),
+			waitingFor:            []string{"mounts"},
+			want: containers.ContainerStatusSpec{
+				State:  containers.ContainerStateRunning,
+				Health: containers.ContainerHealthHealthy,
+				Image:  imageRef,
+				PID:    7,
+			},
+		},
+		{
+			name: "the last execution's outcome survives the gap between instances",
+			prev: containers.ContainerStatusSpec{
+				State:        containers.ContainerStateBackoff,
+				Health:       containers.ContainerHealthDegraded,
+				PID:          9,
+				RestartCount: 3,
+				Generation:   3,
+				ExitCode:     7,
+				Error:        "task exited",
+			},
+			want: containers.ContainerStatusSpec{
+				State:        containers.ContainerStateStarting,
+				Health:       containers.ContainerHealthPulling,
+				Image:        imageRef,
+				RestartCount: 3,
+				Generation:   3,
+				ExitCode:     7,
+				Error:        "task exited",
+			},
+		},
+		{
+			name: "a present instance status overwrites the carried-over outcome",
+			prev: containers.ContainerStatusSpec{
+				RestartCount: 3,
+				Generation:   3,
+				ExitCode:     7,
+			},
+			containerInstanceStatus: newInstanceStatus(func(spec *containers.ContainerInstanceStatusSpec) {
+				spec.Phase = containers.ContainerInstancePhaseRunning
+				spec.Generation = 5
+				spec.PID = 11
+			}),
+			containerInstanceSpec: newInstanceSpec("", resource.PhaseRunning),
+			want: containers.ContainerStatusSpec{
+				State:        containers.ContainerStateRunning,
+				Health:       containers.ContainerHealthHealthy,
+				Image:        imageRef,
+				PID:          11,
+				RestartCount: 3,
+				Generation:   5,
+			},
+		},
+		{
+			name: "a present instance status without an error clears the carried-over one",
+			prev: containers.ContainerStatusSpec{
+				Error: "task exited",
+			},
+			containerInstanceStatus: newInstanceStatus(func(spec *containers.ContainerInstanceStatusSpec) {
+				spec.Phase = containers.ContainerInstancePhaseRunning
+				spec.PID = 11
+			}),
+			containerInstanceSpec: newInstanceSpec("", resource.PhaseRunning),
+			want: containers.ContainerStatusSpec{
+				State:  containers.ContainerStateRunning,
+				Health: containers.ContainerHealthHealthy,
+				Image:  imageRef,
+				PID:    11,
+			},
+		},
+		{
+			name: "stopping carries the previous health of a healthy container",
+			prev: containers.ContainerStatusSpec{
+				State:  containers.ContainerStateRunning,
+				Health: containers.ContainerHealthHealthy,
+			},
+			containerInstanceStatus: newInstanceStatus(func(spec *containers.ContainerInstanceStatusSpec) {
+				spec.Phase = containers.ContainerInstancePhaseRunning
+				spec.PID = 11
+			}),
+			containerInstanceSpec: newInstanceSpec(digest, resource.PhaseTearingDown),
+			want: containers.ContainerStatusSpec{
+				State:  containers.ContainerStateStopping,
+				Health: containers.ContainerHealthHealthy,
+				Image:  digest,
+				PID:    11,
+			},
+		},
+		{
+			name: "stopping carries the previous health of a degraded container",
+			prev: containers.ContainerStatusSpec{
+				State:  containers.ContainerStateBackoff,
+				Health: containers.ContainerHealthDegraded,
+			},
+			containerInstanceStatus: newInstanceStatus(func(spec *containers.ContainerInstanceStatusSpec) {
+				spec.Phase = containers.ContainerInstancePhaseTerminated
+				spec.ExitCode = 2
+			}),
+			containerInstanceSpec: newInstanceSpec(digest, resource.PhaseTearingDown),
+			want: containers.ContainerStatusSpec{
+				State:    containers.ContainerStateStopping,
+				Health:   containers.ContainerHealthDegraded,
+				Image:    digest,
+				ExitCode: 2,
+			},
+		},
+		{
+			name: "an instance whose spec is already destroyed is still stopping",
+			prev: containers.ContainerStatusSpec{
+				State:  containers.ContainerStateRunning,
+				Health: containers.ContainerHealthHealthy,
+				Image:  digest,
+				PID:    1234,
+			},
+			containerInstanceStatus: newInstanceStatus(func(spec *containers.ContainerInstanceStatusSpec) {
+				spec.Phase = containers.ContainerInstancePhaseRunning
+				spec.Generation = 1
+				spec.PID = 1234
+			}),
+			imageDigest: digest,
+			want: containers.ContainerStatusSpec{
+				State:        containers.ContainerStateStopping,
+				Health:       containers.ContainerHealthHealthy,
+				Image:        digest,
+				RestartCount: 0,
+				Generation:   1,
+			},
+		},
+		{
+			name: "a destroyed instance spec carries the previous health of a degraded container",
+			prev: containers.ContainerStatusSpec{
+				State:  containers.ContainerStateBackoff,
+				Health: containers.ContainerHealthDegraded,
+			},
+			containerInstanceStatus: newInstanceStatus(func(spec *containers.ContainerInstanceStatusSpec) {
+				spec.Phase = containers.ContainerInstancePhaseTerminated
+				spec.ExitCode = 2
+			}),
+			imageDigest: digest,
+			want: containers.ContainerStatusSpec{
+				State:    containers.ContainerStateStopping,
+				Health:   containers.ContainerHealthDegraded,
+				Image:    digest,
+				ExitCode: 2,
+			},
+		},
+		{
+			name:                 "a failed pull surfaces through the aggregate",
+			containerImageStatus: newImageStatus(containers.ContainerImagePhaseFailed, "pull failed"),
+			waitingFor:           []string{"image"},
+			want: containers.ContainerStatusSpec{
+				State:  containers.ContainerStateBackoff,
+				Health: containers.ContainerHealthDegraded,
+				Image:  imageRef,
+				Error:  "pull failed",
+			},
+		},
+		{
+			name:         "gates that have not been published yet are not gates that are met",
+			gatesUnknown: true,
+			want: containers.ContainerStatusSpec{
+				State:  containers.ContainerStatePending,
+				Health: containers.ContainerHealthPending,
+				Image:  imageRef,
+			},
+		},
+		{
+			name: "the running instance's image outranks a newly resolved digest",
+			containerInstanceStatus: newInstanceStatus(func(spec *containers.ContainerInstanceStatusSpec) {
+				spec.Phase = containers.ContainerInstancePhaseRunning
+				spec.PID = 11
+			}),
+			containerInstanceSpec: newInstanceSpec("sha256:old", resource.PhaseRunning),
+			imageDigest:           digest,
+			want: containers.ContainerStatusSpec{
+				State:  containers.ContainerStateRunning,
+				Health: containers.ContainerHealthHealthy,
+				Image:  "sha256:old",
+				PID:    11,
+			},
+		},
+		{
+			name:                    "a running container with a health check is pending until a check decides",
+			containerInstanceStatus: newInstanceStatus(runningInstance),
+			containerInstanceSpec:   newInstanceSpec("", resource.PhaseRunning),
+			healthChecked:           true,
+			want: containers.ContainerStatusSpec{
+				State:  containers.ContainerStateRunning,
+				Health: containers.ContainerHealthPending,
+				Image:  imageRef,
+				PID:    11,
+			},
+		},
+		{
+			name:                    "a passing health check makes a running container healthy",
+			containerInstanceStatus: newInstanceStatus(runningInstance),
+			containerInstanceSpec:   newInstanceSpec("", resource.PhaseRunning),
+			healthChecked:           true,
+			containerHealthStatus:   newHealthStatus(true, ""),
+			want: containers.ContainerStatusSpec{
+				State:  containers.ContainerStateRunning,
+				Health: containers.ContainerHealthHealthy,
+				Image:  imageRef,
+				PID:    11,
+			},
+		},
+		{
+			name:                    "a failing health check degrades a running container and reports why",
+			containerInstanceStatus: newInstanceStatus(runningInstance),
+			containerInstanceSpec:   newInstanceSpec("", resource.PhaseRunning),
+			healthChecked:           true,
+			containerHealthStatus:   newHealthStatus(false, "connection refused"),
+			want: containers.ContainerStatusSpec{
+				State:  containers.ContainerStateRunning,
+				Health: containers.ContainerHealthDegraded,
+				Image:  imageRef,
+				PID:    11,
+				Error:  "health check: connection refused",
+			},
+		},
+		{
+			name:                    "a health status is ignored when no health check is configured",
+			containerInstanceStatus: newInstanceStatus(runningInstance),
+			containerInstanceSpec:   newInstanceSpec("", resource.PhaseRunning),
+			containerHealthStatus:   newHealthStatus(false, "connection refused"),
+			want: containers.ContainerStatusSpec{
+				State:  containers.ContainerStateRunning,
+				Health: containers.ContainerHealthHealthy,
+				Image:  imageRef,
+				PID:    11,
+			},
+		},
+		{
+			name: "an exited container with a health check is degraded by its exit, not by the check",
+			containerInstanceStatus: newInstanceStatus(func(spec *containers.ContainerInstanceStatusSpec) {
+				spec.Phase = containers.ContainerInstancePhaseTerminated
+				spec.ExitCode = 1
+			}),
+			containerInstanceSpec: newInstanceSpec("", resource.PhaseRunning),
+			healthChecked:         true,
+			containerHealthStatus: newHealthStatus(false, "connection refused"),
+			want: containers.ContainerStatusSpec{
+				State:    containers.ContainerStateExited,
+				Health:   containers.ContainerHealthDegraded,
+				Image:    imageRef,
+				ExitCode: 1,
+			},
+		},
+		{
+			name: "stopping keeps the health a check last decided",
+			prev: containers.ContainerStatusSpec{
+				State:  containers.ContainerStateRunning,
+				Health: containers.ContainerHealthDegraded,
+			},
+			containerInstanceStatus: newInstanceStatus(runningInstance),
+			containerInstanceSpec:   newInstanceSpec(digest, resource.PhaseTearingDown),
+			healthChecked:           true,
+			want: containers.ContainerStatusSpec{
+				State:  containers.ContainerStateStopping,
+				Health: containers.ContainerHealthDegraded,
+				Image:  digest,
+				PID:    11,
+			},
+		},
+		{
+			// A check never ends an execution: its message is not why the last one went away.
+			name: "a health check error is not carried over as the last execution's outcome",
+			prev: containers.ContainerStatusSpec{
+				State:        containers.ContainerStateRunning,
+				Health:       containers.ContainerHealthDegraded,
+				RestartCount: 2,
+				Error:        "health check: connection refused",
+			},
+			healthChecked: true,
+			want: containers.ContainerStatusSpec{
+				State:        containers.ContainerStateStarting,
+				Health:       containers.ContainerHealthPulling,
+				Image:        imageRef,
+				RestartCount: 2,
+			},
+		},
+		{
+			// Where an error came from is told by the state it was reported in, not by its text.
+			name: "an execution's error is carried over whatever its text",
+			prev: containers.ContainerStatusSpec{
+				State:        containers.ContainerStateBackoff,
+				Health:       containers.ContainerHealthDegraded,
+				RestartCount: 2,
+				Error:        "health check: binary not found",
+			},
+			healthChecked: true,
+			want: containers.ContainerStatusSpec{
+				State:        containers.ContainerStateStarting,
+				Health:       containers.ContainerHealthPulling,
+				Image:        imageRef,
+				RestartCount: 2,
+				Error:        "health check: binary not found",
+			},
+		},
+		{
+			// An image error reported next to a running instance is not why it went away: it is derived
+			// again from the image status, here gone.
+			name: "an error reported while running is not carried over",
+			prev: containers.ContainerStatusSpec{
+				State:        containers.ContainerStateRunning,
+				Health:       containers.ContainerHealthHealthy,
+				RestartCount: 2,
+				Error:        "failed to pull image",
+			},
+			want: containers.ContainerStatusSpec{
+				State:        containers.ContainerStateStarting,
+				Health:       containers.ContainerHealthPulling,
+				Image:        imageRef,
+				RestartCount: 2,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var containerDependencyStatus *containers.ContainerDependencyStatus
+
+			if !tt.gatesUnknown {
+				containerDependencyStatus = containers.NewContainerDependencyStatus(containers.NamespaceName, "nginx")
+				containerDependencyStatus.TypedSpec().WaitingFor = tt.waitingFor
+			}
+
+			got := tt.prev
+
+			got.Update(
+				newContainerSpec(tt.healthChecked),
+				tt.containerImageStatus,
+				tt.containerInstanceStatus,
+				tt.containerInstanceSpec,
+				tt.imageDigest,
+				containerDependencyStatus,
+				nil,
+				tt.containerHealthStatus,
+			)
+
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestContainerStatusSpecUpdateFinished(t *testing.T) {
+	t.Parallel()
+
+	containerSpec := containers.NewContainerSpec(containers.NamespaceName, "migrate")
+	containerSpec.TypedSpec().Image = containers.ContainerImageSpec{Ref: "ghcr.io/example/migrate:v1.0.0"}
+	containerSpec.TypedSpec().Restart.Policy = containers.ContainerRestartPolicyNever
+
+	instanceStatus := containers.NewContainerInstanceStatus(containers.NamespaceName, "migrate-4")
+	instanceStatus.TypedSpec().Generation = 4
+	instanceStatus.TypedSpec().Phase = containers.ContainerInstancePhaseTerminated
+
+	runStatus := containers.NewContainerRunStatus(containers.NamespaceName, "migrate")
+	runStatus.TypedSpec().ExecutionHash = containerSpec.TypedSpec().ExecutionHash()
+	runStatus.TypedSpec().Policy = containerSpec.TypedSpec().Restart.Policy
+	runStatus.TypedSpec().Restarts = 2
+	runStatus.TypedSpec().FinishedGeneration = 4
+	runStatus.TypedSpec().FinishedState = containers.ContainerStateSucceeded
+
+	dependencyStatus := containers.NewContainerDependencyStatus(containers.NamespaceName, "migrate")
+	dependencyStatus.TypedSpec().WaitingFor = []string{"container: db"}
+
+	for _, test := range []struct {
+		name  string
+		hash  string
+		state containers.ContainerState
+	}{
+		{name: "current configuration", hash: containerSpec.TypedSpec().ExecutionHash(), state: containers.ContainerStateSucceeded},
+		{name: "changed configuration", hash: "previous", state: containers.ContainerStatePending},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			instanceSpec := containers.NewContainerInstanceSpec(containers.NamespaceName, "migrate-4")
+			instanceSpec.TypedSpec().ExecutionHash = test.hash
+
+			var status containers.ContainerStatusSpec
+
+			status.Update(containerSpec, nil, instanceStatus, instanceSpec, "", dependencyStatus, runStatus, nil)
+
+			assert.Equal(t, test.state, status.State)
+			assert.EqualValues(t, 2, status.RestartCount)
+			assert.EqualValues(t, 4, status.Generation)
+		})
+	}
+}

@@ -12,6 +12,7 @@ import (
 
 	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/network"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
@@ -25,7 +26,7 @@ func ingressRuleWithinCluster(cidrs []netip.Prefix, gateways []netip.Addr) []net
 			rules,
 			network.IngressRule{
 				Subnet: cidrs[i],
-				Except: network.Prefix{Prefix: netip.PrefixFrom(gateways[i], gateways[i].BitLen())},
+				Except: meta.Prefix{Prefix: netip.PrefixFrom(gateways[i], gateways[i].BitLen())},
 			},
 		)
 	}
@@ -184,6 +185,19 @@ func Worker(defaultAction nethelpers.DefaultAction, cidrs []netip.Prefix, gatewa
 	vxlanRule.Ingress = ingressRuleWithinCluster(cidrs, gateways)
 
 	provider, err := container.New(def, kubeletRule, apidRule, vxlanRule)
+	if err != nil { // should not fail
+		panic(err)
+	}
+
+	return configpatcher.NewStrategicMergePatch(provider)
+}
+
+// LinkIngress generates a link ingress filter to block all traffic
+// not destined to the node IPs.
+func LinkIngress(interfaceName string) configpatcher.Patch {
+	linkIngress := network.NewLinkIngressConfigV1Alpha1(interfaceName)
+
+	provider, err := container.New(linkIngress)
 	if err != nil { // should not fail
 		panic(err)
 	}

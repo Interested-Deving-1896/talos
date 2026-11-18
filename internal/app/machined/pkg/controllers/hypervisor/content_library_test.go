@@ -1,0 +1,790 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+package hypervisor_test
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/cosi-project/runtime/pkg/resource"
+	"github.com/cosi-project/runtime/pkg/safe"
+	"github.com/cosi-project/runtime/pkg/state"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
+
+	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
+	hypervisorctrl "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/hypervisor"
+	"github.com/siderolabs/talos/internal/pkg/contentlibrary/staging"
+	configcfg "github.com/siderolabs/talos/pkg/machinery/config/config"
+	"github.com/siderolabs/talos/pkg/machinery/config/container"
+	blockcfg "github.com/siderolabs/talos/pkg/machinery/config/types/block"
+	hypervisorcfg "github.com/siderolabs/talos/pkg/machinery/config/types/hypervisor"
+	"github.com/siderolabs/talos/pkg/machinery/constants"
+	"github.com/siderolabs/talos/pkg/machinery/resources/block"
+	"github.com/siderolabs/talos/pkg/machinery/resources/config"
+	"github.com/siderolabs/talos/pkg/machinery/resources/hypervisor"
+)
+
+const (
+	// testLibrary is the content library name the tests use.
+	testLibrary = "vm-images"
+	// testVolumeName is the name the backing volume is declared under, as written by the user.
+	testVolumeName = "vm-images"
+)
+
+// contentLibraryControllerName is the controller's name, which its mount requests are keyed by.
+var contentLibraryControllerName = (&hypervisorctrl.ContentLibraryController{}).Name()
+
+// testVolumeID is the internal ID the backing volume gets, which the user never writes.
+var testVolumeID = constants.UserVolumePrefix + testVolumeName
+
+// testRequestID mirrors the controller's naming so tests can find what it creates.
+var testRequestID = contentLibraryControllerName + "/" + testLibrary + "/" + testVolumeID
+
+// fingerprint is the fingerprint of dir, and fails the test rather than returning an error.
+func fingerprint(t *testing.T, dir string) string {
+	t.Helper()
+
+	got, err := hypervisorctrl.FingerprintLibrary(dir)
+	require.NoError(t, err)
+
+	return got
+}
+
+// requireFullDigest fails unless s is a whole SHA-256 digest in hex.
+func requireFullDigest(t *testing.T, s string) {
+	t.Helper()
+
+	require.Len(t, s, hex.EncodedLen(sha256.Size), "the fingerprint must be a whole SHA-256 digest")
+
+	decoded, err := hex.DecodeString(s)
+	require.NoError(t, err, "the fingerprint must be hex")
+	require.Len(t, decoded, sha256.Size)
+}
+
+func TestFingerprintLibraryIsAWholeDigest(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	// An empty library hashes no entries at all, which pins that nothing else is mixed in.
+	empty := fingerprint(t, dir)
+	requireFullDigest(t, empty)
+	require.Equal(t, hex.EncodeToString(sha256.New().Sum(nil)), empty)
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "talos.iso"), []byte("an image"), 0o600))
+	requireFullDigest(t, fingerprint(t, dir))
+}
+
+func TestFingerprintLibraryTracksContents(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	empty := fingerprint(t, dir)
+	require.NotEmpty(t, empty)
+	require.Equal(t, empty, fingerprint(t, dir), "a fingerprint must not change on its own")
+
+	image := filepath.Join(dir, "talos.iso")
+	require.NoError(t, os.WriteFile(image, []byte("an image"), 0o600))
+
+	added := fingerprint(t, dir)
+	require.NotEqual(t, empty, added, "an added file must change the fingerprint")
+	require.Equal(t, added, fingerprint(t, dir), "rereading an unchanged library must agree")
+
+	require.NoError(t, os.WriteFile(image, []byte("a longer image"), 0o600))
+	resized := fingerprint(t, dir)
+	require.NotEqual(t, added, resized, "a changed size must change the fingerprint")
+
+	// Same size, different content: only the modification time distinguishes them.
+	require.NoError(t, os.WriteFile(image, []byte("a longer imagE"), 0o600))
+	require.NoError(t, os.Chtimes(image, time.Time{}, time.Now().Add(time.Hour)))
+	require.NotEqual(t, resized, fingerprint(t, dir), "a changed modification time must change the fingerprint")
+
+	require.NoError(t, os.Remove(image))
+	require.Equal(t, empty, fingerprint(t, dir), "removing the only file must restore the empty fingerprint")
+}
+
+// A rename is what an upload does on its last step, and is the only moment the library's contents
+// change: the staged file it renames from is not contents.
+func TestFingerprintLibraryIgnoresStagedAndDirs(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	empty := fingerprint(t, dir)
+
+	staged := filepath.Join(dir, staging.Prefix+"upload"+staging.Suffix)
+	require.NoError(t, os.WriteFile(staged, []byte("half an image"), 0o600))
+	require.Equal(t, empty, fingerprint(t, dir), "an upload in flight is not contents yet")
+
+	require.NoError(t, os.Mkdir(filepath.Join(dir, "nested"), 0o700))
+	require.Equal(t, empty, fingerprint(t, dir), "a library is flat: a directory is not contents")
+
+	require.NoError(t, os.Rename(staged, filepath.Join(dir, "talos.iso")))
+	require.NotEqual(t, empty, fingerprint(t, dir), "the rename completing an upload is the change")
+}
+
+// The name is part of the fingerprint: two libraries holding the same bytes under different names
+// are different contents.
+func TestFingerprintLibraryCoversNames(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "a.iso"), []byte("same"), 0o600))
+	withA := fingerprint(t, dir)
+
+	require.NoError(t, os.Rename(filepath.Join(dir, "a.iso"), filepath.Join(dir, "b.iso")))
+	require.NotEqual(t, withA, fingerprint(t, dir), "a renamed file must change the fingerprint")
+}
+
+func TestFingerprintLibraryReportsAMissingDirectory(t *testing.T) {
+	t.Parallel()
+
+	_, err := hypervisorctrl.FingerprintLibrary(filepath.Join(t.TempDir(), "absent"))
+	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+type ContentLibrarySuite struct {
+	ctest.DefaultSuite
+}
+
+func TestContentLibrarySuite(t *testing.T) {
+	t.Parallel()
+
+	suite.Run(t, &ContentLibrarySuite{
+		Timeout: 15 * time.Second,
+		AfterSetup: func(suite *ctest.DefaultSuite) {
+			suite.Require().NoError(suite.Runtime().RegisterController(&hypervisorctrl.ContentLibraryController{}))
+		},
+	})
+}
+
+// applyConfig puts the given documents into the active machine config.
+func (suite *ContentLibrarySuite) applyConfig(docs ...configcfg.Document) {
+	cfg, err := container.New(docs...)
+	suite.Require().NoError(err)
+
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), config.NewMachineConfig(cfg)))
+}
+
+// updateConfig replaces the active machine config with the given documents.
+func (suite *ContentLibrarySuite) updateConfig(docs ...configcfg.Document) {
+	cfg, err := container.New(docs...)
+	suite.Require().NoError(err)
+
+	old, err := safe.StateGetByID[*config.MachineConfig](suite.Ctx(), suite.State(), config.ActiveID)
+	suite.Require().NoError(err)
+
+	res := config.NewMachineConfig(cfg)
+	res.Metadata().SetVersion(old.Metadata().Version())
+
+	suite.Require().NoError(suite.State().Update(suite.Ctx(), res))
+}
+
+// applyLibrary puts the library into the machine config, along with the user volume backing it.
+//
+// Resolution needs the volume document: the library names it, and the document declaring that name
+// is what decides the volume's ID.
+func (suite *ContentLibrarySuite) applyLibrary(doc *hypervisorcfg.ContentLibraryConfigV1Alpha1) {
+	suite.applyConfig(newUserVolume(testVolumeName), doc)
+}
+
+func newDoc() *hypervisorcfg.ContentLibraryConfigV1Alpha1 {
+	return newDocBackedBy(testVolumeName)
+}
+
+// newDocBackedBy builds the test library, backed by the named volume.
+func newDocBackedBy(volumeName string) *hypervisorcfg.ContentLibraryConfigV1Alpha1 {
+	return newNamedDoc(testLibrary, volumeName)
+}
+
+// newNamedDoc builds a library under the given name, backed by the named volume.
+func newNamedDoc(libraryID, volumeName string) *hypervisorcfg.ContentLibraryConfigV1Alpha1 {
+	doc := hypervisorcfg.NewContentLibraryConfigV1Alpha1()
+	doc.MetaName = libraryID
+	doc.BackingConfig.VolumeName = volumeName
+
+	return doc
+}
+
+func newUserVolume(name string) *blockcfg.UserVolumeConfigV1Alpha1 {
+	doc := blockcfg.NewUserVolumeConfigV1Alpha1()
+	doc.MetaName = name
+
+	return doc
+}
+
+func newExternalVolume(name string) *blockcfg.ExternalVolumeConfigV1Alpha1 {
+	doc := blockcfg.NewExternalVolumeConfigV1Alpha1()
+	doc.MetaName = name
+
+	return doc
+}
+
+func newExistingVolume(name string) *blockcfg.ExistingVolumeConfigV1Alpha1 {
+	doc := blockcfg.NewExistingVolumeConfigV1Alpha1()
+	doc.MetaName = name
+
+	return doc
+}
+
+// newReadOnlyExternalVolume builds an external volume the user declared read-only.
+func newReadOnlyExternalVolume(name string) *blockcfg.ExternalVolumeConfigV1Alpha1 {
+	doc := newExternalVolume(name)
+	doc.MountSpec.MountReadOnly = new(true)
+
+	return doc
+}
+
+// newReadOnlyExistingVolume builds an existing volume the user declared read-only.
+func newReadOnlyExistingVolume(name string) *blockcfg.ExistingVolumeConfigV1Alpha1 {
+	doc := newExistingVolume(name)
+	doc.MountSpec.MountReadOnly = new(true)
+
+	return doc
+}
+
+// satisfyMount creates the VolumeMountStatus the block subsystem would produce for the request.
+func (suite *ContentLibrarySuite) satisfyMount(requestID, volumeID, target string, readOnly bool) {
+	status := block.NewVolumeMountStatus(block.NamespaceName, requestID)
+	status.TypedSpec().VolumeID = volumeID
+	status.TypedSpec().Requester = contentLibraryControllerName
+	status.TypedSpec().Target = target
+	status.TypedSpec().ReadOnly = readOnly
+
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), status))
+}
+
+func (suite *ContentLibrarySuite) assertNotReady(expectedError string) {
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.False(status.TypedSpec().Phase == hypervisor.ContentLibraryPhaseReady)
+		asrt.Equal(expectedError, status.TypedSpec().Error)
+		asrt.Empty(status.TypedSpec().Path)
+	})
+}
+
+func (suite *ContentLibrarySuite) assertHeld(requestID string, held bool) {
+	ctest.AssertResource(suite, requestID, func(status *block.VolumeMountStatus, asrt *assert.Assertions) {
+		asrt.Equal(held, status.Metadata().Finalizers().Has(contentLibraryControllerName))
+	})
+}
+
+// TestResolvesUserVolume covers a library backed by a user volume: the status reports the name the
+// user configured, and the volume's internal ID only in the deprecated field.
+func (suite *ContentLibrarySuite) TestResolvesUserVolume() {
+	suite.applyLibrary(newDoc())
+
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.Equal(testVolumeName, status.TypedSpec().VolumeName)
+		asrt.Equal(testVolumeID, status.TypedSpec().VolumeID, "deprecated field still populated for older clients") //nolint:staticcheck
+	})
+
+	// The mount is asked for, and nothing has answered yet.
+	suite.assertNotReady("waiting for the backing volume to be mounted")
+}
+
+// TestResolvesExternalVolume covers a library backed by an external volume: the same name, but the
+// document declaring it gives the volume a different ID.
+func (suite *ContentLibrarySuite) TestResolvesExternalVolume() {
+	const externalVolumeName = "nfs-images"
+
+	suite.applyConfig(newExternalVolume(externalVolumeName), newDocBackedBy(externalVolumeName))
+
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.Equal(externalVolumeName, status.TypedSpec().VolumeName)
+		asrt.Equal(constants.ExternalVolumePrefix+externalVolumeName, status.TypedSpec().VolumeID) //nolint:staticcheck
+	})
+}
+
+// TestResolvesExistingVolume covers a library backed by an existing volume, which the user declares
+// by pointing at a volume already on the disk.
+func (suite *ContentLibrarySuite) TestResolvesExistingVolume() {
+	const existingVolumeName = "found-images"
+
+	suite.applyConfig(newExistingVolume(existingVolumeName), newDocBackedBy(existingVolumeName))
+
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.Equal(existingVolumeName, status.TypedSpec().VolumeName)
+		asrt.Equal(constants.ExistingVolumePrefix+existingVolumeName, status.TypedSpec().VolumeID) //nolint:staticcheck
+	})
+}
+
+// TestMissingVolume covers a library naming a volume no document declares: there is nothing to
+// resolve the name against.
+func (suite *ContentLibrarySuite) TestMissingVolume() {
+	suite.applyConfig(newDocBackedBy("nowhere"))
+
+	suite.assertNotReady(`no user, existing or external volume named "nowhere" is configured`)
+
+	// The configured name is still reported, though nothing resolves it to a volume ID.
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.Equal("nowhere", status.TypedSpec().VolumeName)
+		asrt.Empty(status.TypedSpec().VolumeID) //nolint:staticcheck
+	})
+
+	ctest.AssertNoResource[*block.VolumeMountRequest](suite, testRequestID)
+}
+
+// TestReadOnlyExternalBackingVolume covers a library backed by an external volume the user declared
+// read-only: a mount is read-only only while every requester asks for it, so asking for the
+// read-write mount a library needs would remount the volume against what the user declared.
+func (suite *ContentLibrarySuite) TestReadOnlyExternalBackingVolume() {
+	const readOnlyVolumeName = "readonly-images"
+
+	suite.applyConfig(newReadOnlyExternalVolume(readOnlyVolumeName), newDocBackedBy(readOnlyVolumeName))
+
+	suite.assertNotReady(fmt.Sprintf("backing volume %q is configured read-only", readOnlyVolumeName))
+
+	ctest.AssertNoResource[*block.VolumeMountRequest](suite,
+		contentLibraryControllerName+"/"+testLibrary+"/"+constants.ExternalVolumePrefix+readOnlyVolumeName)
+}
+
+// TestReadOnlyExistingBackingVolume covers the same for an existing volume, the other kind which
+// takes a read-only mount policy.
+func (suite *ContentLibrarySuite) TestReadOnlyExistingBackingVolume() {
+	const readOnlyVolumeName = "readonly-found-images"
+
+	suite.applyConfig(newReadOnlyExistingVolume(readOnlyVolumeName), newDocBackedBy(readOnlyVolumeName))
+
+	suite.assertNotReady(fmt.Sprintf("backing volume %q is configured read-only", readOnlyVolumeName))
+
+	ctest.AssertNoResource[*block.VolumeMountRequest](suite,
+		contentLibraryControllerName+"/"+testLibrary+"/"+constants.ExistingVolumePrefix+readOnlyVolumeName)
+}
+
+// TestRequestsMount covers the mount being asked for on the library's behalf.
+func (suite *ContentLibrarySuite) TestRequestsMount() {
+	suite.applyLibrary(newDoc())
+
+	ctest.AssertResource(suite, testRequestID, func(request *block.VolumeMountRequest, asrt *assert.Assertions) {
+		asrt.Equal(testVolumeID, request.TypedSpec().VolumeID)
+		asrt.Equal(contentLibraryControllerName, request.TypedSpec().Requester)
+
+		library, labeled := request.Metadata().Labels().Get("content-library")
+		asrt.True(labeled, "the request must name the library it was made for")
+		asrt.Equal(testLibrary, library)
+
+		// Uploads write into the library, and a library holds image data only.
+		asrt.False(request.TypedSpec().ReadOnly)
+		asrt.True(request.TypedSpec().Secure)
+		asrt.True(request.TypedSpec().NoExec)
+	})
+}
+
+// TestBecomesReady covers the library going ready once its backing volume is mounted: the mount
+// target is the library's path, and the mount is held for as long as the library uses it.
+func (suite *ContentLibrarySuite) TestBecomesReady() {
+	target := suite.T().TempDir()
+
+	suite.applyLibrary(newDoc())
+
+	ctest.AssertResource(suite, testRequestID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+
+	suite.satisfyMount(testRequestID, testVolumeID, target, false)
+
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.True(status.TypedSpec().Phase == hypervisor.ContentLibraryPhaseReady, "error: %q", status.TypedSpec().Error)
+		asrt.Equal(target, status.TypedSpec().Path)
+		asrt.Empty(status.TypedSpec().Error)
+	})
+
+	suite.assertHeld(testRequestID, true)
+}
+
+// TestSweepsStagedUploads covers the leftovers of interrupted uploads being cleared on the way to
+// ready, which is the only moment nothing can be staged.
+func (suite *ContentLibrarySuite) TestSweepsStagedUploads() {
+	target := suite.T().TempDir()
+
+	// Deliberately not staging.Name: the sweep has to match anything staged-looking, not only what
+	// today's uploads name themselves.
+	staged := filepath.Join(target, staging.Prefix+"image"+staging.Suffix)
+	suite.Require().NoError(os.WriteFile(staged, nil, 0o644))
+
+	kept := filepath.Join(target, "image")
+	suite.Require().NoError(os.WriteFile(kept, nil, 0o644))
+
+	suite.applyLibrary(newDoc())
+
+	ctest.AssertResource(suite, testRequestID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+
+	suite.satisfyMount(testRequestID, testVolumeID, target, false)
+
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.True(status.TypedSpec().Phase == hypervisor.ContentLibraryPhaseReady, "error: %q", status.TypedSpec().Error)
+	})
+
+	// The sweep runs just after the status is written, so the leftover goes a moment after ready.
+	suite.Eventually(func() bool {
+		_, err := os.Stat(staged)
+
+		return os.IsNotExist(err)
+	}, 5*time.Second, 10*time.Millisecond, "the staged upload was not swept")
+
+	suite.FileExists(kept)
+}
+
+// TestReadOnlyMount covers another requester having left the volume mounted read-only: every upload
+// would fail, so the library is better reported not ready.
+func (suite *ContentLibrarySuite) TestReadOnlyMount() {
+	suite.applyLibrary(newDoc())
+
+	ctest.AssertResource(suite, testRequestID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+
+	suite.satisfyMount(testRequestID, testVolumeID, suite.T().TempDir(), true)
+
+	suite.assertNotReady("the backing volume is mounted read-only")
+	suite.assertHeld(testRequestID, false)
+}
+
+// TestMountTearingDown covers the backing volume being unmounted under a ready library: the hold has
+// to be given back, or the unmount would never finish.
+func (suite *ContentLibrarySuite) TestMountTearingDown() {
+	suite.applyLibrary(newDoc())
+
+	ctest.AssertResource(suite, testRequestID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+
+	suite.satisfyMount(testRequestID, testVolumeID, suite.T().TempDir(), false)
+
+	suite.assertHeld(testRequestID, true)
+
+	statusMD := block.NewVolumeMountStatus(block.NamespaceName, testRequestID).Metadata()
+
+	// Pinned by a foreign finalizer, so the status stays readable while tearing down.
+	suite.AddFinalizer(statusMD, "test")
+
+	_, err := suite.State().Teardown(suite.Ctx(), statusMD)
+	suite.Require().NoError(err)
+
+	suite.assertNotReady("the backing volume is being unmounted")
+	suite.assertHeld(testRequestID, false)
+
+	suite.RemoveFinalizer(statusMD, "test")
+}
+
+// TestRepointedToAnotherVolume covers a library being backed by a different volume: the old mount is
+// given back and a new one asked for.
+func (suite *ContentLibrarySuite) TestRepointedToAnotherVolume() {
+	const otherVolumeName = "other-images"
+
+	suite.applyLibrary(newDoc())
+
+	ctest.AssertResource(suite, testRequestID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+
+	suite.satisfyMount(testRequestID, testVolumeID, suite.T().TempDir(), false)
+
+	suite.assertHeld(testRequestID, true)
+
+	suite.updateConfig(
+		newUserVolume(testVolumeName),
+		newUserVolume(otherVolumeName),
+		newDocBackedBy(otherVolumeName),
+	)
+
+	otherRequestID := contentLibraryControllerName + "/" + testLibrary + "/" + constants.UserVolumePrefix + otherVolumeName
+
+	ctest.AssertResource(suite, otherRequestID, func(request *block.VolumeMountRequest, asrt *assert.Assertions) {
+		asrt.Equal(constants.UserVolumePrefix+otherVolumeName, request.TypedSpec().VolumeID)
+	})
+
+	ctest.AssertNoResource[*block.VolumeMountRequest](suite, testRequestID)
+	suite.assertHeld(testRequestID, false)
+}
+
+// TestRemovedFromConfig covers a library being removed: its status goes with it, and so does its
+// hold on the backing volume.
+func (suite *ContentLibrarySuite) TestRemovedFromConfig() {
+	suite.applyLibrary(newDoc())
+
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.Equal(testVolumeName, status.TypedSpec().VolumeName)
+		asrt.Equal(testVolumeID, status.TypedSpec().VolumeID, "deprecated field still populated for older clients") //nolint:staticcheck
+	})
+
+	suite.satisfyMount(testRequestID, testVolumeID, suite.T().TempDir(), false)
+
+	suite.assertHeld(testRequestID, true)
+
+	suite.Require().NoError(suite.State().Destroy(suite.Ctx(), config.NewMachineConfig(nil).Metadata()))
+
+	ctest.AssertNoResource[*hypervisor.ContentLibraryStatus](suite, testLibrary)
+	ctest.AssertNoResource[*block.VolumeMountRequest](suite, testRequestID)
+	suite.assertHeld(testRequestID, false)
+}
+
+// landImage puts a file into a library the way an upload does: staged elsewhere, then renamed into
+// place, so the library only ever sees the finished file.
+func (suite *ContentLibrarySuite) landImage(target, name, contents string) {
+	suite.T().Helper()
+
+	staged := filepath.Join(suite.T().TempDir(), name)
+	suite.Require().NoError(os.WriteFile(staged, []byte(contents), 0o600))
+	suite.Require().NoError(os.Rename(staged, filepath.Join(target, name)))
+}
+
+// A library's contents are files, not resources: writing one produces no event of its own, so the
+// status carries a fingerprint of the listing that consumers can watch instead.
+func (suite *ContentLibrarySuite) TestPublishesFingerprint() {
+	target := suite.T().TempDir()
+
+	suite.applyLibrary(newDoc())
+	ctest.AssertResource(suite, testRequestID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+	suite.satisfyMount(testRequestID, testVolumeID, target, false)
+
+	var empty string
+
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.True(status.TypedSpec().Phase == hypervisor.ContentLibraryPhaseReady, "error: %q", status.TypedSpec().Error)
+		asrt.NotEmpty(status.TypedSpec().Fingerprint)
+
+		empty = status.TypedSpec().Fingerprint
+	})
+
+	suite.landImage(target, "talos.iso", "an image")
+
+	var withImage string
+
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.NotEqual(empty, status.TypedSpec().Fingerprint, "an uploaded image must change the fingerprint")
+
+		withImage = status.TypedSpec().Fingerprint
+	})
+
+	// An upload in flight is staged under a reserved prefix, and is not contents yet.
+	suite.Require().NoError(os.WriteFile(filepath.Join(target, staging.Prefix+"partial"), []byte("half"), 0o600))
+
+	ctx, st := suite.Ctx(), suite.State()
+
+	suite.Assert().Never(func() bool {
+		status, err := safe.StateGet[*hypervisor.ContentLibraryStatus](ctx, st,
+			hypervisor.NewContentLibraryStatus(hypervisor.NamespaceName, testLibrary).Metadata())
+
+		return err == nil && status.TypedSpec().Fingerprint != withImage
+	}, time.Second, 100*time.Millisecond)
+
+	suite.Require().NoError(os.Remove(filepath.Join(target, "talos.iso")))
+
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.NotEqual(withImage, status.TypedSpec().Fingerprint, "a deleted image must change the fingerprint")
+	})
+}
+
+// TestWatchesAnotherVolumesContents covers the contents watch following a library repointed at
+// another volume: the directory the new mount brought has to be watched too, or an image landing in
+// it would never move the fingerprint.
+func (suite *ContentLibrarySuite) TestWatchesAnotherVolumesContents() {
+	const otherVolumeName = "other-images"
+
+	suite.applyLibrary(newDoc())
+	ctest.AssertResource(suite, testRequestID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+	suite.satisfyMount(testRequestID, testVolumeID, suite.T().TempDir(), false)
+
+	var empty string
+
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.True(status.TypedSpec().Phase == hypervisor.ContentLibraryPhaseReady, "error: %q", status.TypedSpec().Error)
+
+		empty = status.TypedSpec().Fingerprint
+	})
+
+	suite.updateConfig(
+		newUserVolume(testVolumeName),
+		newUserVolume(otherVolumeName),
+		newDocBackedBy(otherVolumeName),
+	)
+
+	otherVolumeID := constants.UserVolumePrefix + otherVolumeName
+	otherRequestID := contentLibraryControllerName + "/" + testLibrary + "/" + otherVolumeID
+	otherTarget := suite.T().TempDir()
+
+	ctest.AssertResource(suite, otherRequestID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+	suite.satisfyMount(otherRequestID, otherVolumeID, otherTarget, false)
+
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.True(status.TypedSpec().Phase == hypervisor.ContentLibraryPhaseReady, "error: %q", status.TypedSpec().Error)
+		asrt.Equal(otherTarget, status.TypedSpec().Path)
+	})
+
+	suite.landImage(otherTarget, "talos.iso", "an image")
+
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.NotEqual(empty, status.TypedSpec().Fingerprint, "an image uploaded to the new backing volume must change the fingerprint")
+	})
+}
+
+// A virtual machine reads its image straight out of the mount, so removing the library from the
+// configuration must not take the medium away: the status tears down and waits, and the mount waits
+// with it.
+func (suite *ContentLibrarySuite) TestKeepsTheMountOfAHeldLibrary() {
+	suite.applyLibrary(newDoc())
+
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.Equal(testVolumeName, status.TypedSpec().VolumeName)
+		asrt.Equal(testVolumeID, status.TypedSpec().VolumeID, "deprecated field still populated for older clients") //nolint:staticcheck
+	})
+
+	suite.satisfyMount(testRequestID, testVolumeID, suite.T().TempDir(), false)
+	suite.assertHeld(testRequestID, true)
+
+	libraryStatus := hypervisor.NewContentLibraryStatus(hypervisor.NamespaceName, testLibrary)
+	suite.AddFinalizer(libraryStatus.Metadata(), "consumer")
+
+	suite.Require().NoError(suite.State().Destroy(suite.Ctx(), config.NewMachineConfig(nil).Metadata()))
+
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.Equal(resource.PhaseTearingDown, status.Metadata().Phase())
+	})
+
+	ctest.AssertResource(suite, testRequestID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+	suite.assertHeld(testRequestID, true)
+
+	suite.RemoveFinalizer(libraryStatus.Metadata(), "consumer")
+
+	ctest.AssertNoResource[*hypervisor.ContentLibraryStatus](suite, testLibrary)
+	ctest.AssertNoResource[*block.VolumeMountRequest](suite, testRequestID)
+	suite.assertHeld(testRequestID, false)
+}
+
+// A mount this controller must not give back is one a guest is reading from, so which library a
+// request was made for is read off the request's own label rather than parsed back out of its ID.
+func (suite *ContentLibrarySuite) TestKeepsTheMountOfAHeldLibraryItNoLongerWants() {
+	suite.applyLibrary(newDoc())
+
+	ctest.AssertResource(suite, testLibrary, func(*hypervisor.ContentLibraryStatus, *assert.Assertions) {})
+
+	libraryStatus := hypervisor.NewContentLibraryStatus(hypervisor.NamespaceName, testLibrary)
+	suite.AddFinalizer(libraryStatus.Metadata(), "consumer")
+
+	target := suite.T().TempDir()
+	suite.satisfyMount(testRequestID, testVolumeID, target, false)
+	suite.assertHeld(testRequestID, true)
+	suite.awaitReconcile(target, "hold-visible")
+
+	// Requests of a previous generation, as a library pointed at another volume leaves behind.
+	heldID := suite.strayRequest(testLibrary, testVolumeID+"-old")
+	unheldID := suite.strayRequest("other-images", "u-other-images")
+
+	suite.awaitReconcile(target, "reconcile-requests")
+
+	// Nothing wants either request any more. The one whose library is held stays anyway.
+	ctest.AssertNoResource[*block.VolumeMountRequest](suite, unheldID)
+	ctest.AssertResource(suite, heldID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+}
+
+// The mount of a previous generation is freed by the hold coming back, and that happens on a status
+// which is still running: the controller has to be woken by a finalizer going away too, not only by
+// a teardown.
+func (suite *ContentLibrarySuite) TestReleasesTheMountOfAPreviousGenerationOnceTheHoldComesBack() {
+	suite.applyLibrary(newDoc())
+
+	// The status is published after the mount request it is for, so it is the status which has to be
+	// waited for: the hold below is put on a resource, not on a name.
+	ctest.AssertResource(suite, testLibrary, func(*hypervisor.ContentLibraryStatus, *assert.Assertions) {})
+
+	libraryStatus := hypervisor.NewContentLibraryStatus(hypervisor.NamespaceName, testLibrary)
+	suite.AddFinalizer(libraryStatus.Metadata(), "consumer")
+
+	target := suite.T().TempDir()
+	suite.satisfyMount(testRequestID, testVolumeID, target, false)
+	suite.assertHeld(testRequestID, true)
+	suite.awaitReconcile(target, "hold-visible")
+
+	// A request of a previous generation, as a library pointed at another volume leaves behind.
+	heldID := suite.strayRequest(testLibrary, testVolumeID+"-old")
+
+	suite.awaitReconcile(target, "reconcile-requests")
+	ctest.AssertResource(suite, heldID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+
+	// The only thing that changes from here: the hold comes back. The configuration does not move,
+	// and the status it is on stays running.
+	suite.RemoveFinalizer(libraryStatus.Metadata(), "consumer")
+
+	ctest.AssertNoResource[*block.VolumeMountRequest](suite, heldID)
+	ctest.AssertResource(suite, testRequestID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+}
+
+// awaitReconcile wakes the controller by putting a file into the library mounted at target, and
+// waits for the fingerprint which includes it.
+//
+// A pass reads which libraries are held before it lists the mount requests it might release, so a
+// pass already running when a test holds a library (or creates a request) can act on an older view.
+// The library is watched before its fingerprint is taken, so the new fingerprint is published by a
+// pass which started after the file was written, and every pass before it has finished.
+func (suite *ContentLibrarySuite) awaitReconcile(target, name string) {
+	suite.T().Helper()
+
+	suite.Require().NoError(os.WriteFile(filepath.Join(target, name), []byte(name), 0o600))
+
+	fingerprint, err := hypervisorctrl.FingerprintLibrary(target)
+	suite.Require().NoError(err)
+
+	ctest.AssertResource(suite, testLibrary, func(status *hypervisor.ContentLibraryStatus, asrt *assert.Assertions) {
+		asrt.Equal(fingerprint, status.TypedSpec().Fingerprint)
+	})
+}
+
+// strayRequest creates a mount request this controller owns but no configuration asks for.
+func (suite *ContentLibrarySuite) strayRequest(libraryID, volumeID string) string {
+	id := contentLibraryControllerName + "/" + libraryID + "/" + volumeID
+
+	request := block.NewVolumeMountRequest(block.NamespaceName, id)
+	request.Metadata().Labels().Set("content-library", libraryID)
+	request.TypedSpec().VolumeID = volumeID
+	request.TypedSpec().Requester = contentLibraryControllerName
+	suite.Create(request, state.WithCreateOwner(contentLibraryControllerName))
+
+	return id
+}
+
+// Mount-request IDs must preserve library ownership, including volumes whose IDs contain a slash.
+func (suite *ContentLibrarySuite) TestMountRequestIDRoundTrip() {
+	suite.applyLibrary(newDoc())
+	ctest.AssertResource(suite, testLibrary, func(*hypervisor.ContentLibraryStatus, *assert.Assertions) {})
+	dir := suite.T().TempDir()
+	suite.satisfyMount(testRequestID, testVolumeID, dir, false)
+	suite.assertHeld(testRequestID, true)
+
+	library := hypervisor.NewContentLibraryStatus(hypervisor.NamespaceName, testLibrary)
+	suite.AddFinalizer(library.Metadata(), "consumer")
+	suite.awaitReconcile(dir, "hold-visible")
+
+	heldID := suite.strayRequest(testLibrary, "a/b")
+	unheldID := suite.strayRequest("zz-images", "unheld")
+
+	// Malformed or foreign IDs cannot safely be attributed, even when their owner and label match.
+	unattributed := []string{
+		"block.VolumeMountController/" + testLibrary + "/" + testVolumeID,
+		contentLibraryControllerName + "//" + testVolumeID,
+		contentLibraryControllerName + "/" + testLibrary + "/",
+		"",
+	}
+	for _, id := range unattributed {
+		request := block.NewVolumeMountRequest(block.NamespaceName, id)
+		request.Metadata().Labels().Set("content-library", testLibrary)
+		request.TypedSpec().VolumeID = testVolumeID
+		request.TypedSpec().Requester = contentLibraryControllerName
+		suite.Create(request, state.WithCreateOwner(contentLibraryControllerName))
+	}
+
+	suite.awaitReconcile(dir, "reconcile-requests")
+	ctest.AssertNoResource[*block.VolumeMountRequest](suite, unheldID)
+	ctest.AssertResource(suite, heldID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+	suite.RemoveFinalizer(library.Metadata(), "consumer")
+	ctest.AssertNoResource[*block.VolumeMountRequest](suite, heldID)
+	ctest.AssertResource(suite, testRequestID, func(*block.VolumeMountRequest, *assert.Assertions) {})
+
+	for _, id := range unattributed {
+		ctest.AssertResource(suite, id, func(request *block.VolumeMountRequest, a *assert.Assertions) {
+			a.Equal(resource.PhaseRunning, request.Metadata().Phase())
+		})
+	}
+}

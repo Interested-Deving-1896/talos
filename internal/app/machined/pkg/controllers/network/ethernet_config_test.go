@@ -29,6 +29,10 @@ func (suite *EthernetConfigSuite) TestReconcile() {
 	cfg1.ChannelsConfig = &networkcfg.EthernetChannelsConfig{
 		RX: new(uint32(4)),
 	}
+	cfg1.FlowControlConfig = &networkcfg.EthernetFlowControlConfig{
+		RX: new(bool(true)),
+		TX: new(bool(false)),
+	}
 
 	ctr, err := container.New(cfg1)
 	suite.Require().NoError(err)
@@ -38,6 +42,8 @@ func (suite *EthernetConfigSuite) TestReconcile() {
 
 	ctest.AssertResource(suite, "enp0s1", func(spec *network.EthernetSpec, asrt *assert.Assertions) {
 		asrt.Equal(uint32(4), pointer.SafeDeref(spec.TypedSpec().Channels.RX))
+		asrt.True(pointer.SafeDeref(spec.TypedSpec().FlowControl.RX))
+		asrt.False(pointer.SafeDeref(spec.TypedSpec().FlowControl.TX))
 	})
 
 	cfg2 := networkcfg.NewEthernetConfigV1Alpha1("enp0s2")
@@ -57,6 +63,8 @@ func (suite *EthernetConfigSuite) TestReconcile() {
 
 	ctest.AssertResource(suite, "enp0s1", func(spec *network.EthernetSpec, asrt *assert.Assertions) {
 		asrt.Equal(uint32(4), pointer.SafeDeref(spec.TypedSpec().Channels.RX))
+		asrt.True(pointer.SafeDeref(spec.TypedSpec().FlowControl.RX))
+		asrt.False(pointer.SafeDeref(spec.TypedSpec().FlowControl.TX))
 	})
 	ctest.AssertResource(suite, "enp0s2", func(spec *network.EthernetSpec, asrt *assert.Assertions) {
 		asrt.Equal(uint32(16), pointer.SafeDeref(spec.TypedSpec().Rings.RX))
@@ -69,15 +77,34 @@ func (suite *EthernetConfigSuite) TestReconcile() {
 	ctest.AssertNoResource[*network.EthernetSpec](suite, "enp0s2")
 }
 
+func (suite *EthernetConfigSuite) TestReconcileAlias() {
+	status := network.NewLinkStatus(network.NamespaceName, "enp0s3")
+	status.TypedSpec().Alias = "net0"
+	suite.Create(status)
+
+	ethCfg := networkcfg.NewEthernetConfigV1Alpha1("net0")
+	ethCfg.RingsConfig = &networkcfg.EthernetRingsConfig{
+		RX: new(uint32(16)),
+	}
+
+	ctr, err := container.New(ethCfg)
+	suite.Require().NoError(err)
+
+	suite.Create(config.NewMachineConfig(ctr))
+
+	ctest.AssertResource(suite, "enp0s3", func(spec *network.EthernetSpec, asrt *assert.Assertions) {
+		asrt.Equal(uint32(16), pointer.SafeDeref(spec.TypedSpec().Rings.RX))
+	})
+	ctest.AssertNoResource[*network.EthernetSpec](suite, "net0")
+}
+
 func TestEthernetConfigSuite(t *testing.T) {
 	t.Parallel()
 
 	suite.Run(t, &EthernetConfigSuite{
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 10 * time.Second,
-			AfterSetup: func(suite *ctest.DefaultSuite) {
-				suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.EthernetConfigController{}))
-			},
+		Timeout: 10 * time.Second,
+		AfterSetup: func(suite *ctest.DefaultSuite) {
+			suite.Require().NoError(suite.Runtime().RegisterController(&netctrl.EthernetConfigController{}))
 		},
 	})
 }

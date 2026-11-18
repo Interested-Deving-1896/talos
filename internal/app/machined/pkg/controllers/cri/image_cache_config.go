@@ -17,18 +17,14 @@ import (
 	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/dustin/go-humanize"
-	"github.com/google/cel-go/common/ast"
-	"github.com/google/cel-go/common/operators"
-	"github.com/google/cel-go/common/types"
 	"github.com/siderolabs/gen/optional"
 	"go.uber.org/zap"
 
 	blockadapter "github.com/siderolabs/talos/internal/app/machined/pkg/adapters/block"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/system"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/system/services"
+	"github.com/siderolabs/talos/internal/pkg/celmatch"
 	"github.com/siderolabs/talos/internal/pkg/partition"
-	"github.com/siderolabs/talos/pkg/machinery/cel"
-	"github.com/siderolabs/talos/pkg/machinery/cel/celenv"
 	cfg "github.com/siderolabs/talos/pkg/machinery/config"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/resources/block"
@@ -42,6 +38,7 @@ type ServiceManager interface {
 	IsRunning(id string) (system.Service, bool, error)
 	Load(services ...system.Service) []string
 	Start(serviceIDs ...string) error
+	Stop(ctx context.Context, serviceIDs ...string) error
 }
 
 // ImageCacheConfigController manages configures Image Cache.
@@ -111,7 +108,7 @@ func (ctrl *ImageCacheConfigController) Outputs() []controller.Output {
 
 // Volume configuration constants.
 const (
-	VolumeImageCacheISO  = "IMAGECACHE-ISO"
+	VolumeImageCacheISO  = constants.ImageCacheISOLabel
 	VolumeImageCacheDISK = constants.ImageCachePartitionLabel
 
 	MinImageCacheSize = 500 * 1024 * 1024      // 500MB
@@ -198,6 +195,56 @@ func (ctrl *ImageCacheConfigController) Run(ctx context.Context, r controller.Ru
 			}
 		}
 
+		// do some cleanup on disabled status
+		if status == cri.ImageCacheStatusDisabled {
+			if registryDService != nil {
+				_, running, err := ctrl.V1Alpha1ServiceManager.IsRunning(RegistrydServiceID)
+
+				if err == nil && running {
+					if err = ctrl.V1Alpha1ServiceManager.Stop(ctx, RegistrydServiceID); err != nil {
+						return fmt.Errorf("error stopping service: %w", err)
+					}
+				}
+			} else if imageCacheDisabled {
+				// if the service is not running, remove the volume mount requests
+				vmrs, err := safe.ReaderListAll[*block.VolumeMountRequest](ctx, r)
+				if err != nil {
+					return fmt.Errorf("error listing volume mount requests: %w", err)
+				}
+
+				for vmr := range vmrs.All() {
+					if vmr.Metadata().Owner() != ctrl.Name() {
+						continue
+					}
+
+					ready, err := r.Teardown(ctx, vmr.Metadata())
+					if err != nil {
+						return fmt.Errorf("error tearing down volume mount request: %w", err)
+					}
+
+					if ready {
+						if err = r.Destroy(ctx, vmr.Metadata()); err != nil {
+							return fmt.Errorf("error destroying volume mount request: %w", err)
+						}
+					}
+				}
+
+				// also remove our finalizers on VolumeMountStatuses
+				vmss, err := safe.ReaderListAll[*block.VolumeMountStatus](ctx, r)
+				if err != nil {
+					return fmt.Errorf("error listing volume mount status: %w", err)
+				}
+
+				for vms := range vmss.All() {
+					if vms.Metadata().Finalizers().Has(ctrl.Name()) {
+						if err = r.RemoveFinalizer(ctx, vms.Metadata(), ctrl.Name()); err != nil {
+							return fmt.Errorf("error removing finalizer: %w", err)
+						}
+					}
+				}
+			}
+		}
+
 		logger.Debug("image cache status", zap.String("status", status.String()), zap.String("copy_status", copyStatus.String()))
 
 		if err = safe.WriterModify(ctx, r, cri.NewImageCacheConfig(), func(cfg *cri.ImageCacheConfig) error {
@@ -209,54 +256,16 @@ func (ctrl *ImageCacheConfigController) Run(ctx context.Context, r controller.Ru
 		}); err != nil {
 			return fmt.Errorf("error writing ImageCacheConfig: %w", err)
 		}
+
+		r.ResetRestartBackoff()
 	}
 }
 
 func (ctrl *ImageCacheConfigController) createVolumeConfigISO(ctx context.Context, r controller.ReaderWriter) error {
-	builder := cel.NewBuilder(celenv.VolumeLocator())
-
-	// volume.name in ["iso9660", "vfat"] && volume.label.startsWith("TALOS_")
-	expr := builder.NewCall(
-		builder.NextID(),
-		operators.LogicalAnd,
-		builder.NewCall(
-			builder.NextID(),
-			operators.In,
-			builder.NewSelect(
-				builder.NextID(),
-				builder.NewIdent(builder.NextID(), "volume"),
-				"name",
-			),
-			builder.NewList(
-				builder.NextID(),
-				[]ast.Expr{
-					builder.NewLiteral(builder.NextID(), types.String("iso9660")),
-					builder.NewLiteral(builder.NextID(), types.String("vfat")),
-				},
-				nil,
-			),
-		),
-		builder.NewMemberCall(
-			builder.NextID(),
-			"startsWith",
-			builder.NewSelect(
-				builder.NextID(),
-				builder.NewIdent(builder.NextID(), "volume"),
-				"label",
-			),
-			builder.NewLiteral(builder.NextID(), types.String("TALOS_")),
-		),
-	)
-
-	boolExpr, err := builder.ToBooleanExpression(expr)
-	if err != nil {
-		return fmt.Errorf("error creating boolean expression: %w", err)
-	}
-
 	return safe.WriterModify(ctx, r, block.NewVolumeConfig(block.NamespaceName, VolumeImageCacheISO), func(volumeCfg *block.VolumeConfig) error {
 		volumeCfg.TypedSpec().Type = block.VolumeTypeDisk
 		volumeCfg.TypedSpec().Locator = block.LocatorSpec{
-			Match: *boolExpr,
+			Match: celmatch.ImageCacheISO(),
 		}
 		volumeCfg.TypedSpec().Mount = block.MountSpec{
 			TargetPath: constants.ImageCacheISOMountPoint,
@@ -270,44 +279,15 @@ func (ctrl *ImageCacheConfigController) createVolumeConfigISO(ctx context.Contex
 }
 
 func (ctrl *ImageCacheConfigController) createVolumeConfigDisk(ctx context.Context, r controller.ReaderWriter, cfg cfg.Config) error {
-	builder := cel.NewBuilder(celenv.VolumeLocator())
-
-	// volume.partition_label == "IMAGECACHE"
-	expr := builder.NewCall(
-		builder.NextID(),
-		operators.Equals,
-		builder.NewSelect(
-			builder.NextID(),
-			builder.NewIdent(builder.NextID(), "volume"),
-			"partition_label",
-		),
-		builder.NewLiteral(builder.NextID(), types.String(constants.ImageCachePartitionLabel)),
-	)
-
-	locatorExpr, err := builder.ToBooleanExpression(expr)
-	if err != nil {
-		return fmt.Errorf("error creating boolean expression: %w", err)
-	}
-
-	// system_disk
-	builder = cel.NewBuilder(celenv.DiskLocator())
-
-	expr = builder.NewIdent(builder.NextID(), "system_disk")
-
-	diskExpr, err := builder.ToBooleanExpression(expr)
-	if err != nil {
-		return fmt.Errorf("error creating boolean expression: %w", err)
-	}
-
 	return safe.WriterModify(ctx, r, block.NewVolumeConfig(block.NamespaceName, VolumeImageCacheDISK), func(volumeCfg *block.VolumeConfig) error {
 		volumeCfg.TypedSpec().Type = block.VolumeTypePartition
 		volumeCfg.TypedSpec().Locator = block.LocatorSpec{
-			Match: *locatorExpr,
+			Match: celmatch.VolumePartitionLabel(constants.ImageCachePartitionLabel),
 		}
 
 		if extraCfg, ok := cfg.Volumes().ByName(constants.ImageCachePartitionLabel); ok {
 			volumeCfg.TypedSpec().Provisioning.Wave = block.WaveSystemDisk
-			volumeCfg.TypedSpec().Provisioning.DiskSelector.Match = extraCfg.Provisioning().DiskSelector().ValueOr(*diskExpr)
+			volumeCfg.TypedSpec().Provisioning.DiskSelector.Match = extraCfg.Provisioning().DiskSelector().ValueOr(celmatch.SystemDisk())
 			volumeCfg.TypedSpec().Provisioning.PartitionSpec.Grow = extraCfg.Provisioning().Grow().ValueOr(false)
 			volumeCfg.TypedSpec().Provisioning.PartitionSpec.MinSize = extraCfg.Provisioning().MinSize().ValueOr(MinImageCacheSize)
 			volumeCfg.TypedSpec().Provisioning.PartitionSpec.MaxSize = extraCfg.Provisioning().MaxSize().ValueOr(MaxImageCacheSize)
@@ -385,9 +365,9 @@ func (ctrl *ImageCacheConfigController) analyzeImageCacheVolumes(ctx context.Con
 				mountRequest.TypedSpec().Requester = ctrl.Name()
 				mountRequest.TypedSpec().VolumeID = volumeID
 				mountRequest.TypedSpec().ReadOnly = !(volumeStatus.Metadata().ID() == VolumeImageCacheDISK && isoPresent)
-				// Image cache stores OCI image data only; Secure applies
-				// nosuid+nodev+noexec.
+				// Image cache stores OCI image data only.
 				mountRequest.TypedSpec().Secure = true
+				mountRequest.TypedSpec().NoExec = true
 
 				return nil
 			},

@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"slices"
 
+	"github.com/siderolabs/gen/optional"
 	"github.com/siderolabs/gen/value"
 	"github.com/siderolabs/gen/xslices"
 	"github.com/siderolabs/go-pointer"
@@ -68,7 +69,8 @@ type ResolverConfigV1Alpha1 struct {
 	//     propagated to Kubernetes DNS (CoreDNS) for use by pods running on the cluster.
 	//
 	//     This overrides any nameservers obtained via DHCP or platform configuration.
-	//     Default configuration is to use 1.1.1.1 and 8.8.8.8 as nameservers.
+	//     Default configuration is to use 1.1.1.1, 8.8.8.8 (IPv4), and their IPv6
+	//     counterparts 2606:4700:4700::1111, 2001:4860:4860::8888 as nameservers.
 	ResolverNameservers []NameserverConfig `yaml:"nameservers,omitempty"`
 	//   description: |
 	//     Configuration for search domains (in /etc/resolv.conf).
@@ -88,11 +90,11 @@ type NameserverConfig struct {
 	//     The IP address of the nameserver.
 	//   examples:
 	//    - value: >
-	//       Addr{netip.MustParseAddr("10.0.0.1")}
+	//       meta.Addr{netip.MustParseAddr("10.0.0.1")}
 	//   schema:
 	//     type: string
 	//     pattern: ^[0-9a-f.:]+$
-	Address Addr `yaml:"address"`
+	Address meta.Addr `yaml:"address"`
 	//   description: |
 	//     A DNS protocol to use.
 	//
@@ -135,15 +137,36 @@ type SearchDomainsConfig struct {
 	//     For example, if "example.com" is a search domain and a user tries to resolve
 	//     "host", the system will attempt to resolve "host.example.com".
 	//
-	//     This overrides any search domains obtained via DHCP or platform configuration.
+	//     If set, this overrides any search domains obtained via DHCP or platform configuration.
+	//     An empty list (`domains: []`) clears search domains obtained from DHCP or platform,
+	//     while leaving this field unset inherits them.
 	//     The default configuration derives the search domain from the hostname FQDN.
-	SearchDomains []string `yaml:"domains,omitempty"`
+	//   schema:
+	//     type: array
+	//     items:
+	//       type: string
+	SearchDomains SearchDomainList `yaml:"domains,omitempty" talos:"omitonlyifnil" merge:"replace"`
 	//   description: |
 	//     Disable default search domain configuration from hostname FQDN.
 	//
 	//     When set to true, the system will not derive search domains from the hostname FQDN.
 	//     This allows for a custom configuration of search domains without any defaults.
 	SearchDisableDefault *bool `yaml:"disableDefault,omitempty"`
+}
+
+// SearchDomainList is a list of DNS search domains.
+//
+// A nil list means that search domains are not configured (and are inherited from
+// other configuration layers), while an explicitly empty list clears search domains
+// obtained from DHCP or platform.
+type SearchDomainList []string
+
+// IsZero implements yaml.IsZeroer.
+//
+// Only a nil list is considered zero, so that an explicitly empty list survives
+// encoding with the `omitempty` tag instead of being dropped.
+func (l SearchDomainList) IsZero() bool {
+	return l == nil
 }
 
 // HostDNSConfig represents host DNS configuration.
@@ -166,6 +189,20 @@ type HostDNSConfig struct {
 	//     When enabled, cluster member hostnames and node names are resolved using the host DNS resolver.
 	//     This requires service discovery to be enabled.
 	HostDNSResolveMemberNames *bool `yaml:"resolveMemberNames,omitempty"`
+	//   description: |
+	//     Log level for the host DNS resolver.
+	//
+	//     The default log level is `debug`, which logs every DNS request and response.
+	//     Raise the log level to reduce the verbosity of the host DNS resolver logs.
+	//   values:
+	//     - "debug"
+	//     - "info"
+	//     - "warn"
+	//     - "error"
+	//   examples:
+	//     - value: >
+	//        "warn"
+	HostDNSLogLevel string `yaml:"logLevel,omitempty"`
 }
 
 // NewResolverConfigV1Alpha1 creates a new ResolverConfig config document.
@@ -182,14 +219,14 @@ func exampleResolverConfigV1Alpha1() *ResolverConfigV1Alpha1 {
 	cfg := NewResolverConfigV1Alpha1()
 	cfg.ResolverNameservers = []NameserverConfig{
 		{
-			Address: Addr{netip.MustParseAddr("1.1.1.1")},
+			Address: meta.Addr{Addr: netip.MustParseAddr("1.1.1.1")},
 		},
 		{
-			Address: Addr{netip.MustParseAddr("ff08::1")},
+			Address: meta.Addr{Addr: netip.MustParseAddr("ff08::1")},
 		},
 	}
 	cfg.ResolverSearchDomains = SearchDomainsConfig{
-		SearchDomains: []string{"example.com"},
+		SearchDomains: SearchDomainList{"example.com"},
 	}
 
 	return cfg
@@ -219,12 +256,12 @@ func exampleResolverConfigV1Alpha4() *ResolverConfigV1Alpha1 {
 	cfg := NewResolverConfigV1Alpha1()
 	cfg.ResolverNameservers = []NameserverConfig{
 		{
-			Address:       Addr{netip.MustParseAddr("9.9.9.9")},
+			Address:       meta.Addr{Addr: netip.MustParseAddr("9.9.9.9")},
 			Protocol:      nethelpers.DNSProtocolDNSOverTLS,
 			TLSServerName: "dns.quad9.net",
 		},
 		{
-			Address:       Addr{netip.MustParseAddr("2620:fe::fe")},
+			Address:       meta.Addr{Addr: netip.MustParseAddr("2620:fe::fe")},
 			Protocol:      nethelpers.DNSProtocolDNSOverTLS,
 			TLSServerName: "dns.quad9.net",
 		},
@@ -237,12 +274,12 @@ func exampleResolverConfigV1Alpha5() *ResolverConfigV1Alpha1 {
 	cfg := NewResolverConfigV1Alpha1()
 	cfg.ResolverNameservers = []NameserverConfig{
 		{
-			Address:       Addr{netip.MustParseAddr("1.1.1.1")},
+			Address:       meta.Addr{Addr: netip.MustParseAddr("1.1.1.1")},
 			Protocol:      nethelpers.DNSProtocolDNSOverHTTP,
 			TLSServerName: "cloudflare-dns.com",
 		},
 		{
-			Address:       Addr{netip.MustParseAddr("2606:4700:4700::1111")},
+			Address:       meta.Addr{Addr: netip.MustParseAddr("2606:4700:4700::1111")},
 			Protocol:      nethelpers.DNSProtocolDNSOverHTTP,
 			TLSServerName: "cloudflare-dns.com",
 		},
@@ -258,7 +295,7 @@ func (s *ResolverConfigV1Alpha1) Clone() config.Document {
 
 // V1Alpha1ConflictValidate implements container.V1Alpha1ConflictValidator interface.
 func (s *ResolverConfigV1Alpha1) V1Alpha1ConflictValidate(v1alpha1Cfg *v1alpha1.Config) error {
-	if v1alpha1Cfg.SearchDomains() != nil {
+	if v1alpha1Cfg.SearchDomains().IsPresent() {
 		return errors.New(".machine.network.searchDomains is already set in v1alpha1 config")
 	}
 
@@ -281,7 +318,7 @@ func (s *ResolverConfigV1Alpha1) V1Alpha1ConflictValidate(v1alpha1Cfg *v1alpha1.
 
 // Validate implements config.Validator interface.
 //
-//nolint:gocyclo
+//nolint:gocyclo,cyclop
 func (s *ResolverConfigV1Alpha1) Validate(validation.RuntimeMode, ...validation.Option) ([]string, error) {
 	var (
 		warnings []string
@@ -297,6 +334,16 @@ func (s *ResolverConfigV1Alpha1) Validate(validation.RuntimeMode, ...validation.
 			if s.ResolveMemberNames() {
 				errs = errors.Join(errs, errors.New("hostDNS.resolveMemberNames cannot be enabled when hostDNS.enabled is false"))
 			}
+
+			if s.LogLevel() != "" {
+				errs = errors.Join(errs, errors.New("hostDNS.logLevel cannot be set when hostDNS.enabled is false"))
+			}
+		}
+
+		switch s.LogLevel() {
+		case "", "debug", "info", "warn", "error":
+		default:
+			errs = errors.Join(errs, fmt.Errorf("hostDNS.logLevel %q is invalid, must be one of: debug, info, warn, error", s.LogLevel()))
 		}
 	}
 
@@ -331,6 +378,13 @@ func (s *ResolverConfigV1Alpha1) Validate(validation.RuntimeMode, ...validation.
 		}
 	}
 
+	// this is a warning (and not an error) to keep accepting machine configuration which was valid before
+	for _, domain := range s.ResolverSearchDomains.SearchDomains {
+		if err := nethelpers.ValidateDNSNameChars(domain); err != nil {
+			warnings = append(warnings, fmt.Sprintf("searchDomains: %s, it will be ignored", err))
+		}
+	}
+
 	if nonRegularDNS > 0 && nonRegularDNS == len(s.ResolverNameservers) {
 		warnings = append(
 			warnings,
@@ -355,8 +409,12 @@ func (s *ResolverConfigV1Alpha1) Resolvers() []config.NetworkResolver {
 }
 
 // SearchDomains implements NetworkResolverConfig interface.
-func (s *ResolverConfigV1Alpha1) SearchDomains() []string {
-	return slices.Clone(s.ResolverSearchDomains.SearchDomains)
+func (s *ResolverConfigV1Alpha1) SearchDomains() optional.Optional[[]string] {
+	if s.ResolverSearchDomains.SearchDomains == nil {
+		return optional.None[[]string]()
+	}
+
+	return optional.Some([]string(slices.Clone(s.ResolverSearchDomains.SearchDomains)))
 }
 
 // DisableSearchDomain implements NetworkResolverConfig interface.
@@ -377,4 +435,9 @@ func (s *ResolverConfigV1Alpha1) ForwardKubeDNSToHost() bool {
 // ResolveMemberNames implements NetworkHostDNSConfig interface.
 func (s *ResolverConfigV1Alpha1) ResolveMemberNames() bool {
 	return pointer.SafeDeref(s.ResolverHostDNS.HostDNSResolveMemberNames)
+}
+
+// LogLevel implements NetworkHostDNSConfig interface.
+func (s *ResolverConfigV1Alpha1) LogLevel() string {
+	return s.ResolverHostDNS.HostDNSLogLevel
 }

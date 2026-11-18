@@ -12,6 +12,7 @@ import (
 	"github.com/opencontainers/runtime-spec/specs-go"
 
 	"github.com/siderolabs/talos/pkg/machinery/proto"
+	"github.com/siderolabs/talos/pkg/machinery/redactable"
 )
 
 // KubeletConfigType is type of KubeletConfig resource.
@@ -27,20 +28,24 @@ type KubeletConfig = typed.Resource[KubeletConfigSpec, KubeletConfigExtension]
 //
 //gotagsrewrite:gen
 type KubeletConfigSpec struct {
-	Image                         string               `yaml:"image" protobuf:"1"`
-	ClusterDNS                    []string             `yaml:"clusterDNS" protobuf:"2"`
-	ClusterDomain                 string               `yaml:"clusterDomain" protobuf:"3"`
-	ExtraArgs                     map[string]ArgValues `yaml:"extraArgs,omitempty" protobuf:"15"`
-	ExtraMounts                   []specs.Mount        `yaml:"extraMounts,omitempty" protobuf:"5"`
-	ExtraConfig                   map[string]any       `yaml:"extraConfig,omitempty" protobuf:"6"`
-	CloudProviderExternal         bool                 `yaml:"cloudProviderExternal" protobuf:"7"`
-	DefaultRuntimeSeccompEnabled  bool                 `yaml:"defaultRuntimeSeccompEnabled" protobuf:"8"`
-	SkipNodeRegistration          bool                 `yaml:"skipNodeRegistration" protobuf:"9"`
-	StaticPodListURL              string               `yaml:"staticPodListURL" protobuf:"10"`
-	DisableManifestsDirectory     bool                 `yaml:"disableManifestsDirectory" protobuf:"11"`
-	EnableFSQuotaMonitoring       bool                 `yaml:"enableFSQuotaMonitoring" protobuf:"12"`
-	CredentialProviderConfig      map[string]any       `yaml:"credentialProviderConfig,omitempty" protobuf:"13"`
-	AllowSchedulingOnControlPlane bool                 `yaml:"allowSchedulingOnControlPlane" protobuf:"14"`
+	Image                        string               `yaml:"image" protobuf:"1"`
+	ClusterDNS                   []string             `yaml:"clusterDNS" protobuf:"2"`
+	ClusterDomain                string               `yaml:"clusterDomain" protobuf:"3"`
+	ExtraArgs                    map[string]ArgValues `yaml:"extraArgs,omitempty" protobuf:"15"`
+	ExtraMounts                  []specs.Mount        `yaml:"extraMounts,omitempty" protobuf:"5"`
+	ExtraConfig                  map[string]any       `yaml:"extraConfig,omitempty" protobuf:"6"`
+	CloudProviderExternal        bool                 `yaml:"cloudProviderExternal" protobuf:"7"`
+	DefaultRuntimeSeccompEnabled bool                 `yaml:"defaultRuntimeSeccompEnabled" protobuf:"8"`
+	SkipNodeRegistration         bool                 `yaml:"skipNodeRegistration" protobuf:"9"`
+	StaticPodListURL             string               `yaml:"staticPodListURL" protobuf:"10"`
+	DisableManifestsDirectory    bool                 `yaml:"disableManifestsDirectory" protobuf:"11"`
+	EnableFSQuotaMonitoring      bool                 `yaml:"enableFSQuotaMonitoring" protobuf:"12"`
+	CredentialProviderConfig     map[string]any       `yaml:"credentialProviderConfig,omitempty" protobuf:"13"`
+	RegisterWithTaints           map[string]string    `yaml:"registerWithTaints,omitempty" protobuf:"16"`
+	// KubepodsMemoryLimit is the desired kubepods memory.max in bytes; zero means unset.
+	KubepodsMemoryLimit uint64 `yaml:"kubepodsMemoryLimit,omitempty" protobuf:"17"`
+	// CredentialProviderFiles maps file names to the contents of the credential provider plugin configuration files.
+	CredentialProviderFiles map[string]string `yaml:"credentialProviderFiles,omitempty" protobuf:"18"`
 }
 
 // NewKubeletConfig initializes an empty KubeletConfig resource.
@@ -60,6 +65,7 @@ func (KubeletConfigExtension) ResourceDefinition() meta.ResourceDefinitionSpec {
 		Type:             KubeletConfigType,
 		Aliases:          []resource.Type{},
 		DefaultNamespace: NamespaceName,
+		Sensitivity:      meta.Sensitive,
 	}
 }
 
@@ -70,4 +76,7 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+
+	// the spec is sensitive, but it is safe to be read in the redacted form
+	redactable.Register[KubeletConfigSpec, KubeletConfigExtension]()
 }

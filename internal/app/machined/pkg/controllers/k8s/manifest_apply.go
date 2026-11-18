@@ -19,7 +19,7 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/siderolabs/gen/optional"
 	"github.com/siderolabs/gen/xslices"
-	"github.com/siderolabs/go-kubernetes/kubernetes/ssa"
+	"github.com/siderolabs/go-kubernetes/kubernetes/ssa/inventory"
 	"github.com/siderolabs/go-kubernetes/kubernetes/ssa/object"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -198,7 +198,7 @@ func (ctrl *ManifestApplyController) applyManifests(
 	}
 
 	if err = etcd.WithLock(ctx, constants.EtcdTalosManifestApplyMutex, logger, func() error {
-		inv, err := ssa.GetInventory(ctx, k8sClient, constants.KubernetesInventoryNamespace, constants.KubernetesBootstrapManifestsInventoryName)
+		inv, err := inventory.Get(ctx, k8sClient, constants.KubernetesInventoryNamespace, constants.KubernetesBootstrapManifestsInventoryName)
 		if err != nil {
 			return fmt.Errorf("error getting inventory: %w", err)
 		}
@@ -278,16 +278,6 @@ func (ctrl *ManifestApplyController) apply(
 		gvk := obj.GroupVersionKind()
 		objName := fmt.Sprintf("%s/%s/%s/%s", gvk.Group, gvk.Version, gvk.Kind, obj.GetName())
 
-		objMeta, err := object.RuntimeToObjMeta(obj)
-		if err != nil {
-			return nil, fmt.Errorf("failed to retrieve object metadata of %q: %w", objName, err)
-		}
-
-		// check if the resource is already in the inventory, if so, skip applying it
-		if inv.Contains(objMeta) {
-			continue
-		}
-
 		mapping, err := mapper.RESTMapping(obj.GroupVersionKind().GroupKind(), obj.GroupVersionKind().Version)
 		if err != nil {
 			switch {
@@ -319,6 +309,32 @@ func (ctrl *ManifestApplyController) apply(
 		} else {
 			// for cluster-wide resources
 			dr = dyn.Resource(mapping.Resource)
+
+			objMeta, err := object.RuntimeToObjMeta(obj)
+			if err != nil {
+				return nil, fmt.Errorf("failed to retrieve object metadata of %q: %w", objName, err)
+			}
+
+			// Talos v1.13 inserted the cluster-wide resources to the inventory with a namespace if they had one set, remove them from the inventory
+			if obj.GetNamespace() != "" && inv.Contains(objMeta) {
+				inv = inv.Remove(objMeta)
+
+				// The object was already in the inventory - skip applying it
+				continue
+			}
+
+			// user might have set the namespace by accident
+			obj.SetNamespace("")
+		}
+
+		objMeta, err := object.RuntimeToObjMeta(obj)
+		if err != nil {
+			return nil, fmt.Errorf("failed to retrieve object metadata of %q: %w", objName, err)
+		}
+
+		// check if the resource is already in the inventory, if so, skip applying it
+		if inv.Contains(objMeta) {
+			continue
 		}
 
 		_, err = dr.Get(ctx, obj.GetName(), metav1.GetOptions{})
@@ -340,7 +356,7 @@ func (ctrl *ManifestApplyController) apply(
 			annotations = make(map[string]string)
 		}
 
-		inventoryAnnotation, inventoryAnnotationSet := annotations[ssa.InventoryAnnotationKey]
+		inventoryAnnotation, inventoryAnnotationSet := annotations[inventory.AnnotationKey]
 
 		if inventoryAnnotationSet && inventoryAnnotation != constants.KubernetesBootstrapManifestsInventoryName {
 			multiErr = multierror.Append(multiErr, fmt.Errorf("unexpected foreign inventory annotation on %s ", objName))
@@ -348,7 +364,7 @@ func (ctrl *ManifestApplyController) apply(
 			continue
 		}
 
-		annotations[ssa.InventoryAnnotationKey] = constants.KubernetesBootstrapManifestsInventoryName
+		annotations[inventory.AnnotationKey] = constants.KubernetesBootstrapManifestsInventoryName
 		obj.SetAnnotations(annotations)
 
 		_, err = dr.Apply(ctx, obj.GetName(), obj, metav1.ApplyOptions{

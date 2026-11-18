@@ -89,7 +89,7 @@ func (suite *EthernetSuite) TestEthernetConfig() {
 	nodeCtx := client.WithNode(suite.ctx, node)
 
 	// pick a Ethernet links
-	ethStatuses, err := safe.StateListAll[*network.EthernetStatus](nodeCtx, suite.Client.COSI)
+	ethStatuses, err := safe.StateListAll[*network.EthernetStatus](nodeCtx, suite.Client.State())
 	suite.Require().NoError(err)
 
 	var (
@@ -137,7 +137,7 @@ func (suite *EthernetSuite) TestEthernetConfig() {
 
 		// now EthernetStatus should reflect the new RX rings
 		rtestutils.AssertResource(
-			nodeCtx, suite.T(), suite.Client.COSI, linkName,
+			nodeCtx, suite.T(), suite.Client.State(), linkName,
 			func(ethStatus *network.EthernetStatus, asrt *assert.Assertions) {
 				asrt.Equal(newRX, pointer.SafeDeref(ethStatus.TypedSpec().Rings.RX))
 			},
@@ -150,7 +150,7 @@ func (suite *EthernetSuite) TestEthernetConfig() {
 
 		// now EthernetStatus should reflect the new RX rings
 		rtestutils.AssertResource(
-			nodeCtx, suite.T(), suite.Client.COSI, linkName,
+			nodeCtx, suite.T(), suite.Client.State(), linkName,
 			func(ethStatus *network.EthernetStatus, asrt *assert.Assertions) {
 				asrt.Equal(pointer.SafeDeref(prevRingConfig.RX), pointer.SafeDeref(ethStatus.TypedSpec().Rings.RX))
 			},
@@ -176,7 +176,7 @@ func (suite *EthernetSuite) TestEthernetConfig() {
 
 		// now EthernetStatus should reflect the new feature status
 		rtestutils.AssertResource(
-			nodeCtx, suite.T(), suite.Client.COSI, linkName,
+			nodeCtx, suite.T(), suite.Client.State(), linkName,
 			func(ethStatus *network.EthernetStatus, asrt *assert.Assertions) {
 				asrt.Equal(!initialState, getFeatureStatus(suite.T(), ethStatus.TypedSpec().Features, featureName))
 			},
@@ -189,7 +189,7 @@ func (suite *EthernetSuite) TestEthernetConfig() {
 
 		// now EthernetStatus should reflect the old feature status
 		rtestutils.AssertResource(
-			nodeCtx, suite.T(), suite.Client.COSI, linkName,
+			nodeCtx, suite.T(), suite.Client.State(), linkName,
 			func(ethStatus *network.EthernetStatus, asrt *assert.Assertions) {
 				asrt.Equal(initialState, getFeatureStatus(suite.T(), ethStatus.TypedSpec().Features, featureName))
 			},
@@ -202,6 +202,74 @@ func (suite *EthernetSuite) TestEthernetConfig() {
 	suite.Run("Channels", func() {
 		suite.T().Skip("channels are not supported by the current QEMU version")
 	})
+}
+
+// TestFlowControl verifies changing Ethernet flow control settings.
+func (suite *EthernetSuite) TestFlowControl() {
+	// pick up a random node to test the Ethernet on, and use it throughout the test
+	node := suite.RandomDiscoveredNodeInternalIP()
+
+	suite.T().Logf("testing Ethernet flow control on node %s", node)
+
+	// build a Talos API context which is tied to the node
+	nodeCtx := client.WithNode(suite.ctx, node)
+
+	ethStatuses, err := safe.StateListAll[*network.EthernetStatus](nodeCtx, suite.Client.State())
+	suite.Require().NoError(err)
+
+	var (
+		linkName string
+		prevRX   bool
+	)
+
+	// flow control is driver specific (e.g. virtio-net doesn't support it), so pick a link which reports it
+	for ethStatus := range ethStatuses.All() {
+		if ethStatus.TypedSpec().FlowControl != nil && ethStatus.TypedSpec().FlowControl.RX != nil {
+			linkName = ethStatus.Metadata().ID()
+			prevRX = *ethStatus.TypedSpec().FlowControl.RX
+
+			break
+		}
+	}
+
+	if linkName == "" {
+		suite.T().Skip("no link supports flow control")
+	}
+
+	suite.T().Logf("testing flow control RX on link %s: %v -> %v", linkName, prevRX, !prevRX)
+
+	cfgDocument := networkconfig.NewEthernetConfigV1Alpha1(linkName)
+	cfgDocument.FlowControlConfig = &networkconfig.EthernetFlowControlConfig{
+		RX: new(!prevRX),
+	}
+	suite.PatchMachineConfig(nodeCtx, cfgDocument)
+
+	// now EthernetStatus should reflect the new flow control settings
+	rtestutils.AssertResource(
+		nodeCtx, suite.T(), suite.Client.State(), linkName,
+		func(ethStatus *network.EthernetStatus, asrt *assert.Assertions) {
+			if asrt.NotNil(ethStatus.TypedSpec().FlowControl) {
+				asrt.Equal(!prevRX, pointer.SafeDeref(ethStatus.TypedSpec().FlowControl.RX))
+			}
+		},
+	)
+
+	// now, let's revert the flow control settings to what they were before
+	cfgDocument.FlowControlConfig.RX = new(prevRX)
+
+	suite.PatchMachineConfig(nodeCtx, cfgDocument)
+
+	rtestutils.AssertResource(
+		nodeCtx, suite.T(), suite.Client.State(), linkName,
+		func(ethStatus *network.EthernetStatus, asrt *assert.Assertions) {
+			if asrt.NotNil(ethStatus.TypedSpec().FlowControl) {
+				asrt.Equal(prevRX, pointer.SafeDeref(ethStatus.TypedSpec().FlowControl.RX))
+			}
+		},
+	)
+
+	// remove the config document
+	suite.RemoveMachineConfigDocuments(nodeCtx, cfgDocument.MetaKind)
 }
 
 // TestBridgeMAC verifies bridge MAC address.
@@ -224,7 +292,7 @@ func (suite *EthernetSuite) TestBridgeMAC() {
 	var dummyMAC string
 
 	// the links should be created
-	rtestutils.AssertResources(nodeCtx, suite.T(), suite.Client.COSI,
+	rtestutils.AssertResources(nodeCtx, suite.T(), suite.Client.State(),
 		[]string{"dummy" + randomSuffix, "bridge" + randomSuffix},
 		func(link *network.LinkStatus, _ *assert.Assertions) {
 			if link.TypedSpec().Kind == "dummy" {
@@ -240,7 +308,7 @@ func (suite *EthernetSuite) TestBridgeMAC() {
 	suite.PatchMachineConfig(nodeCtx, dc, bc)
 
 	// now bridge should have the same MAC address as dummy
-	rtestutils.AssertResources(nodeCtx, suite.T(), suite.Client.COSI,
+	rtestutils.AssertResources(nodeCtx, suite.T(), suite.Client.State(),
 		[]string{"dummy" + randomSuffix, "bridge" + randomSuffix},
 		func(link *network.LinkStatus, asrt *assert.Assertions) {
 			asrt.Equal(dummyMAC, link.TypedSpec().HardwareAddr.String(), "dummy MAC address is not equal to bridge MAC address")
@@ -264,8 +332,8 @@ func (suite *EthernetSuite) TestBridgeMAC() {
 
 	suite.PatchMachineConfig(nodeCtx, patches...)
 
-	rtestutils.AssertNoResource[*network.LinkStatus](nodeCtx, suite.T(), suite.Client.COSI, "dummy"+randomSuffix)
-	rtestutils.AssertNoResource[*network.LinkStatus](nodeCtx, suite.T(), suite.Client.COSI, "bridge"+randomSuffix)
+	rtestutils.AssertNoResource[*network.LinkStatus](nodeCtx, suite.T(), suite.Client.State(), "dummy"+randomSuffix)
+	rtestutils.AssertNoResource[*network.LinkStatus](nodeCtx, suite.T(), suite.Client.State(), "bridge"+randomSuffix)
 }
 
 func init() {

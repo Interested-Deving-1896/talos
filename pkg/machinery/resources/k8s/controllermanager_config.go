@@ -12,6 +12,7 @@ import (
 	"github.com/cosi-project/runtime/pkg/resource/typed"
 
 	"github.com/siderolabs/talos/pkg/machinery/proto"
+	"github.com/siderolabs/talos/pkg/machinery/redactable"
 )
 
 // ControllerManagerConfigType is type of ControllerManagerConfig resource.
@@ -19,6 +20,9 @@ const ControllerManagerConfigType = resource.Type("ControllerManagerConfigs.kube
 
 // ControllerManagerConfigID is a singleton resource ID for ControllerManagerConfig.
 const ControllerManagerConfigID = resource.ID(ControllerManagerID)
+
+// FinalControllerManagerConfigID is a singleton resource ID for the final ControllerManagerConfig.
+const FinalControllerManagerConfigID = resource.ID(FinalPrefix + ControllerManagerID)
 
 // ControllerManagerConfig represents configuration for kube-controller-manager.
 type ControllerManagerConfig = typed.Resource[ControllerManagerConfigSpec, ControllerManagerConfigExtension]
@@ -32,16 +36,19 @@ type ControllerManagerConfigSpec struct {
 	CloudProvider        string               `yaml:"cloudProvider" protobuf:"3"`
 	PodCIDRs             []string             `yaml:"podCIDRs" protobuf:"4"`
 	ServiceCIDRs         []string             `yaml:"serviceCIDRs" protobuf:"5"`
-	ExtraArgs            map[string]ArgValues `yaml:"extraArgs" protobuf:"10"`
+	ExtraArgs            map[string]ArgValues `yaml:"extraArgs,omitempty" protobuf:"10"`
+	Args                 []string             `yaml:"args,omitempty" protobuf:"11"`
 	ExtraVolumes         []ExtraVolume        `yaml:"extraVolumes" protobuf:"7"`
 	EnvironmentVariables map[string]string    `yaml:"environmentVariables" protobuf:"8"`
 	Resources            Resources            `yaml:"resources" protobuf:"9"`
+	NodeCIDRMaskSizeIPv4 int                  `yaml:"nodeCIDRMaskSizeIPv4" protobuf:"12"`
+	NodeCIDRMaskSizeIPv6 int                  `yaml:"nodeCIDRMaskSizeIPv6" protobuf:"13"`
 }
 
 // NewControllerManagerConfig returns new ControllerManagerConfig resource.
-func NewControllerManagerConfig() *ControllerManagerConfig {
+func NewControllerManagerConfig(id resource.ID) *ControllerManagerConfig {
 	return typed.NewResource[ControllerManagerConfigSpec, ControllerManagerConfigExtension](
-		resource.NewMetadata(ControlPlaneNamespaceName, ControllerManagerConfigType, ControllerManagerConfigID, resource.VersionUndefined),
+		resource.NewMetadata(ControlPlaneNamespaceName, ControllerManagerConfigType, id, resource.VersionUndefined),
 		ControllerManagerConfigSpec{},
 	)
 }
@@ -54,6 +61,8 @@ func (ControllerManagerConfigExtension) ResourceDefinition() meta.ResourceDefini
 	return meta.ResourceDefinitionSpec{
 		Type:             ControllerManagerConfigType,
 		DefaultNamespace: ControlPlaneNamespaceName,
+		// the extra arguments and the environment variables come from the machine configuration
+		Sensitivity: meta.Sensitive,
 	}
 }
 
@@ -64,4 +73,7 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+
+	// the spec is sensitive, but it is safe to be read in the redacted form
+	redactable.Register[ControllerManagerConfigSpec, ControllerManagerConfigExtension]()
 }

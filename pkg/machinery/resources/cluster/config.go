@@ -11,6 +11,7 @@ import (
 	"github.com/cosi-project/runtime/pkg/resource/typed"
 
 	"github.com/siderolabs/talos/pkg/machinery/proto"
+	"github.com/siderolabs/talos/pkg/machinery/redactable"
 	"github.com/siderolabs/talos/pkg/machinery/resources/config"
 )
 
@@ -20,20 +21,38 @@ const ConfigType = resource.Type("DiscoveryConfigs.cluster.talos.dev")
 // ConfigID the singleton config resource ID.
 const ConfigID = resource.ID("cluster")
 
-// Config resource holds KubeSpan configuration.
+// Config resource holds Discovery configuration.
 type Config = typed.Resource[ConfigSpec, ConfigExtension]
 
-// ConfigSpec describes KubeSpan configuration.
+// ConfigSpec describes Discovery configuration.
 //
 //gotagsrewrite:gen
+//redactgen:gen
 type ConfigSpec struct {
-	DiscoveryEnabled          bool   `yaml:"discoveryEnabled" protobuf:"1"`
-	RegistryKubernetesEnabled bool   `yaml:"registryKubernetesEnabled" protobuf:"2"`
-	RegistryServiceEnabled    bool   `yaml:"registryServiceEnabled" protobuf:"3"`
-	ServiceEndpoint           string `yaml:"serviceEndpoint" protobuf:"4"`
-	ServiceEndpointInsecure   bool   `yaml:"serviceEndpointInsecure,omitempty" protobuf:"5"`
-	ServiceEncryptionKey      []byte `yaml:"serviceEncryptionKey" protobuf:"6"`
-	ServiceClusterID          string `yaml:"serviceClusterID" protobuf:"7"`
+	// Deprecated: use ServiceEndpoints instead (configured via DiscoveryServiceConfig documents)
+	DiscoveryEnabled bool `yaml:"discoveryEnabled" protobuf:"1"`
+
+	RegistryKubernetesEnabled bool `yaml:"registryKubernetesEnabled" protobuf:"2"`
+
+	// Deprecated: enabled via DiscoveryServiceConfig documents instead.
+	RegistryServiceEnabled bool `yaml:"registryServiceEnabled" protobuf:"3"`
+	// Deprecated: use ServiceEndpoints instead
+	ServiceEndpoint string `yaml:"serviceEndpoint" protobuf:"4"`
+	// Deprecated: use ServiceEndpoints instead
+	ServiceEndpointInsecure bool `yaml:"serviceEndpointInsecure,omitempty" protobuf:"5"`
+
+	ServiceEncryptionKey []byte            `yaml:"serviceEncryptionKey" protobuf:"6" redact:"zero"`
+	ServiceClusterID     string            `yaml:"serviceClusterID" protobuf:"7"`
+	ServiceEndpoints     []ServiceEndpoint `yaml:"serviceEndpoints" protobuf:"8"`
+}
+
+// ServiceEndpoint describes a service endpoint for discovery.
+//
+//gotagsrewrite:gen
+type ServiceEndpoint struct {
+	Name     string `yaml:"name" protobuf:"1"`
+	Endpoint string `yaml:"endpoint" protobuf:"2"`
+	Insecure bool   `yaml:"insecure" protobuf:"3"`
 }
 
 // NewConfig initializes a Config resource.
@@ -65,4 +84,7 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+
+	// the spec is sensitive, but it is safe to be read in the redacted form
+	redactable.Register[ConfigSpec, ConfigExtension]()
 }

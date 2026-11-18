@@ -16,8 +16,10 @@ import (
 	"github.com/siderolabs/talos/internal/pkg/efivarfs"
 )
 
-// nolint:gocyclo
+//nolint:gocyclo
 func TestMarshalExamples(t *testing.T) {
+	t.Parallel()
+
 	cases := []struct {
 		name        string
 		path        efivarfs.DevicePath
@@ -77,6 +79,8 @@ func TestMarshalExamples(t *testing.T) {
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+
 			got, err := c.path.Marshal()
 			if err != nil && !c.expectError {
 				t.Fatalf("unexpected error: %v", err)

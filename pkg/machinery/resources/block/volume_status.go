@@ -5,6 +5,8 @@
 package block
 
 import (
+	"time"
+
 	"github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/resource/meta"
 	"github.com/cosi-project/runtime/pkg/resource/protobuf"
@@ -44,6 +46,11 @@ type VolumeStatusSpec struct {
 	Size           uint64 `yaml:"size,omitempty" protobuf:"9"`
 	PrettySize     string `yaml:"prettySize,omitempty" protobuf:"13"`
 
+	// Grow indicates whether the volume filesystem should be grown to fill the volume.
+	//
+	// The filesystem is grown on mount, and whenever the volume size changes while mounted.
+	Grow bool `yaml:"grow,omitempty" protobuf:"29"`
+
 	// Filesystem is the filesystem type.
 	Filesystem FilesystemType `yaml:"filesystem,omitempty" protobuf:"10"`
 
@@ -59,6 +66,20 @@ type VolumeStatusSpec struct {
 	EncryptionSlot *int `yaml:"encryptionSlot,omitempty" protobuf:"21"`
 	// TPMEncryptionOptions is the options for TPM-based encryption.
 	TPMEncryptionOptions TPMEncryptionOptionsInfo `yaml:"tpmEncryptionOptions,omitempty" protobuf:"22"`
+	// EncryptionAllowDiscards indicates whether the encrypted volume passes discards to the underlying device.
+	EncryptionAllowDiscards bool `yaml:"encryptionAllowDiscards,omitempty" protobuf:"23"`
+
+	// TrimEnabled indicates whether the volume should be trimmed (fstrim) on a schedule.
+	TrimEnabled bool `yaml:"trimEnabled,omitempty" protobuf:"24"`
+	// TrimInterval is the resolved interval at which the volume should be trimmed.
+	TrimInterval time.Duration `yaml:"trimInterval,omitempty" protobuf:"25"`
+	// TrimOptions are the resolved options of the trim operation.
+	TrimOptions TrimOptionsSpec `yaml:"trimOptions,omitempty" protobuf:"28"`
+
+	// ScrubEnabled indicates whether the volume filesystem should be scrubbed on a schedule.
+	ScrubEnabled bool `yaml:"scrubEnabled,omitempty" protobuf:"26"`
+	// ScrubInterval is the resolved period at which the volume filesystem should be scrubbed.
+	ScrubInterval time.Duration `yaml:"scrubInterval,omitempty" protobuf:"27"`
 
 	// MountSpec is the mount specification.
 	MountSpec MountSpec `yaml:"mountSpec,omitempty" protobuf:"15"`

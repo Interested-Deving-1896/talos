@@ -22,6 +22,7 @@ import (
 	"github.com/siderolabs/go-cmd/pkg/cmd/proc"
 	"github.com/siderolabs/go-cmd/pkg/cmd/proc/reaper"
 	debug "github.com/siderolabs/go-debug"
+	"github.com/siderolabs/go-kmsg"
 	"github.com/siderolabs/go-procfs/procfs"
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
@@ -31,22 +32,32 @@ import (
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime/emergency"
 	v1alpha1runtime "github.com/siderolabs/talos/internal/app/machined/pkg/runtime/v1alpha1"
+	"github.com/siderolabs/talos/internal/app/machined/pkg/sandboxd"
 	startuptasks "github.com/siderolabs/talos/internal/app/machined/pkg/startup"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/system"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/system/services"
+	"github.com/siderolabs/talos/internal/app/modprobe"
 	"github.com/siderolabs/talos/internal/app/poweroff"
 	"github.com/siderolabs/talos/internal/app/trustd"
+	"github.com/siderolabs/talos/internal/pkg/containermode"
+	"github.com/siderolabs/talos/internal/pkg/ctrltrace"
 	"github.com/siderolabs/talos/internal/pkg/mount/v3"
 	"github.com/siderolabs/talos/pkg/httpdefaults"
 	"github.com/siderolabs/talos/pkg/machinery/api/common"
 	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
+	"github.com/siderolabs/talos/pkg/machinery/version"
 	"github.com/siderolabs/talos/pkg/startup"
 )
 
 func init() {
 	// Patch a default HTTP client with updated transport to handle cases when default client is being used.
-	http.DefaultClient.Transport = httpdefaults.PatchTransport(cleanhttp.DefaultPooledTransport())
+	//
+	// The transport is built lazily, as it loads the trusted CA bundle, and most of the processes started
+	// from this binary (apid, trustd, dashboard, etc.) never use the default HTTP client.
+	http.DefaultClient.Transport = httpdefaults.LazyTransport(func() *http.Transport {
+		return httpdefaults.PatchTransport(cleanhttp.DefaultPooledTransport())
+	})
 }
 
 func recovery(ctx context.Context) {
@@ -164,6 +175,11 @@ func run() error {
 	// Limit GOMAXPROCS.
 	startup.LimitMaxProcs(constants.MachinedMaxProcs)
 
+	// Start the controller runtime tracer (no-op unless enabled via `talos.trace=1`).
+	//
+	// This has to happen before the resource state is created, as the tracer wraps it.
+	defer ctrltrace.Setup(version.Tag).Close() //nolint:errcheck
+
 	// Initialize the controller without a config.
 	c, err := v1alpha1runtime.NewController()
 	if err != nil {
@@ -193,7 +209,7 @@ func run() error {
 	)...)
 }
 
-//nolint:gocyclo
+//nolint:gocyclo,cyclop
 func runEntrypoint(ctx context.Context, c *v1alpha1runtime.Controller) (returnErr error) {
 	errCh := make(chan error)
 
@@ -261,6 +277,12 @@ func runEntrypoint(ctx context.Context, c *v1alpha1runtime.Controller) (returnEr
 		log.Printf("controller runtime finished")
 	})
 
+	controllerWaitGroup.Go(func() {
+		if e := c.Runtime().State().V1Alpha2().RunBackgroundCleanup(ctx); e != nil {
+			errCh <- e
+		}
+	})
+
 	// Load machined service.
 	system.Services(c.Runtime()).Load(
 		&services.Machined{Controller: c},
@@ -322,6 +344,7 @@ func runEntrypoint(ctx context.Context, c *v1alpha1runtime.Controller) (returnEr
 	return <-errCh
 }
 
+//nolint:gocyclo
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -331,12 +354,28 @@ func main() {
 		apid.Main()
 
 		return
+	case "sandboxd":
+		// PID 1 of the sandbox PID+mount namespace: forks the container-plane
+		// services (cri, kubelet, pods) and walls them off from machined.
+		sandboxd.Main()
+
+		return
 	case "trustd":
 		trustd.Main()
 
 		return
 	// Azure uses the hv_utils kernel module to shutdown the node in hyper-v by calling perform_shutdown which will call orderly_poweroff which will call /sbin/poweroff.
-	case "poweroff", "shutdown":
+	// Hyper-V restart requests call orderly_reboot which will call /sbin/reboot.
+	case "poweroff", "shutdown", "reboot":
+		// These are invoked by the kernel usermode helper (and machined is the static
+		// usermode helper), which has no console, so set up kmsg logging to make the
+		// invocation and its result visible in `talosctl dmesg`.
+		if !containermode.InContainer() {
+			kmsg.SetupLogger(nil, filepath.Base(os.Args[0]), nil) //nolint:errcheck // best effort logging to kmsg
+		}
+
+		log.Printf("usermode helper invoked as %q (args %v)", os.Args[0], os.Args[1:])
+
 		poweroff.Main(os.Args)
 
 		return
@@ -344,7 +383,30 @@ func main() {
 		dashboard.Main()
 
 		return
+	case "modprobe":
+		// The kernel invokes `/sbin/modprobe` via the static usermode helper (machined) to load a module
+		// on demand (request_module()), e.g. when a driver loads a helper module while probing a device.
+		//
+		// The invocation itself is not logged, as userspace triggers requests for subsystem aliases
+		// (e.g. a socket of an unsupported family) which are refused silently, like `modprobe -q` does.
+		if !containermode.InContainer() {
+			kmsg.SetupLogger(nil, "modprobe", nil) //nolint:errcheck // best effort logging to kmsg
+		}
+
+		modprobe.Main(os.Args)
+
+		return
+	case "init", "machined":
+		// fall through to the main machined entrypoint
 	default:
+		// unknown name
+		if !containermode.InContainer() {
+			kmsg.SetupLogger(nil, "machined", nil) //nolint:errcheck // best effort logging to kmsg
+		}
+
+		log.Printf("unknown executable name %q (args %v)", os.Args[0], os.Args[1:])
+
+		os.Exit(1) //nolint:gocritic // we don't care about defering context cancellation in this case
 	}
 
 	// Setup panic handler.

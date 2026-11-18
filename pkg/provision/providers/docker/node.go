@@ -26,6 +26,10 @@ import (
 	"github.com/siderolabs/talos/pkg/provision"
 )
 
+// nodeStopTimeoutSeconds is how long to wait for a node container to gracefully shut
+// down (machined shutdown sequence) before Docker forcibly SIGKILLs it.
+const nodeStopTimeoutSeconds = 30
+
 type portMap struct {
 	exposedPorts network.PortSet
 	portBindings network.PortMap
@@ -139,12 +143,10 @@ func (p *provisioner) createNode(ctx context.Context, clusterReq provision.Clust
 	mounts = slices.Concat(mounts, nodeReq.Mounts)
 
 	hostConfig := &container.HostConfig{
-		Privileged:  true,
-		SecurityOpt: []string{"seccomp:unconfined"},
-		Resources: container.Resources{
-			NanoCPUs: nodeReq.NanoCPUs,
-			Memory:   nodeReq.Memory,
-		},
+		Privileged:     true,
+		SecurityOpt:    []string{"seccomp:unconfined"},
+		NanoCPUs:       nodeReq.NanoCPUs,
+		Memory:         nodeReq.Memory,
 		ReadonlyRootfs: true,
 		Mounts:         mounts,
 	}
@@ -267,6 +269,13 @@ func (p *provisioner) destroyNodes(ctx context.Context, clusterName string, opti
 	for _, ctr := range containers {
 		go func(ctr container.Summary) {
 			fmt.Fprintln(options.LogWriter, "destroying node", ctr.Names[0][1:])
+
+			// Give Talos a chance to gracefully shut down: SIGTERM triggers the shutdown
+			// sequence inside machined (stop services, kill children, unmount), which
+			// tears down the nested container runtimes and mounts in order.
+			if _, err := p.client.ContainerStop(ctx, ctr.ID, client.ContainerStopOptions{Timeout: new(nodeStopTimeoutSeconds)}); err != nil {
+				fmt.Fprintf(options.LogWriter, "error stopping node %s (continuing with force remove): %s\n", ctr.Names[0][1:], err)
+			}
 
 			_, err := p.client.ContainerRemove(ctx, ctr.ID, client.ContainerRemoveOptions{RemoveVolumes: true, Force: true})
 

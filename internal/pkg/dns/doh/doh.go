@@ -4,31 +4,29 @@
 
 // Package doh implements a DNS-over-HTTPS (RFC 8484) upstream proxy.
 //
-// The proxy uses [dnshttp] from the codeberg.org/miekg/dns library to build
-// DoH requests and parse responses, and an [http.Client] with a custom dialer
-// that redirects direct upstream connections to a fixed IP so the request URL
-// host is used purely for SNI/certificate verification and the URL path. When
-// an HTTPS proxy is configured, the dialer passes the proxy address through so
-// HTTPS_PROXY/NO_PROXY are honored. Messages cross the boundary between
-// coredns' miekg/dns and codeberg's fork via the DNS wire format.
+// The proxy sends the queries as POST requests with the DNS wire format body,
+// using an [http.Client] with a custom dialer that redirects direct upstream
+// connections to a fixed IP so the request URL host is used purely for
+// SNI/certificate verification and the URL path. When an HTTPS proxy is
+// configured, the dialer passes the proxy address through so HTTPS_PROXY/NO_PROXY
+// are honored.
 package doh
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync/atomic"
 	"time"
 
-	cdns "codeberg.org/miekg/dns"
-	"codeberg.org/miekg/dns/dnshttp"
-	"github.com/coredns/coredns/plugin/pkg/proxy"
-	"github.com/coredns/coredns/request"
 	"github.com/miekg/dns"
 
+	"github.com/siderolabs/talos/internal/pkg/dns/internal/probe"
 	"github.com/siderolabs/talos/pkg/httpdefaults"
 )
 
@@ -42,6 +40,16 @@ const dialTimeout = 4 * time.Second
 // requestTimeout caps an individual DoH HTTP request.
 const requestTimeout = 4 * time.Second
 
+const (
+	// mimeType is the media type of DNS messages over HTTP (RFC 8484, section 6).
+	mimeType = "application/dns-message"
+	// path is the well-known URL path of the DoH endpoint (RFC 8484, section 3).
+	path = "/dns-query"
+)
+
+// nextProtos is the ALPN list of a DoH client (RFC 8484, section 5.2).
+var nextProtos = []string{"h2", "http/1.1"}
+
 // Proxy is a DoH upstream resolver.
 //
 // It satisfies both the [dns.Upstream] interface used by the resolver handler
@@ -50,14 +58,14 @@ type Proxy struct {
 	// addr is the "host:port" the underlying TCP connection dials. host is the
 	// nameserver IP literal (so DoH itself does not require name resolution).
 	addr string
-	// url is "https://<serverName>" — the DoH request base URL. The "/dns-query"
-	// path is appended by [dnshttp.NewRequest].
+	// url is "https://<serverName>/dns-query" — the DoH request URL.
 	url string
 	// serverName is used as TLS SNI and as the URL host (for certificate
 	// validation).
 	serverName string
 
 	httpClient *http.Client
+	probe      probe.Probe
 
 	fails  atomic.Uint32
 	closed atomic.Bool
@@ -73,7 +81,7 @@ func NewProxy(addr, serverName string) *Proxy {
 	p := &Proxy{
 		addr:       addr,
 		serverName: serverName,
-		url:        "https://" + serverName,
+		url:        "https://" + serverName + path,
 	}
 
 	transport := &http.Transport{
@@ -105,7 +113,7 @@ func NewProxy(addr, serverName string) *Proxy {
 	// fields on top while keeping the patched RootCAs.
 	transport.TLSClientConfig.ServerName = serverName
 	transport.TLSClientConfig.MinVersion = tls.VersionTLS13
-	transport.TLSClientConfig.NextProtos = dnshttp.NextProtos
+	transport.TLSClientConfig.NextProtos = nextProtos
 
 	p.httpClient = &http.Client{
 		Timeout:   requestTimeout,
@@ -119,17 +127,33 @@ func NewProxy(addr, serverName string) *Proxy {
 func (p *Proxy) Addr() string { return p.addr }
 
 // Fails returns the number of consecutive failures observed since the last
-// successful query.
+// successful query or health check.
 func (p *Proxy) Fails() uint32 { return p.fails.Load() }
 
-// Healthcheck is a no-op for DoH: HTTP keep-alive plus the request/response
-// cycle itself is sufficient signal, and there is no separate ping primitive
-// for DoH.
-func (p *Proxy) Healthcheck() {}
+// Healthcheck kicks off a round of health checks for this proxy.
+//
+// The health check sends a ". IN NS" query to the upstream every probe interval
+// until it succeeds. If a health check is already in progress, this is a no-op.
+func (p *Proxy) Healthcheck() {
+	p.probe.Do(func() error {
+		ping := new(dns.Msg)
+		ping.SetQuestion(".", dns.TypeNS)
 
-// Start is a no-op for DoH (there is no background health-check loop to
-// schedule).
-func (p *Proxy) Start(time.Duration) {}
+		_, err := p.connect(context.Background(), ping)
+		if err != nil {
+			p.fails.Add(1)
+
+			return err
+		}
+
+		p.fails.Store(0)
+
+		return nil
+	})
+}
+
+// Start sets the interval between health check probes.
+func (p *Proxy) Start(duration time.Duration) { p.probe.Start(duration) }
 
 // Close releases any idle connections held by the underlying transport.
 func (p *Proxy) Close() {
@@ -137,18 +161,20 @@ func (p *Proxy) Close() {
 		return
 	}
 
+	p.probe.Stop()
+
 	if t, ok := p.httpClient.Transport.(*http.Transport); ok {
 		t.CloseIdleConnections()
 	}
 }
 
-// Connect sends the DNS query as a DoH POST request and returns the parsed
+// Exchange sends the DNS query as a DoH POST request and returns the parsed
 // response. It implements the [dns.Upstream] interface.
 //
-// The opts parameter (TCP/UDP preference, etc.) is irrelevant for DoH — DoH
+// The proto parameter (TCP/UDP preference) is irrelevant for DoH — DoH
 // always runs over HTTP/2 — and is therefore ignored.
-func (p *Proxy) Connect(ctx context.Context, state request.Request, _ proxy.Options) (*dns.Msg, error) {
-	resp, err := p.connect(ctx, state)
+func (p *Proxy) Exchange(ctx context.Context, req *dns.Msg, _ string) (*dns.Msg, error) {
+	resp, err := p.connect(ctx, req)
 	if err != nil {
 		p.fails.Add(1)
 	} else {
@@ -158,77 +184,55 @@ func (p *Proxy) Connect(ctx context.Context, state request.Request, _ proxy.Opti
 	return resp, err
 }
 
-func (p *Proxy) connect(ctx context.Context, state request.Request) (*dns.Msg, error) {
-	if state.Req == nil {
+func (p *Proxy) connect(ctx context.Context, req *dns.Msg) (*dns.Msg, error) {
+	if req == nil {
 		return nil, errors.New("doh: nil request")
 	}
 
-	cmsg, err := convertToCodeberg(state.Req)
+	// the ID is set to zero for HTTP cache friendliness (RFC 8484, section 4.1)
+	query := *req
+	query.Id = 0
+
+	wire, err := query.Pack()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("doh: pack request: %w", err)
 	}
 
-	httpReq, err := dnshttp.NewRequest(http.MethodPost, p.url, cmsg)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.url, bytes.NewReader(wire))
 	if err != nil {
 		return nil, fmt.Errorf("doh: build request: %w", err)
 	}
 
-	httpReq = httpReq.WithContext(ctx)
+	httpReq.Header.Set("Content-Type", mimeType)
+	httpReq.Header.Set("Accept", mimeType)
 
 	httpResp, err := p.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("doh: %w", err)
 	}
 
-	if httpResp.StatusCode != http.StatusOK {
-		httpResp.Body.Close() //nolint:errcheck
+	defer httpResp.Body.Close() //nolint:errcheck
 
+	if httpResp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("doh: upstream returned HTTP %d", httpResp.StatusCode)
 	}
 
-	cresp, err := dnshttp.Response(httpResp)
+	body, err := io.ReadAll(io.LimitReader(httpResp.Body, dns.MaxMsgSize+1))
 	if err != nil {
+		return nil, fmt.Errorf("doh: read response: %w", err)
+	}
+
+	if len(body) > dns.MaxMsgSize {
+		return nil, errors.New("doh: response is too large")
+	}
+
+	resp := new(dns.Msg)
+	if err = resp.Unpack(body); err != nil {
 		return nil, fmt.Errorf("doh: parse response: %w", err)
 	}
 
-	resp, err := convertFromCodeberg(cresp)
-	if err != nil {
-		return nil, err
-	}
-
-	// Restore the original ID — dnshttp.NewRequest forces it to zero per RFC 8484.
-	resp.Id = state.Req.Id
+	// restore the original ID
+	resp.Id = req.Id
 
 	return resp, nil
-}
-
-// convertToCodeberg crosses the github.com/miekg/dns ↔ codeberg.org/miekg/dns
-// type boundary by going through the DNS wire format. Both packages are
-// wire-compatible by RFC 1035, so the round-trip preserves the message.
-func convertToCodeberg(msg *dns.Msg) (*cdns.Msg, error) {
-	wire, err := msg.Pack()
-	if err != nil {
-		return nil, fmt.Errorf("doh: pack request: %w", err)
-	}
-
-	out := &cdns.Msg{Data: wire}
-	if err := out.Unpack(); err != nil {
-		return nil, fmt.Errorf("doh: convert request: %w", err)
-	}
-
-	return out, nil
-}
-
-// convertFromCodeberg is the inverse of [convertToCodeberg].
-func convertFromCodeberg(msg *cdns.Msg) (*dns.Msg, error) {
-	if err := msg.Pack(); err != nil {
-		return nil, fmt.Errorf("doh: pack response: %w", err)
-	}
-
-	out := new(dns.Msg)
-	if err := out.Unpack(msg.Data); err != nil {
-		return nil, fmt.Errorf("doh: convert response: %w", err)
-	}
-
-	return out, nil
 }

@@ -29,10 +29,46 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/resources/config"
 	"github.com/siderolabs/talos/pkg/machinery/resources/k8s"
+	runtimeres "github.com/siderolabs/talos/pkg/machinery/resources/runtime"
 )
 
 type KubeletSpecSuite struct {
 	ctest.DefaultSuite
+}
+
+func (suite *KubeletSpecSuite) TestReconcileSELinux() {
+	cfg := k8s.NewKubeletConfig(k8s.NamespaceName, k8s.KubeletID)
+	cfg.TypedSpec().Image = "kubelet:v1.29.0"
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), cfg))
+
+	nodeIP := k8s.NewNodeIP(k8s.NamespaceName, k8s.KubeletID)
+	nodeIP.TypedSpec().Addresses = []netip.Addr{netip.MustParseAddr("172.20.0.2")}
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), nodeIP))
+
+	nodename := k8s.NewNodename(k8s.NamespaceName, k8s.NodenameID)
+	nodename.TypedSpec().Nodename = "example.com"
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), nodename))
+
+	machineType := config.NewMachineType()
+	machineType.SetMachineType(machine.TypeWorker)
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), machineType))
+
+	securityState := runtimeres.NewSecurityStateSpec(runtimeres.NamespaceName)
+	securityState.TypedSpec().SELinuxState = runtimeres.SELinuxStateEnforcing
+	securityState.TypedSpec().SELinuxCategories = true
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), securityState))
+
+	rtestutils.AssertResources(suite.Ctx(), suite.T(), suite.State(), []resource.ID{k8s.KubeletID}, func(kubeletSpec *k8s.KubeletSpec, asrt *assert.Assertions) {
+		asrt.Len(kubeletSpec.TypedSpec().ExtraMounts, 2)
+		asrt.Equal("/sys/fs/selinux", kubeletSpec.TypedSpec().ExtraMounts[0].Destination)
+	})
+
+	securityState.TypedSpec().SELinuxCategories = false
+	suite.Require().NoError(suite.State().Update(suite.Ctx(), securityState))
+
+	rtestutils.AssertResources(suite.Ctx(), suite.T(), suite.State(), []resource.ID{k8s.KubeletID}, func(kubeletSpec *k8s.KubeletSpec, asrt *assert.Assertions) {
+		asrt.Empty(kubeletSpec.TypedSpec().ExtraMounts)
+	})
 }
 
 func (suite *KubeletSpecSuite) TestReconcileDefault() {
@@ -270,11 +306,9 @@ func TestKubeletSpecSuite(t *testing.T) {
 	t.Parallel()
 
 	suite.Run(t, &KubeletSpecSuite{
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 3 * time.Second,
-			AfterSetup: func(suite *ctest.DefaultSuite) {
-				suite.Require().NoError(suite.Runtime().RegisterController(&k8sctrl.KubeletSpecController{}))
-			},
+		Timeout: 3 * time.Second,
+		AfterSetup: func(suite *ctest.DefaultSuite) {
+			suite.Require().NoError(suite.Runtime().RegisterController(&k8sctrl.KubeletSpecController{}))
 		},
 	})
 }
@@ -342,11 +376,9 @@ func TestNewKubeletConfigurationMerge(t *testing.T) {
 	t.Parallel()
 
 	defaultKubeletConfig := kubeletconfig.KubeletConfiguration{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: kubeletconfig.SchemeGroupVersion.String(),
-			Kind:       "KubeletConfiguration",
-		},
-		Port: constants.KubeletPort,
+		APIVersion: kubeletconfig.SchemeGroupVersion.String(),
+		Kind:       "KubeletConfiguration",
+		Port:       constants.KubeletPort,
 		Authentication: kubeletconfig.KubeletAuthentication{
 			X509: kubeletconfig.KubeletX509Authentication{
 				ClientCAFile: constants.KubernetesCACert,
@@ -361,17 +393,19 @@ func TestNewKubeletConfigurationMerge(t *testing.T) {
 		Authorization: kubeletconfig.KubeletAuthorization{
 			Mode: kubeletconfig.KubeletAuthorizationModeWebhook,
 		},
-		CgroupRoot:            "/",
-		SystemCgroups:         constants.CgroupSystem,
-		KubeletCgroups:        constants.CgroupKubelet,
-		RotateCertificates:    true,
-		ProtectKernelDefaults: true,
-		Address:               "0.0.0.0",
-		OOMScoreAdj:           new(int32(constants.KubeletOOMScoreAdj)),
-		ClusterDomain:         "cluster.local",
-		ClusterDNS:            []string{"10.0.0.5"},
-		SerializeImagePulls:   new(false),
-		FailSwapOn:            new(false),
+		CgroupRoot:                  "/",
+		SystemCgroups:               "/" + constants.CgroupSystem,
+		KubeletCgroups:              "/" + constants.CgroupKubelet,
+		RotateCertificates:          true,
+		ProtectKernelDefaults:       true,
+		Address:                     "0.0.0.0",
+		OOMScoreAdj:                 new(int32(constants.KubeletOOMScoreAdj)),
+		ClusterDomain:               "cluster.local",
+		ClusterDNS:                  []string{"10.0.0.5"},
+		SerializeImagePulls:         new(false),
+		FailSwapOn:                  new(false),
+		ImageGCHighThresholdPercent: new(int32(constants.KubeletImageGCHighThresholdPercent)),
+		ImageGCLowThresholdPercent:  new(int32(constants.KubeletImageGCLowThresholdPercent)),
 		SystemReserved: map[string]string{
 			"cpu":               constants.KubeletSystemReservedCPU,
 			"memory":            constants.KubeletSystemReservedMemoryWorker,
@@ -419,6 +453,9 @@ func TestNewKubeletConfigurationMerge(t *testing.T) {
 			cfgSpec: &k8s.KubeletConfigSpec{
 				ClusterDNS:    []string{"10.0.0.5"},
 				ClusterDomain: "cluster.local",
+				RegisterWithTaints: map[string]string{
+					constants.LabelNodeRoleControlPlane: string(corev1.TaintEffectNoSchedule),
+				},
 			},
 			kubeletVersion: compatibility.VersionFromImageRef("ghcr.io/siderolabs/kubelet:v1.29.0"),
 			expectedOverrides: func(kc *kubeletconfig.KubeletConfiguration) {
@@ -486,6 +523,22 @@ func TestNewKubeletConfigurationMerge(t *testing.T) {
 			kubeletVersion: compatibility.VersionFromImageRef("ghcr.io/siderolabs/kubelet:v1.29.0"),
 			expectedOverrides: func(kc *kubeletconfig.KubeletConfiguration) {
 				kc.StaticPodPath = ""
+			},
+			machineType: machine.TypeWorker,
+		},
+		{
+			name: "override image GC thresholds",
+			cfgSpec: &k8s.KubeletConfigSpec{
+				ClusterDNS:    []string{"10.0.0.5"},
+				ClusterDomain: "cluster.local",
+				ExtraConfig: map[string]any{
+					"imageGCHighThresholdPercent": 90,
+				},
+			},
+			kubeletVersion: compatibility.VersionFromImageRef("ghcr.io/siderolabs/kubelet:v1.29.0"),
+			expectedOverrides: func(kc *kubeletconfig.KubeletConfiguration) {
+				kc.ImageGCHighThresholdPercent = new(int32(90))
+				kc.ImageGCLowThresholdPercent = nil
 			},
 			machineType: machine.TypeWorker,
 		},

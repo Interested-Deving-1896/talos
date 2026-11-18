@@ -6,10 +6,9 @@
 (type k8s_conf_t)
 (call system_f (k8s_conf_t))
 (filecon "/etc/kubernetes(/.*)?" any (system_u object_r k8s_conf_t (systemLow systemLow)))
-
-(type k8s_plugin_t)
-(call system_f (k8s_plugin_t))
-(filecon "/usr/libexec/kubernetes(/.*)?" any (system_u object_r k8s_plugin_t (systemLow systemLow)))
+; /etc/kubernetes is a tmpfs mounted with context=k8s_conf_t (its superblock is k8s_conf_t
+; too), so k8s_conf_t inodes must be allowed to associate with a k8s_conf_t filesystem.
+(allow k8s_conf_t k8s_conf_t (filesystem (associate)))
 
 (type k8s_credentialproviders_t)
 (call system_f (k8s_credentialproviders_t))
@@ -63,17 +62,23 @@
 ; CNI config, /etc/hosts written by kubelet
 (allow pod_p kubelet_state_t (fs_classes (ro)))
 
-(allow kubelet_t k8s_plugin_t (fs_classes (rw)))
-(allow kubelet_t k8s_plugin_t (file (entrypoint execute execute_no_trans)))
-
 ; kubelet sends sigkill to pod processes
 (allow kubelet_t pod_p (process_classes (signal)))
+; and to the runc init processes left in an orphaned pod cgroup: when the StartContainer call is
+; canceled (e.g. kubelet restart), runc init stays parked on its exec fifo, still pod_containerd_t
+; as it never exec'd the entrypoint, and the kubelet SIGKILLs it before removing the pod cgroup
+(allow kubelet_t pod_containerd_t (process (sigkill)))
 
 ; ; Used when Mayastor/OpenEBS is enabled
 ; (allow kubelet_t hugetlbfs_t (fs_classes (rw)))
 
-; ; /registration/rook-ceph.cephfs.csi.ceph.com-reg.sock and similar when using Rook-Ceph
-; (allow kubelet_t pod_p (unix_stream_socket (connectto)))
+; /registration/rook-ceph.cephfs.csi.ceph.com-reg.sock and similar when using Rook-Ceph
+(allow kubelet_t pod_p (unix_stream_socket (connectto)))
 
 ; local-path-provisioner
 (allow kubelet_t ephemeral_t (fs_classes (rw)))
+
+; the kubelet labels the volumes and plugin directories of every pod, whatever its categories
+(typeattributeset mcs_exempt_p kubelet_t)
+; /usr/share/containers/selinux/contexts
+(allow kubelet_t usr_t (fs_classes (ro)))

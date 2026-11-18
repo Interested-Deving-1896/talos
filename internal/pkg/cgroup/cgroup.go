@@ -15,15 +15,19 @@
 package cgroup
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/containerd/cgroups/v3"
 	"github.com/containerd/cgroups/v3/cgroup1"
 	"github.com/containerd/cgroups/v3/cgroup2"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/siderolabs/go-debug"
+	"go.uber.org/zap"
 
 	"github.com/siderolabs/talos/internal/pkg/containermode"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
@@ -106,7 +110,25 @@ func getCgroupV2Resources(name string) *cgroup2.Resources {
 			},
 		}
 	case constants.CgroupSystemDebug:
-		return &cgroup2.Resources{} // no limits for debug cgroup
+		// no memory limits for the debug cgroup, only a CPU weight against the other system services
+		return &cgroup2.Resources{
+			CPU: &cgroup2.CPU{
+				Weight: new(MillicoresToCPUWeight(MilliCores(constants.CgroupSystemDebugMillicores))),
+			},
+		}
+	case constants.CgroupExtensions:
+		return &cgroup2.Resources{
+			CPU: &cgroup2.CPU{
+				Weight: new(MillicoresToCPUWeight(MilliCores(constants.CgroupExtensionsMillicores))),
+			},
+			Pids: workloadRootPids(),
+		}
+	case constants.CgroupInstaller:
+		return &cgroup2.Resources{
+			CPU: &cgroup2.CPU{
+				Weight: new(MillicoresToCPUWeight(MilliCores(constants.CgroupInstallerMillicores))),
+			},
+		}
 	case constants.CgroupSystemRuntime:
 		return &cgroup2.Resources{
 			Memory: &cgroup2.Memory{
@@ -131,6 +153,10 @@ func getCgroupV2Resources(name string) *cgroup2.Resources {
 		}
 	case constants.CgroupPodRuntimeRoot:
 		return &cgroup2.Resources{
+			Memory: &cgroup2.Memory{
+				Min: new(int64(constants.CgroupPodRuntimeRootReservedMemory)),
+				Low: new(int64(constants.CgroupPodRuntimeRootSoftReservedMemory)),
+			},
 			CPU: &cgroup2.CPU{
 				Weight: new(MillicoresToCPUWeight(MilliCores(constants.CgroupPodRuntimeRootMillicores))),
 			},
@@ -144,6 +170,17 @@ func getCgroupV2Resources(name string) *cgroup2.Resources {
 			},
 			CPU: &cgroup2.CPU{
 				Weight: new(MillicoresToCPUWeight(MilliCores(constants.CgroupPodRuntimeMillicores))),
+			},
+		}
+	case constants.CgroupPodRuntimeShim:
+		return &cgroup2.Resources{
+			Memory: &cgroup2.Memory{
+				Min:  new(int64(constants.CgroupPodRuntimeShimReservedMemory)),
+				Low:  new(int64(constants.CgroupPodRuntimeShimReservedMemory * 2)),
+				Swap: new(int64(0)),
+			},
+			CPU: &cgroup2.CPU{
+				Weight: new(MillicoresToCPUWeight(MilliCores(constants.CgroupPodRuntimeShimMillicores))),
 			},
 		}
 	case constants.CgroupKubelet:
@@ -200,15 +237,59 @@ func getCgroupV2Resources(name string) *cgroup2.Resources {
 				Weight: new(MillicoresToCPUWeight(MilliCores(constants.CgroupTrustdMillicores))),
 			},
 		}
+	case constants.CgroupSystemSandbox:
+		return &cgroup2.Resources{
+			Memory: &cgroup2.Memory{
+				Min:  new(int64(constants.CgroupSystemSandboxReservedMemory)),
+				Low:  new(int64(constants.CgroupSystemSandboxReservedMemory * 2)),
+				Swap: new(int64(0)),
+			},
+			CPU: &cgroup2.CPU{
+				Weight: new(MillicoresToCPUWeight(MilliCores(constants.CgroupSystemSandboxMillicores))),
+			},
+		}
+	case constants.CgroupTalosContainersRoot:
+		// No memory reservation at the root: these are user workloads, not a reserved system
+		// component. Per-container limits are applied directly by the container runtime controller.
+		return &cgroup2.Resources{
+			CPU: &cgroup2.CPU{
+				Weight: new(MillicoresToCPUWeight(MilliCores(constants.CgroupTalosContainersMillicores))),
+			},
+			Pids: workloadRootPids(),
+		}
+	case constants.CgroupVirtualMachines:
+		// Same reasoning as taloscontainers: guest workloads, so a weight against the other roots but no
+		// reservation. libvirt creates the per-domain consumer cgroups below this partition itself.
+		return &cgroup2.Resources{
+			CPU: &cgroup2.CPU{
+				Weight: new(MillicoresToCPUWeight(MilliCores(constants.CgroupVirtualMachinesMillicores))),
+			},
+			Pids: workloadRootPids(),
+		}
 	}
 
 	return &cgroup2.Resources{}
 }
 
+// workloadRootPids enables the pids controller on a workload root without setting a limit.
+//
+// The cgroup2 manager only enables the controllers whose resources are set, and nothing else enables
+// pids at boot, so without this the root would have no pids.max for WorkloadPidsController to own.
+// A zero Max writes nothing: pids.max of the new cgroup stays "max" until the controller reconciles it.
+func workloadRootPids() *cgroup2.Pids {
+	return &cgroup2.Pids{}
+}
+
 // CreateCgroup creates a cgroup, with resources limits if configured and supported.
 func CreateCgroup(name string) (CommonCgroup, error) {
 	resources := getCgroupV2Resources(name)
+	scaleMemoryProtection(resources, memoryProtectionScale())
 
+	return CreateCgroupWithResources(name, resources)
+}
+
+// CreateCgroupWithResources creates a cgroup with the given resource limits, if supported.
+func CreateCgroupWithResources(name string, resources *cgroup2.Resources) (CommonCgroup, error) {
 	if containermode.InContainer() {
 		// don't attempt to set resources in container mode, as they might conflict with the parent cgroup tree
 		resources = &cgroup2.Resources{}
@@ -243,4 +324,55 @@ func CreateCgroup(name string) (CommonCgroup, error) {
 	}
 
 	return cg, nil
+}
+
+// KillCgroup kills all processes in the cgroup.
+//
+// This method is only supported for cgroupv2, as cgroupv1 is legacy and only in container mode.
+func KillCgroup(log *zap.Logger, name string) error {
+	if cgroups.Mode() != cgroups.Unified {
+		return nil
+	}
+
+	cg, err := cgroup2.Load(Path(name), cgroup2.WithMountpoint(constants.CgroupMountPath))
+	if err != nil {
+		return fmt.Errorf("failed to load cgroup: %w", err)
+	}
+
+	for i := range 10 {
+		pids, err := cg.Procs(true)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+
+			return fmt.Errorf("failed to get processes in cgroup: %w", err)
+		}
+
+		if len(pids) == 0 {
+			break
+		}
+
+		if i == 0 {
+			log.Info(
+				"killing processes in cgroup",
+				zap.String("cgroup", name),
+				zap.Int("num_processes", len(pids)),
+			)
+
+			if err := cg.Kill(); err != nil {
+				return fmt.Errorf("failed to kill processes in cgroup: %w", err)
+			}
+		} else {
+			log.Info(
+				"waiting for processes in cgroup to exit",
+				zap.String("cgroup", name),
+				zap.Int("num_processes", len(pids)),
+			)
+		}
+
+		<-time.After(time.Second)
+	}
+
+	return cg.Delete()
 }

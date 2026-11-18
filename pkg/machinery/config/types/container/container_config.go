@@ -1,0 +1,565 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+package container
+
+//docgen:jsonschema
+
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/google/go-containerregistry/pkg/name"
+	"github.com/siderolabs/gen/optional"
+
+	"github.com/siderolabs/talos/pkg/machinery/config/config"
+	"github.com/siderolabs/talos/pkg/machinery/config/internal/registry"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
+	"github.com/siderolabs/talos/pkg/machinery/config/validation"
+	"github.com/siderolabs/talos/pkg/machinery/constants"
+)
+
+// ContainerConfigKind is a config document kind.
+const ContainerConfigKind = "ContainerConfig"
+
+// maxNameLength is the maximum length of a container name.
+const maxNameLength = 63
+
+// validNamePattern matches the characters a container name may contain.
+var validNamePattern = regexp.MustCompile(`^[a-z0-9-]+$`)
+
+func init() {
+	registry.Register(ContainerConfigKind, func(version string) config.Document {
+		switch version {
+		case "v1alpha1":
+			return &ContainerConfigV1Alpha1{}
+		default:
+			return nil
+		}
+	})
+}
+
+// Check interfaces.
+var (
+	_ config.ContainerConfig = &ContainerConfigV1Alpha1{}
+	_ config.NamedDocument   = &ContainerConfigV1Alpha1{}
+	_ config.Validator       = &ContainerConfigV1Alpha1{}
+)
+
+// ContainerConfigV1Alpha1 is a container configuration document.
+//
+//	description: |
+//	  ContainerConfig declares a container to be run by Talos directly, without Kubernetes.
+//
+//	  The container is started as soon as the configuration is applied, with no image rebuild
+//	  and no reboot. It runs against the CRI containerd instance in the dedicated
+//	  `taloscontainers` namespace, and by default is restarted 5 seconds after it stops.
+//
+//	  Containers are not Talos services: they do not appear in `talosctl services`, and
+//	  `talosctl service` does not apply to them. Status is reported via `ContainerStatus`.
+//	examples:
+//	  - value: exampleContainerConfigV1Alpha1()
+//	alias: ContainerConfig
+//	schemaRoot: true
+//	schemaMeta: v1alpha1/ContainerConfig
+type ContainerConfigV1Alpha1 struct {
+	meta.Meta `yaml:",inline"`
+
+	//   description: |
+	//     Name of the container.
+	//
+	//     Must be between 1 and 63 characters long, and can only contain lowercase ASCII
+	//     letters, digits and hyphens. It is used as the containerd container ID and as the
+	//     container's log identifier, so it may not collide with a Talos service name.
+	MetaName string `yaml:"name"`
+	//   description: |
+	//     OCI image reference supplying the container's root filesystem.
+	//
+	//     A digest-pinned reference (`repo@sha256:...`) is recommended: it is the only form
+	//     that guarantees the same bytes on every pull. Short references are accepted and
+	//     normalized, so `nginx` becomes `index.docker.io/library/nginx:latest`.
+	//   examples:
+	//     - value: '"docker.io/library/nginx:1.27"'
+	ContainerImage string `yaml:"image"`
+	//   description: |
+	//     Overrides the image's ENTRYPOINT.
+	//
+	//     Unset means the image's own entrypoint is used.
+	ContainerEntrypoint []string `yaml:"entrypoint,omitempty" merge:"replace"`
+	//   description: |
+	//     Overrides the image's CMD.
+	ContainerArgs []string `yaml:"args,omitempty" merge:"replace"`
+	//   description: |
+	//     Overrides the image's WORKDIR.
+	ContainerWorkingDir string `yaml:"workingDir,omitempty"`
+	//   description: |
+	//     Overrides the image's USER uid and/or gid.
+	//
+	//     There are no user namespaces, so a container running as uid 0 is root on the host.
+	RunAsConfig *ContainerRunAs `yaml:"runAs,omitempty"`
+	//   description: |
+	//     Environment variables, in `KEY=value` form, merged over the image's own ENV.
+	//
+	//     Values are stored in the machine configuration verbatim, so treat anything put here
+	//     as being as sensitive as the machine configuration itself.
+	ContainerEnvironment []string `yaml:"environment,omitempty"`
+	//   description: |
+	//     Filesystems to mount into the container.
+	MountsConfig []ContainerMount `yaml:"mounts,omitempty"`
+	//   description: |
+	//     Devices to hand to the container.
+	//   examples:
+	//     - value: exampleContainerDevices()
+	DevicesConfig []ContainerDevice `yaml:"devices,omitempty"`
+	//   description: |
+	//     Security settings for the container.
+	SecurityConfig *ContainerSecurity `yaml:"security,omitempty"`
+	//   description: |
+	//     Network settings for the container.
+	NetworkConfig *ContainerNetwork `yaml:"network,omitempty"`
+	//   description: |
+	//     Resource limits, applied as cgroup v2 settings.
+	ResourcesConfig *ContainerResources `yaml:"resources,omitempty"`
+	// docgen:nodoc
+	//
+	// Deprecated: Use `lifecycle.dependsOn` instead.
+	DependsOnConfig *ContainerDependsOn `yaml:"dependsOn,omitempty"`
+	//   description: |
+	//     Lifecycle settings for the container.
+	LifecycleConfig *ContainerLifecycle `yaml:"lifecycle,omitempty"`
+}
+
+// NewContainerConfigV1Alpha1 creates a new container config document.
+func NewContainerConfigV1Alpha1() *ContainerConfigV1Alpha1 {
+	return &ContainerConfigV1Alpha1{
+		Meta: meta.Meta{
+			MetaKind:       ContainerConfigKind,
+			MetaAPIVersion: "v1alpha1",
+		},
+	}
+}
+
+func exampleContainerConfigV1Alpha1() *ContainerConfigV1Alpha1 {
+	cfg := NewContainerConfigV1Alpha1()
+	cfg.MetaName = "nginx"
+	cfg.ContainerImage = "docker.io/library/nginx:1.27"
+	cfg.ContainerEnvironment = []string{"NGINX_PORT=8080"}
+	cfg.MountsConfig = []ContainerMount{
+		{
+			VolumeMount: &VolumeMount{
+				VolumeName:       "web-content",
+				MountDestination: "/usr/share/nginx/html",
+				MountOpts:        []string{"ro"},
+			},
+		},
+		{
+			TmpfsMount: &TmpfsMount{
+				MountDestination: "/tmp",
+				MountSize:        "64MiB",
+			},
+		},
+	}
+	cfg.ResourcesConfig = &ContainerResources{
+		Limits: &ContainerResourceLimits{
+			CPU:    "1500m",
+			Memory: "512MiB",
+		},
+	}
+	cfg.LifecycleConfig = &ContainerLifecycle{
+		DependsOnConfig: &ContainerDependsOn{
+			PathsConfig:   []string{"/var/mnt/web-content"},
+			NetworkConfig: []string{"addresses"},
+			TimeConfig:    new(true),
+		},
+	}
+
+	return cfg
+}
+
+func exampleContainerHealthCheck() *ContainerHealthCheck {
+	return &ContainerHealthCheck{
+		HTTPCheck: &ContainerHTTPHealthCheck{
+			CheckPort: 8080,
+			CheckPath: "/healthz",
+		},
+		CheckInterval: 10 * time.Second,
+		CheckTimeout:  time.Second,
+	}
+}
+
+func exampleContainerDevices() []ContainerDevice {
+	return []ContainerDevice{
+		{
+			RawVolumeDevice: &RawVolumeDevice{
+				VolumeName:        "data",
+				DeviceDestination: "/dev/data",
+			},
+		},
+	}
+}
+
+// Name implements config.NamedDocument interface.
+func (c *ContainerConfigV1Alpha1) Name() string {
+	return c.MetaName
+}
+
+// Clone implements config.Document interface.
+func (c *ContainerConfigV1Alpha1) Clone() config.Document {
+	return c.DeepCopy()
+}
+
+// ContainerConfigSignal is a signal for container config.
+func (c *ContainerConfigV1Alpha1) ContainerConfigSignal() {}
+
+// Image implements config.ContainerConfig interface.
+//
+// The reference is returned in canonical form. Validation has already rejected anything
+// unparseable, so the error path here is unreachable in practice.
+func (c *ContainerConfigV1Alpha1) Image() string {
+	normalized, err := c.NormalizedImage()
+	if err != nil {
+		return c.ContainerImage
+	}
+
+	return normalized
+}
+
+// Entrypoint implements config.ContainerConfig interface.
+func (c *ContainerConfigV1Alpha1) Entrypoint() []string { return c.ContainerEntrypoint }
+
+// Args implements config.ContainerConfig interface.
+func (c *ContainerConfigV1Alpha1) Args() []string { return c.ContainerArgs }
+
+// WorkingDir implements config.ContainerConfig interface.
+func (c *ContainerConfigV1Alpha1) WorkingDir() string { return c.ContainerWorkingDir }
+
+// RunAs implements config.ContainerConfig interface.
+func (c *ContainerConfigV1Alpha1) RunAs() config.ContainerRunAsConfig {
+	if c.RunAsConfig == nil {
+		return &ContainerRunAs{}
+	}
+
+	return c.RunAsConfig
+}
+
+// Environment implements config.ContainerConfig interface.
+func (c *ContainerConfigV1Alpha1) Environment() []string { return c.ContainerEnvironment }
+
+// NormalizedImage returns the image reference in canonical form.
+//
+// Short references such as `nginx` or `nginx:latest` are expanded to
+// `index.docker.io/library/nginx:latest`.
+//
+// Note: this canonical form uses `index.docker.io`, not the `docker.io` host used by the
+// containerd pull path and image GC elsewhere in Talos (both refer to the same registry). If
+// those paths ever match against this value directly, the host will need reconciling.
+func (c *ContainerConfigV1Alpha1) NormalizedImage() (string, error) {
+	ref, err := name.ParseReference(c.ContainerImage)
+	if err != nil {
+		return "", fmt.Errorf("invalid image reference %q: %w", c.ContainerImage, err)
+	}
+
+	return ref.Name(), nil
+}
+
+// Validate implements config.Validator interface.
+//
+//nolint:gocyclo,cyclop
+func (c *ContainerConfigV1Alpha1) Validate(validation.RuntimeMode, ...validation.Option) ([]string, error) {
+	var (
+		warnings         []string
+		validationErrors error
+	)
+
+	validationErrors = errors.Join(validationErrors, c.ValidateName())
+
+	if c.ContainerImage == "" {
+		validationErrors = errors.Join(validationErrors, errors.New("image is required"))
+	} else {
+		normalized, err := c.NormalizedImage()
+		if err != nil {
+			validationErrors = errors.Join(validationErrors, err)
+		} else if _, digested := mustParse(normalized).(name.Digest); !digested {
+			warnings = append(warnings,
+				fmt.Sprintf("container %q: image %q is not digest-pinned, the running image may change on restart", c.MetaName, c.ContainerImage))
+		}
+	}
+
+	for i, env := range c.ContainerEnvironment {
+		if !strings.Contains(env, "=") {
+			validationErrors = errors.Join(validationErrors, fmt.Errorf("environment[%d]: %q must be in KEY=value form", i, env))
+		}
+	}
+
+	validationErrors = errors.Join(validationErrors, c.ValidateMounts(), c.ValidateDevices())
+
+	if c.SecurityConfig != nil {
+		validationErrors = errors.Join(validationErrors, c.SecurityConfig.Validate())
+	}
+
+	if c.NetworkConfig != nil {
+		validationErrors = errors.Join(validationErrors, c.NetworkConfig.Validate())
+	}
+
+	if c.ResourcesConfig != nil {
+		validationErrors = errors.Join(validationErrors, c.ResourcesConfig.Validate())
+	}
+
+	if c.DependsOnConfig != nil {
+		warnings = append(warnings,
+			fmt.Sprintf("container %q: dependsOn is deprecated, use lifecycle.dependsOn instead", c.MetaName))
+
+		if c.LifecycleConfig != nil && c.LifecycleConfig.DependsOnConfig != nil {
+			validationErrors = errors.Join(validationErrors,
+				errors.New("dependsOn and lifecycle.dependsOn are mutually exclusive, use lifecycle.dependsOn"))
+		}
+	}
+
+	if dependsOn := c.dependsOnConfig(); dependsOn != nil {
+		validationErrors = errors.Join(validationErrors, dependsOn.Validate(c.MetaName))
+	}
+
+	if c.RunAsConfig != nil {
+		validationErrors = errors.Join(validationErrors, c.RunAsConfig.Validate())
+	}
+
+	if c.LifecycleConfig != nil {
+		if c.LifecycleConfig.HealthCheckConfig != nil {
+			validationErrors = errors.Join(validationErrors, c.LifecycleConfig.HealthCheckConfig.Validate())
+		}
+
+		if c.LifecycleConfig.StopTimeoutConfig != nil {
+			if stopTimeout := *c.LifecycleConfig.StopTimeoutConfig; stopTimeout <= 0 || stopTimeout > constants.ContainerMaxStopTimeout {
+				validationErrors = errors.Join(validationErrors,
+					fmt.Errorf("lifecycle.stopTimeout: %s must be greater than 0 and at most %s", stopTimeout, constants.ContainerMaxStopTimeout))
+			}
+		}
+
+		if c.LifecycleConfig.RestartConfig != nil {
+			validationErrors = errors.Join(validationErrors, c.LifecycleConfig.RestartConfig.Validate())
+		}
+	}
+
+	return warnings, validationErrors
+}
+
+func (c *ContainerConfigV1Alpha1) ValidateMounts() error {
+	var (
+		validationErrors error
+		destinations     = map[string]struct{}{}
+	)
+
+	for i, mount := range c.MountsConfig {
+		destination, err := mount.Validate()
+		if err != nil {
+			validationErrors = errors.Join(validationErrors, fmt.Errorf("mounts[%d]: %w", i, err))
+
+			continue
+		}
+
+		if _, exists := destinations[destination]; exists {
+			validationErrors = errors.Join(validationErrors, fmt.Errorf("mounts[%d]: duplicate destination %q", i, destination))
+		}
+
+		destinations[destination] = struct{}{}
+	}
+
+	return validationErrors
+}
+
+// ValidateDevices checks the devices, and that their destinations overlap neither each other nor the
+// mounts: the runtime does not create a device node where a path already exists.
+//
+//nolint:gocyclo
+func (c *ContainerConfigV1Alpha1) ValidateDevices() error {
+	var (
+		validationErrors error
+		destinations     = make([]string, len(c.DevicesConfig))
+		rawVolumes       = map[string]int{}
+	)
+
+	for i, device := range c.DevicesConfig {
+		destination, err := device.Validate()
+		if err != nil {
+			validationErrors = errors.Join(validationErrors, fmt.Errorf("devices[%d]: %w", i, err))
+
+			continue
+		}
+
+		destinations[i] = destination
+
+		for j := range i {
+			if destinations[j] != "" && pathsOverlap(destinations[j], destination) {
+				validationErrors = errors.Join(validationErrors,
+					fmt.Errorf("devices[%d]: destination %q overlaps devices[%d] destination %q", i, destination, j, destinations[j]))
+			}
+		}
+
+		if rawVolume, ok := device.RawVolume().Get(); ok {
+			if j, exists := rawVolumes[rawVolume.Name()]; exists {
+				validationErrors = errors.Join(validationErrors,
+					fmt.Errorf("devices[%d]: raw volume %q is already handed to the container by devices[%d]", i, rawVolume.Name(), j))
+			} else {
+				rawVolumes[rawVolume.Name()] = i
+			}
+		}
+	}
+
+	for j, mount := range c.MountsConfig {
+		mountDestination, err := mount.Validate()
+		if err != nil {
+			// Reported by ValidateMounts.
+			continue
+		}
+
+		mountDestination = filepath.Clean(mountDestination)
+
+		for i, destination := range destinations {
+			if destination != "" && pathsOverlap(mountDestination, destination) {
+				validationErrors = errors.Join(validationErrors,
+					fmt.Errorf("devices[%d]: destination %q overlaps mounts[%d] destination %q", i, destination, j, mountDestination))
+			}
+		}
+	}
+
+	return validationErrors
+}
+
+// Mounts implements config.ContainerConfig interface.
+func (c *ContainerConfigV1Alpha1) Mounts() []config.ContainerMountConfig {
+	out := make([]config.ContainerMountConfig, 0, len(c.MountsConfig))
+
+	for i := range c.MountsConfig {
+		out = append(out, &c.MountsConfig[i])
+	}
+
+	return out
+}
+
+// Devices implements config.ContainerConfig interface.
+func (c *ContainerConfigV1Alpha1) Devices() []config.ContainerDeviceConfig {
+	out := make([]config.ContainerDeviceConfig, 0, len(c.DevicesConfig))
+
+	for i := range c.DevicesConfig {
+		out = append(out, &c.DevicesConfig[i])
+	}
+
+	return out
+}
+
+// Security implements config.ContainerConfig interface.
+func (c *ContainerConfigV1Alpha1) Security() config.ContainerSecurityConfig {
+	if c.SecurityConfig == nil {
+		return &ContainerSecurity{}
+	}
+
+	return c.SecurityConfig
+}
+
+// Network implements config.ContainerConfig interface.
+func (c *ContainerConfigV1Alpha1) Network() config.ContainerNetworkConfig {
+	if c.NetworkConfig == nil {
+		return &ContainerNetwork{}
+	}
+
+	return c.NetworkConfig
+}
+
+// Resources implements config.ContainerConfig interface.
+func (c *ContainerConfigV1Alpha1) Resources() config.ContainerResourcesConfig {
+	if c.ResourcesConfig == nil {
+		return &ContainerResources{}
+	}
+
+	return c.ResourcesConfig
+}
+
+// DependsOn implements config.ContainerConfig interface.
+func (c *ContainerConfigV1Alpha1) DependsOn() config.ContainerDependsOnConfig {
+	if dependsOn := c.dependsOnConfig(); dependsOn != nil {
+		return dependsOn
+	}
+
+	return &ContainerDependsOn{}
+}
+
+// dependsOnConfig returns the dependency settings in effect, or nil if there are none.
+//
+// The deprecated top-level `dependsOn` is used only when `lifecycle.dependsOn` is not set; setting
+// both is rejected by validation.
+func (c *ContainerConfigV1Alpha1) dependsOnConfig() *ContainerDependsOn {
+	if c.LifecycleConfig != nil && c.LifecycleConfig.DependsOnConfig != nil {
+		return c.LifecycleConfig.DependsOnConfig
+	}
+
+	return c.DependsOnConfig
+}
+
+// HealthCheck implements config.ContainerConfig interface.
+func (c *ContainerConfigV1Alpha1) HealthCheck() optional.Optional[config.ContainerHealthCheckConfig] {
+	if c.LifecycleConfig == nil || c.LifecycleConfig.HealthCheckConfig == nil {
+		return optional.None[config.ContainerHealthCheckConfig]()
+	}
+
+	return optional.Some[config.ContainerHealthCheckConfig](c.LifecycleConfig.HealthCheckConfig)
+}
+
+// StopTimeout implements config.ContainerConfig interface.
+func (c *ContainerConfigV1Alpha1) StopTimeout() time.Duration {
+	if c.LifecycleConfig == nil || c.LifecycleConfig.StopTimeoutConfig == nil {
+		return constants.ContainerDefaultStopTimeout
+	}
+
+	return *c.LifecycleConfig.StopTimeoutConfig
+}
+
+// Restart implements config.ContainerConfig interface.
+func (c *ContainerConfigV1Alpha1) Restart() config.ContainerRestartConfig {
+	if c.LifecycleConfig == nil || c.LifecycleConfig.RestartConfig == nil {
+		return &ContainerRestart{}
+	}
+
+	return c.LifecycleConfig.RestartConfig
+}
+
+// mustParse re-parses an already-normalized reference. Normalization has succeeded by the time
+// this is called, so a failure here is impossible.
+func mustParse(ref string) name.Reference {
+	parsed, err := name.ParseReference(ref)
+	if err != nil {
+		panic(fmt.Sprintf("normalized reference %q failed to re-parse: %s", ref, err))
+	}
+
+	return parsed
+}
+
+// ValidateName checks the container name.
+func (c *ContainerConfigV1Alpha1) ValidateName() error {
+	switch {
+	case c.MetaName == "":
+		return errors.New("name is required")
+	case len(c.MetaName) > maxNameLength:
+		return fmt.Errorf("name %q must be %d characters or fewer", c.MetaName, maxNameLength)
+	case !validNamePattern.MatchString(c.MetaName):
+		return fmt.Errorf("name %q: name can only contain lowercase ASCII letters, digits and hyphens", c.MetaName)
+	}
+
+	return nil
+}
+
+func ValidateAbsPath(kind, path string) error {
+	if path == "" {
+		return fmt.Errorf("%s is required", kind)
+	}
+
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("%s %q must be an absolute path", kind, path)
+	}
+
+	return nil
+}

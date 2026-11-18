@@ -10,8 +10,8 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/google/cel-go/cel"
-	"github.com/google/cel-go/common/types"
+	"cel.dev/cel-go/cel"
+	"cel.dev/cel-go/common/types"
 	"github.com/siderolabs/protoenc"
 	"go.yaml.in/yaml/v4"
 	exprpb "google.golang.org/genproto/googleapis/api/expr/v1alpha1"
@@ -80,7 +80,7 @@ func parseExpressionWithOutputType(expression string, env *cel.Env, expectedType
 	return ast, nil
 }
 
-// Merge imlements merge.Mergeable.
+// Merge implements the merger interface: the expression is replaced as a whole.
 func (expr *Expression) Merge(v any) error {
 	other, ok := v.(Expression)
 	if !ok {
@@ -132,12 +132,10 @@ func (expr *Expression) ParseDouble(env *cel.Env) error {
 }
 
 // EvalBool evaluates the expression in the given environment.
+//
+// The compiled program is cached, so repeated evaluations of the same expression (or its copies) are cheap.
 func (expr Expression) EvalBool(env *cel.Env, values map[string]any) (bool, error) {
-	if err := expr.ParseBool(env); err != nil {
-		return false, err
-	}
-
-	prog, err := env.Program(expr.ast)
+	prog, err := expr.program(env, types.BoolType)
 	if err != nil {
 		return false, err
 	}
@@ -156,12 +154,10 @@ func (expr Expression) EvalBool(env *cel.Env, values map[string]any) (bool, erro
 }
 
 // EvalDouble evaluates the expression in the given environment.
+//
+// The compiled program is cached, so repeated evaluations of the same expression (or its copies) are cheap.
 func (expr Expression) EvalDouble(env *cel.Env, values map[string]any) (float64, error) {
-	if err := expr.ParseDouble(env); err != nil {
-		return math.NaN(), err
-	}
-
-	prog, err := env.Program(expr.ast)
+	prog, err := expr.program(env, types.DoubleType)
 	if err != nil {
 		return math.NaN(), err
 	}

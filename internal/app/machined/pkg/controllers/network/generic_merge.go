@@ -14,17 +14,22 @@ import (
 	"github.com/cosi-project/runtime/pkg/resource/typed"
 	"github.com/cosi-project/runtime/pkg/safe"
 	"go.uber.org/zap"
+
+	"github.com/siderolabs/talos/pkg/machinery/redactable"
 )
 
 type genericMergeFunc[T typed.DeepCopyable[T], E typed.Extension] func(logger *zap.Logger, in safe.List[*typed.Resource[T, E]]) map[resource.ID]*T
 
 // GenericMergeController initializes a generic merge controller for network resources.
-func GenericMergeController[T typed.DeepCopyable[T], E typed.Extension](namespaceIn, namespaceOut resource.Namespace, mergeFunc genericMergeFunc[T, E]) controller.Controller {
+func GenericMergeController[T typed.DeepCopyable[T], PT redactable.SpecPtr[T], E typed.Extension](
+	namespaceIn, namespaceOut resource.Namespace,
+	mergeFunc genericMergeFunc[T, E],
+) controller.Controller {
 	var zeroE E
 
 	controllerName := strings.ReplaceAll(zeroE.ResourceDefinition().Type, "Spec", "MergeController")
 
-	return &genericMergeController[T, E]{
+	return &genericMergeController[T, PT, E]{
 		controllerName: controllerName,
 		resourceType:   zeroE.ResourceDefinition().Type,
 		namespaceIn:    namespaceIn,
@@ -33,7 +38,7 @@ func GenericMergeController[T typed.DeepCopyable[T], E typed.Extension](namespac
 	}
 }
 
-type genericMergeController[T typed.DeepCopyable[T], E typed.Extension] struct {
+type genericMergeController[T typed.DeepCopyable[T], PT redactable.SpecPtr[T], E typed.Extension] struct {
 	controllerName string
 	resourceType   resource.Type
 	namespaceIn    resource.Namespace
@@ -41,11 +46,11 @@ type genericMergeController[T typed.DeepCopyable[T], E typed.Extension] struct {
 	mergeFunc      genericMergeFunc[T, E]
 }
 
-func (ctrl *genericMergeController[T, E]) Name() string {
+func (ctrl *genericMergeController[T, PT, E]) Name() string {
 	return ctrl.controllerName
 }
 
-func (ctrl *genericMergeController[T, E]) Inputs() []controller.Input {
+func (ctrl *genericMergeController[T, PT, E]) Inputs() []controller.Input {
 	return []controller.Input{
 		{
 			Namespace: ctrl.namespaceIn,
@@ -60,7 +65,7 @@ func (ctrl *genericMergeController[T, E]) Inputs() []controller.Input {
 	}
 }
 
-func (ctrl *genericMergeController[T, E]) Outputs() []controller.Output {
+func (ctrl *genericMergeController[T, PT, E]) Outputs() []controller.Output {
 	return []controller.Output{
 		{
 			Type: ctrl.resourceType,
@@ -70,7 +75,7 @@ func (ctrl *genericMergeController[T, E]) Outputs() []controller.Output {
 }
 
 //nolint:gocyclo
-func (ctrl *genericMergeController[T, E]) Run(ctx context.Context, r controller.Runtime, logger *zap.Logger) error {
+func (ctrl *genericMergeController[T, PT, E]) Run(ctx context.Context, r controller.Runtime, logger *zap.Logger) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -124,8 +129,10 @@ func (ctrl *genericMergeController[T, E]) Run(ctx context.Context, r controller.
 		var zeroT T
 
 		for id, spec := range merged {
+			md := resource.NewMetadata(ctrl.namespaceOut, ctrl.resourceType, id, resource.VersionUndefined)
+
 			if err = safe.WriterModify(ctx, r,
-				typed.NewResource[T, E](resource.NewMetadata(ctrl.namespaceOut, ctrl.resourceType, id, resource.VersionUndefined), zeroT),
+				typed.NewResource[T, E](md, zeroT),
 				func(r *R) error {
 					*r.TypedSpec() = *spec
 
@@ -134,7 +141,9 @@ func (ctrl *genericMergeController[T, E]) Run(ctx context.Context, r controller.
 				return fmt.Errorf("error updating resource: %w", err)
 			}
 
-			logger.Debug("merged spec", zap.String("id", id), zap.Any("spec", spec))
+			specRedacted := redactable.Redact[T, PT](*spec, md)
+
+			logger.Debug("merged spec", zap.String("id", id), zap.Any("spec", specRedacted))
 		}
 
 		r.ResetRestartBackoff()

@@ -10,6 +10,63 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/encoder"
 )
 
+func (CRIBaseRuntimeSpecConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "CRIBaseRuntimeSpecConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "CRIBaseRuntimeSpecConfig configures the base OCI runtime specification for CRI containers." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "CRIBaseRuntimeSpecConfig configures the base OCI runtime specification for CRI containers.",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "overrides",
+				Type:        "Unstructured",
+				Note:        "",
+				Description: "Overrides for the default OCI runtime specification used by CRI containers.\n\nThis document is mutually exclusive with the deprecated\n`.machine.baseRuntimeSpecOverrides` field.\n\nStrategic merge patches replace this overrides object as a whole, so\nreapplying the same document is idempotent.\n\nApplying, updating, or removing these overrides restarts CRI automatically.\nA machine reboot is not required.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Overrides for the default OCI runtime specification used by CRI containers." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.AddExample("", exampleCRIBaseRuntimeSpecConfigV1Alpha1())
+
+	return doc
+}
+
+func (CRICustomizationConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "CRICustomizationConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "CRICustomizationConfig configures the CRI containerd instance." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "CRICustomizationConfig configures the CRI containerd instance.",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "name",
+				Type:        "string",
+				Note:        "",
+				Description: "Name of the CRI customization.\n\nCustomizations are merged with physical CRI configuration parts in\nlexicographical order by name. The legacy\n`/etc/cri/conf.d/20-customization.part` machine file is included under\nthe reserved name `customization`.\n\nApplying, updating, or removing a customization restarts CRI automatically.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Name of the CRI customization." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "content",
+				Type:        "string",
+				Note:        "",
+				Description: "CRI containerd configuration fragment in TOML format.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "CRI containerd configuration fragment in TOML format." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.AddExample("", exampleCRICustomizationConfigV1Alpha1())
+
+	return doc
+}
+
 func (ImageCacheConfigV1Alpha1) Doc() *encoder.Doc {
 	doc := &encoder.Doc{
 		Type:        "ImageCacheConfig",
@@ -234,18 +291,55 @@ func (RegistryTLSConfigV1Alpha1) Doc() *encoder.Doc {
 	return doc
 }
 
+func (SeccompProfileConfigV1Alpha1) Doc() *encoder.Doc {
+	doc := &encoder.Doc{
+		Type:        "SeccompProfileConfig",
+		Comments:    [3]string{"" /* encoder.HeadComment */, "SeccompProfileConfig declares a named seccomp profile." /* encoder.LineComment */, "" /* encoder.FootComment */},
+		Description: "SeccompProfileConfig declares a named seccomp profile.\nSeccompProfileConfig declares a seccomp profile which can be referenced by name.\n\nEvery profile is written to `/var/lib/kubelet/seccomp/profiles/<name>`, so Kubernetes pods\ncan use it with `securityContext.seccompProfile.type: Localhost` and\n`localhostProfile: profiles/<name>`.\n\nThis document replaces the deprecated `.machine.seccompProfiles` field.\n",
+		Fields: []encoder.Doc{
+			{
+				Type:   "Meta",
+				Inline: true,
+			},
+			{
+				Name:        "name",
+				Type:        "string",
+				Note:        "",
+				Description: "Name of the seccomp profile.\n\nThe name is used as the profile's file name, so it must be at most 255 characters long\nand may only contain ASCII letters, digits, `.`, `_` and `-`.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "Name of the seccomp profile." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+			{
+				Name:        "profile",
+				Type:        "Unstructured",
+				Note:        "",
+				Description: "The seccomp profile, in the OCI runtime specification `LinuxSeccomp` format.\n\nThis is the same JSON format Kubernetes `Localhost` seccomp profiles use, expressed\nas YAML. `defaultAction` is required.",
+				Comments:    [3]string{"" /* encoder.HeadComment */, "The seccomp profile, in the OCI runtime specification `LinuxSeccomp` format." /* encoder.LineComment */, "" /* encoder.FootComment */},
+			},
+		},
+	}
+
+	doc.AddExample("", exampleSeccompProfileConfigV1Alpha1())
+
+	doc.Fields[1].AddExample("", "audit.json")
+
+	return doc
+}
+
 // GetFileDoc returns documentation for the file cri_doc.go.
 func GetFileDoc() *encoder.FileDoc {
 	return &encoder.FileDoc{
 		Name:        "cri",
 		Description: "",
 		Structs: []*encoder.Doc{
+			CRIBaseRuntimeSpecConfigV1Alpha1{}.Doc(),
+			CRICustomizationConfigV1Alpha1{}.Doc(),
 			ImageCacheConfigV1Alpha1{}.Doc(),
 			LocalImageCacheConfig{}.Doc(),
 			RegistryAuthConfigV1Alpha1{}.Doc(),
 			RegistryMirrorConfigV1Alpha1{}.Doc(),
 			RegistryEndpoint{}.Doc(),
 			RegistryTLSConfigV1Alpha1{}.Doc(),
+			SeccompProfileConfigV1Alpha1{}.Doc(),
 		},
 	}
 }

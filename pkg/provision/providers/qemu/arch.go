@@ -66,6 +66,25 @@ func (arch Arch) Console() string {
 	}
 }
 
+// DisplayDeviceArgs returns the display device which `-nodefaults` drops.
+//
+// On amd64 (q35) QEMU creates a standard VGA by default, and the firmware and the kernel
+// behave differently without it (no GOP framebuffer, no BGRT): this was observed to break
+// kexec into the installed kernel (its built-in BTF gets corrupted, so all module loads fail).
+// The default device is restored to keep the VM the same as without `-nodefaults`.
+//
+// On arm64 (virt) there is no default display device.
+func (arch Arch) DisplayDeviceArgs() []string {
+	switch arch {
+	case ArchAmd64:
+		return []string{"-device", "VGA"}
+	case ArchArm64:
+		return nil
+	default:
+		panic("unsupported architecture")
+	}
+}
+
 // PFlash for UEFI boot.
 type PFlash struct {
 	Size        int64
@@ -134,6 +153,7 @@ func (arch Arch) PFlash(uefiEnabled bool, extraUEFISearchPaths []string) []PFlas
 			"/usr/share/qemu",
 			"/usr/share/ovmf/x64",      // Arch Linux
 			"/opt/homebrew/share/qemu", // Darwin
+			"/run/libvirt/nix-ovmf/",   // NixOS
 		}
 
 		// Secure boot enabled firmware files
@@ -242,6 +262,24 @@ func (arch Arch) TPMDeviceArgs(socketPath string) []string {
 	}
 }
 
+// IPMIDeviceArgs returns arguments for qemu to enable an emulated BMC (IPMI) device.
+//
+// QEMU publishes an SMBIOS type-38 (IPMI Device Information) entry for the device, so the
+// guest kernel autoloads `ipmi_si` and exposes `/dev/ipmi0`, same as on real hardware.
+//
+// The BMC identity is fixed to values the integration test asserts on: Dell (IANA 674),
+// product 0x029a, firmware 7.10.
+func (arch Arch) IPMIDeviceArgs() ([]string, error) {
+	if arch != ArchAmd64 {
+		return nil, fmt.Errorf("IPMI emulation is only supported on amd64, not %s", string(arch))
+	}
+
+	return []string{
+		"-device", "ipmi-bmc-sim,id=bmc0,mfg_id=674,product_id=666,fwrev1=7,fwrev2=0x10",
+		"-device", "isa-ipmi-kcs,bmc=bmc0",
+	}, nil
+}
+
 func (arch Arch) getMachineArgs(iommu bool) []string {
 	args := arch.QemuMachine()
 	if arch.acceleratorAvailable() {
@@ -255,6 +293,12 @@ func (arch Arch) getMachineArgs(iommu bool) []string {
 
 	if arch == ArchAmd64 {
 		args += ",smm=on"
+
+		// disable i8042 as it seems to cause deadlocks under QEMU on kexec due to PS/2 driver
+		// Talos 1.15+ uses virtio-keyboard driver instead
+		//
+		// note: requires QEMU >= 7.0
+		args += ",i8042=off"
 	}
 
 	return []string{"-machine", args}

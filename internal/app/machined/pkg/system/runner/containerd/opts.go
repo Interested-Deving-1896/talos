@@ -20,6 +20,21 @@ import (
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
+// WithAmbientFromPermittedForNonRoot sets the inheritable and ambient sets of a non-root process to
+// its permitted set.
+func WithAmbientFromPermittedForNonRoot(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+	if s.Process == nil || s.Process.User.UID == 0 || s.Process.Capabilities == nil {
+		return nil
+	}
+
+	capabilities := s.Process.Capabilities
+
+	capabilities.Inheritable = slices.Clone(capabilities.Permitted)
+	capabilities.Ambient = slices.Clone(capabilities.Permitted)
+
+	return nil
+}
+
 // WithRootfsPropagation sets the root filesystem propagation.
 func WithRootfsPropagation(rp string) oci.SpecOpts {
 	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
@@ -44,6 +59,32 @@ func WithCustomSeccompProfile(override func(*specs.LinuxSeccomp)) oci.SpecOpts {
 		s.Linux.Seccomp = seccomp.DefaultProfile(s)
 
 		override(s.Linux.Seccomp)
+
+		return nil
+	}
+}
+
+// WithSeccompProfile applies the given seccomp profile as is.
+//
+// The profile is copied, so that a container never shares its spec with the caller.
+func WithSeccompProfile(profile *specs.LinuxSeccomp) oci.SpecOpts {
+	return func(_ context.Context, _ oci.Client, _ *containers.Container, s *specs.Spec) error {
+		if s.Linux == nil {
+			s.Linux = &specs.Linux{}
+		}
+
+		data, err := json.Marshal(profile)
+		if err != nil {
+			return fmt.Errorf("failed to marshal seccomp profile: %w", err)
+		}
+
+		var seccompProfile specs.LinuxSeccomp
+
+		if err = json.Unmarshal(data, &seccompProfile); err != nil {
+			return fmt.Errorf("failed to unmarshal seccomp profile: %w", err)
+		}
+
+		s.Linux.Seccomp = &seccompProfile
 
 		return nil
 	}

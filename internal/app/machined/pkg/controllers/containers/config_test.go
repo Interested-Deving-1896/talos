@@ -1,0 +1,395 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+package containers_test
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/suite"
+
+	containersctrl "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/containers"
+	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
+	configcfg "github.com/siderolabs/talos/pkg/machinery/config/config"
+	"github.com/siderolabs/talos/pkg/machinery/config/container"
+	blockcfg "github.com/siderolabs/talos/pkg/machinery/config/types/block"
+	containercfg "github.com/siderolabs/talos/pkg/machinery/config/types/container"
+	cricfg "github.com/siderolabs/talos/pkg/machinery/config/types/cri"
+	runtimecfg "github.com/siderolabs/talos/pkg/machinery/config/types/runtime"
+	"github.com/siderolabs/talos/pkg/machinery/resources/config"
+	"github.com/siderolabs/talos/pkg/machinery/resources/containers"
+)
+
+type ConfigSuite struct {
+	ctest.DefaultSuite
+}
+
+func TestConfigSuite(t *testing.T) {
+	t.Parallel()
+
+	suite.Run(t, &ConfigSuite{
+		Timeout: 5 * time.Second,
+		AfterSetup: func(suite *ctest.DefaultSuite) {
+			suite.Require().NoError(suite.Runtime().RegisterController(&containersctrl.ConfigController{}))
+		},
+	})
+}
+
+// applyContainers puts the given documents into the active machine config.
+func (suite *ConfigSuite) applyContainers(documents ...configcfg.Document) {
+	cfg, err := container.New(documents...)
+	suite.Require().NoError(err)
+
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), config.NewMachineConfig(cfg)))
+}
+
+func newDoc(name, image string) *containercfg.ContainerConfigV1Alpha1 {
+	doc := containercfg.NewContainerConfigV1Alpha1()
+	doc.MetaName = name
+	doc.ContainerImage = image
+
+	return doc
+}
+
+func (suite *ConfigSuite) TestNormalizesImageAndResolvesDefaults() {
+	suite.applyContainers(newDoc("nginx", "nginx"))
+
+	ctest.AssertResource(suite, "nginx", func(spec *containers.ContainerSpec, asrt *assert.Assertions) {
+		// A short reference is expanded here, once, so that everything downstream sees the same
+		// canonical string.
+		asrt.Equal("index.docker.io/library/nginx:latest", spec.TypedSpec().Image.Ref)
+
+		// Defaults: restricted, default seccomp profile, no host network, no limits, the default stop timeout.
+		asrt.False(spec.TypedSpec().Security.Privileged)
+		asrt.True(spec.TypedSpec().Security.ReadOnlyRootFS)
+		asrt.False(spec.TypedSpec().Security.SeccompUnconfined)
+		asrt.Empty(spec.TypedSpec().Security.SeccompLocalhostProfile)
+		asrt.Empty(spec.TypedSpec().Security.SeccompLocalhostProfileContent)
+		asrt.False(spec.TypedSpec().Network.HostNetwork)
+		asrt.Zero(spec.TypedSpec().Resources.MemoryLimit)
+		asrt.Nil(spec.TypedSpec().Resources.SwapLimit)
+		asrt.Equal(10*time.Second, spec.TypedSpec().StopTimeout)
+
+		// no SecurityProfileConfig: no categories
+		asrt.Empty(spec.TypedSpec().Security.SELinuxLevel)
+	})
+}
+
+func (suite *ConfigSuite) TestAssignsSELinuxLevels() {
+	privileged := newDoc("privileged", "nginx")
+	privileged.SecurityConfig = &containercfg.ContainerSecurity{SecurityProfile: "privileged"}
+
+	securityProfile := runtimecfg.NewSecurityProfileConfigV1Alpha1()
+	securityProfile.SELinuxCategoriesEnabled = new(true)
+
+	cfg, err := container.New(newDoc("a", "nginx"), newDoc("b", "nginx"), privileged, securityProfile)
+	suite.Require().NoError(err)
+
+	suite.Require().NoError(suite.State().Create(suite.Ctx(), config.NewMachineConfig(cfg)))
+
+	levels := map[string]string{}
+
+	ctest.AssertResources(suite, []string{"a", "b"}, func(spec *containers.ContainerSpec, asrt *assert.Assertions) {
+		asrt.Regexp(`^s0:c\d+,c\d+$`, spec.TypedSpec().Security.SELinuxLevel)
+
+		levels[spec.Metadata().ID()] = spec.TypedSpec().Security.SELinuxLevel
+	})
+
+	suite.Assert().NotEqual(levels["a"], levels["b"])
+
+	ctest.AssertResource(suite, "privileged", func(spec *containers.ContainerSpec, asrt *assert.Assertions) {
+		asrt.Empty(spec.TypedSpec().Security.SELinuxLevel)
+	})
+}
+
+func (suite *ConfigSuite) TestResolvesRestart() {
+	doc := newDoc("migrate", "ghcr.io/example/migrate:v1.0.0")
+	doc.LifecycleConfig = &containercfg.ContainerLifecycle{
+		RestartConfig: &containercfg.ContainerRestart{
+			RestartPolicy:     configcfg.ContainerRestartPolicyOnFailure,
+			RestartMaxRetries: new(2),
+			RestartDelay:      new(time.Second),
+			RestartMaxDelay:   new(time.Minute),
+		},
+	}
+
+	never := newDoc("init", "ghcr.io/example/init:v1.0.0")
+	never.LifecycleConfig = &containercfg.ContainerLifecycle{
+		RestartConfig: &containercfg.ContainerRestart{RestartPolicy: configcfg.ContainerRestartPolicyNever},
+	}
+
+	suite.applyContainers(doc, never, newDoc("nginx", "nginx"))
+
+	ctest.AssertResource(suite, "migrate", func(spec *containers.ContainerSpec, asrt *assert.Assertions) {
+		asrt.Equal(containers.ContainerRestartSpec{
+			Policy:     containers.ContainerRestartPolicyOnFailure,
+			MaxRetries: new(uint32(2)),
+			Delay:      time.Second,
+			MaxDelay:   time.Minute,
+		}, spec.TypedSpec().Restart)
+	})
+
+	ctest.AssertResource(suite, "init", func(spec *containers.ContainerSpec, asrt *assert.Assertions) {
+		asrt.Equal(containers.ContainerRestartPolicyNever, spec.TypedSpec().Restart.Policy)
+	})
+
+	// the defaults: always, and a fixed delay
+	ctest.AssertResource(suite, "nginx", func(spec *containers.ContainerSpec, asrt *assert.Assertions) {
+		asrt.Equal(containers.ContainerRestartSpec{
+			Policy:   containers.ContainerRestartPolicyAlways,
+			Delay:    5 * time.Second,
+			MaxDelay: 5 * time.Second,
+		}, spec.TypedSpec().Restart)
+	})
+}
+
+func (suite *ConfigSuite) TestResolvesMounts() {
+	doc := newDoc("director", "ghcr.io/siderolabs/director:v1.0.0")
+	doc.MountsConfig = []containercfg.ContainerMount{
+		{
+			VolumeMount: &containercfg.VolumeMount{
+				VolumeName:       "director-data",
+				MountDestination: "/var/lib/director",
+				MountOpts:        []string{"rw"},
+			},
+		},
+		{
+			TmpfsMount: &containercfg.TmpfsMount{
+				MountDestination: "/tmp",
+				MountSize:        "64MiB",
+			},
+		},
+		{
+			TmpfsMount: &containercfg.TmpfsMount{
+				MountDestination: "/tmp/ro",
+				MountOpts:        []string{"ro"},
+			},
+		},
+		{
+			HostPathMount: &containercfg.HostPathMount{
+				MountSource:      "/dev",
+				MountDestination: "/dev",
+			},
+		},
+	}
+
+	userVolume := blockcfg.NewUserVolumeConfigV1Alpha1()
+	userVolume.MetaName = "director-data"
+
+	suite.applyContainers(doc, userVolume)
+
+	ctest.AssertResource(suite, "director", func(spec *containers.ContainerSpec, asrt *assert.Assertions) {
+		mounts := spec.TypedSpec().Mounts
+		asrt.Len(mounts, 4)
+
+		// A volume keeps its declared name, not a volume ID or host path: resolving the name and
+		// mounting the volume are MountController's job.
+		asrt.Equal(containers.MountKindVolume, mounts[0].Kind)
+		asrt.Equal("director-data", mounts[0].VolumeName)
+		asrt.Empty(mounts[0].Source)
+		asrt.NotContains(mounts[0].Options, "ro")
+
+		asrt.Equal(containers.MountKindTmpfs, mounts[1].Kind)
+		asrt.Equal(uint64(64<<20), mounts[1].Size)
+		// Writable by default.
+		asrt.NotContains(mounts[1].Options, "ro")
+
+		asrt.Equal(containers.MountKindTmpfs, mounts[2].Kind)
+		// An explicit ro is honored.
+		asrt.Equal([]string{"ro"}, mounts[2].Options)
+
+		asrt.Equal(containers.MountKindHostPath, mounts[3].Kind)
+		asrt.Equal("/dev", mounts[3].Source)
+		// Writable by default.
+		asrt.NotContains(mounts[3].Options, "ro")
+	})
+}
+
+func (suite *ConfigSuite) TestResolvesSeccompLocalhostProfile() {
+	profile := cricfg.NewSeccompProfileConfigV1Alpha1("no-ns.json")
+	profile.ProfileConfig.Object = map[string]any{
+		"defaultAction": "SCMP_ACT_ALLOW",
+		// Not part of the OCI format: dropped from the resolved profile.
+		"comment": "deny namespace creation",
+		"syscalls": []any{
+			map[string]any{
+				"action": "SCMP_ACT_ERRNO",
+				"names":  []any{"unshare", "setns"},
+			},
+		},
+	}
+
+	doc := newDoc("sandboxed", "ghcr.io/siderolabs/sandboxed:v1.0.0")
+	doc.SecurityConfig = &containercfg.ContainerSecurity{
+		SecuritySeccompProfile: &containercfg.ContainerSeccomp{
+			SeccompType:             configcfg.ContainerSeccompProfileLocalhost,
+			SeccompLocalhostProfile: "no-ns.json",
+		},
+	}
+
+	suite.applyContainers(profile, doc)
+
+	ctest.AssertResource(suite, "sandboxed", func(spec *containers.ContainerSpec, asrt *assert.Assertions) {
+		asrt.False(spec.TypedSpec().Security.SeccompUnconfined)
+		asrt.Equal("no-ns.json", spec.TypedSpec().Security.SeccompLocalhostProfile)
+		asrt.JSONEq(
+			`{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["unshare","setns"],"action":"SCMP_ACT_ERRNO"}]}`,
+			spec.TypedSpec().Security.SeccompLocalhostProfileContent,
+		)
+	})
+
+	// Editing the profile updates the spec, which is what restarts the container.
+	edited := profile.DeepCopy()
+	edited.ProfileConfig.Object = map[string]any{"defaultAction": "SCMP_ACT_LOG"}
+
+	cfg, err := container.New(edited, doc)
+	suite.Require().NoError(err)
+
+	oldCfg, err := suite.State().Get(suite.Ctx(), config.NewMachineConfig(nil).Metadata())
+	suite.Require().NoError(err)
+
+	newCfg := config.NewMachineConfig(cfg)
+	newCfg.Metadata().SetVersion(oldCfg.Metadata().Version())
+
+	suite.Require().NoError(suite.State().Update(suite.Ctx(), newCfg))
+
+	ctest.AssertResource(suite, "sandboxed", func(spec *containers.ContainerSpec, asrt *assert.Assertions) {
+		asrt.JSONEq(`{"defaultAction":"SCMP_ACT_LOG"}`, spec.TypedSpec().Security.SeccompLocalhostProfileContent)
+	})
+}
+
+func (suite *ConfigSuite) TestResolvesSecurityNetworkAndResources() {
+	doc := newDoc("director", "ghcr.io/siderolabs/director:v1.0.0")
+	doc.SecurityConfig = &containercfg.ContainerSecurity{
+		SecurityProfile: "privileged",
+		SecurityCapabilities: &containercfg.ContainerCapabilities{
+			CapabilitiesAddConfig:  []string{"NET_ADMIN"},
+			CapabilitiesDropConfig: []string{"ALL"},
+		},
+		SecuritySeccompProfile: &containercfg.ContainerSeccomp{SeccompType: "unconfined"},
+		SecurityReadOnlyRootFS: new(true),
+	}
+	doc.NetworkConfig = &containercfg.ContainerNetwork{NetworkMode: "host"}
+	doc.ResourcesConfig = &containercfg.ContainerResources{
+		Limits: &containercfg.ContainerResourceLimits{CPU: "1500m", Memory: "512MiB", Swap: "0"},
+	}
+	doc.LifecycleConfig = &containercfg.ContainerLifecycle{
+		DependsOnConfig: &containercfg.ContainerDependsOn{
+			PathsConfig:   []string{"/var/mnt/data"},
+			NetworkConfig: []string{"addresses"},
+			TimeConfig:    new(true),
+		},
+		StopTimeoutConfig: new(30 * time.Second),
+	}
+	doc.RunAsConfig = &containercfg.ContainerRunAs{
+		RunAsUID: new(int32(1000)),
+		RunAsGID: new(int32(1000)),
+	}
+
+	suite.applyContainers(doc)
+
+	ctest.AssertResource(suite, "director", func(spec *containers.ContainerSpec, asrt *assert.Assertions) {
+		asrt.True(spec.TypedSpec().Security.Privileged)
+		// The explicit setting wins over the privileged default of a writable rootfs.
+		asrt.True(spec.TypedSpec().Security.ReadOnlyRootFS)
+		asrt.Equal([]string{"NET_ADMIN"}, spec.TypedSpec().Security.CapabilitiesAdd)
+		asrt.True(spec.TypedSpec().Security.SeccompUnconfined)
+		asrt.True(spec.TypedSpec().Network.HostNetwork)
+
+		asrt.Equal(uint64(512<<20), spec.TypedSpec().Resources.MemoryLimit)
+		// CPU stays in millicores; the cgroup conversion happens where the cgroup is created.
+		asrt.Equal(uint64(1500), spec.TypedSpec().Resources.CPULimit)
+		// A zero swap limit must survive as a value, not collapse into "unset".
+		if asrt.NotNil(spec.TypedSpec().Resources.SwapLimit) {
+			asrt.Zero(*spec.TypedSpec().Resources.SwapLimit)
+		}
+
+		asrt.Equal([]string{"/var/mnt/data"}, spec.TypedSpec().DependsOn.Paths)
+		asrt.Equal([]string{"addresses"}, spec.TypedSpec().DependsOn.Networks)
+		asrt.True(spec.TypedSpec().DependsOn.Time)
+		asrt.Equal(30*time.Second, spec.TypedSpec().StopTimeout)
+
+		if asrt.NotNil(spec.TypedSpec().RunAs.UID) {
+			asrt.Equal(int32(1000), *spec.TypedSpec().RunAs.UID)
+		}
+
+		if asrt.NotNil(spec.TypedSpec().RunAs.GID) {
+			asrt.Equal(int32(1000), *spec.TypedSpec().RunAs.GID)
+		}
+	})
+}
+
+// TestResolvesDeprecatedDependsOn covers a document written against v1.14, with dependsOn at the top
+// level rather than under lifecycle: every condition still reaches the spec.
+func (suite *ConfigSuite) TestResolvesDeprecatedDependsOn() {
+	doc := newDoc("api", "ghcr.io/siderolabs/api:v1.0.0")
+	doc.DependsOnConfig = &containercfg.ContainerDependsOn{ //nolint:staticcheck // testing deprecated field
+		PathsConfig:      []string{"/var/mnt/data"},
+		NetworksConfig:   []string{"addresses"}, //nolint:staticcheck // testing deprecated field
+		TimeConfig:       new(true),
+		ContainersConfig: []containercfg.ContainerDependency{{DependencyName: "database"}},
+	}
+
+	suite.applyContainers(doc, newDoc("database", "ghcr.io/siderolabs/database:v1.0.0"))
+
+	ctest.AssertResource(suite, "api", func(spec *containers.ContainerSpec, asrt *assert.Assertions) {
+		asrt.Equal(containers.ContainerDependsOnSpec{
+			Paths:      []string{"/var/mnt/data"},
+			Networks:   []string{"addresses"},
+			Time:       true,
+			Containers: []containers.ContainerDependencySpec{{Name: "database", Condition: containers.ContainerDependencyConditionRunning}},
+		}, spec.TypedSpec().DependsOn)
+	})
+}
+
+func (suite *ConfigSuite) TestResolvesHealthCheck() {
+	withCheck := newDoc("api", "ghcr.io/siderolabs/api:v1.0.0")
+	withCheck.LifecycleConfig = &containercfg.ContainerLifecycle{
+		HealthCheckConfig: &containercfg.ContainerHealthCheck{
+			GRPCCheck:         &containercfg.ContainerGRPCHealthCheck{CheckPort: 9000, CheckService: "api"},
+			CheckInitialDelay: 2 * time.Second,
+		},
+	}
+
+	suite.applyContainers(withCheck, newDoc("plain", "nginx"))
+
+	ctest.AssertResource(suite, "api", func(spec *containers.ContainerSpec, asrt *assert.Assertions) {
+		asrt.Equal(containers.ContainerHealthCheckSpec{
+			Kind:             string(configcfg.ContainerHealthCheckKindGRPC),
+			Port:             9000,
+			GRPCService:      "api",
+			InitialDelay:     2 * time.Second,
+			Interval:         containercfg.DefaultHealthCheckInterval,
+			Timeout:          containercfg.DefaultHealthCheckTimeout,
+			FailureThreshold: containercfg.DefaultHealthCheckFailureThreshold,
+		}, spec.TypedSpec().HealthCheck)
+	})
+
+	ctest.AssertResource(suite, "plain", func(spec *containers.ContainerSpec, asrt *assert.Assertions) {
+		asrt.False(spec.TypedSpec().HealthCheck.Enabled())
+	})
+}
+
+func (suite *ConfigSuite) TestRemovesSpecWhenDocumentGoesAway() {
+	suite.applyContainers(newDoc("a", "nginx"), newDoc("b", "nginx"))
+
+	ctest.AssertResources(suite, []string{"a", "b"}, func(*containers.ContainerSpec, *assert.Assertions) {})
+
+	// Replace the machine config with one that only declares "a".
+	cfg, err := container.New(newDoc("a", "nginx"))
+	suite.Require().NoError(err)
+
+	oldCfg, err := suite.State().Get(suite.Ctx(), config.NewMachineConfig(nil).Metadata())
+	suite.Require().NoError(err)
+
+	newCfg := config.NewMachineConfig(cfg)
+	newCfg.Metadata().SetVersion(oldCfg.Metadata().Version())
+
+	suite.Require().NoError(suite.State().Update(suite.Ctx(), newCfg))
+
+	ctest.AssertNoResource[*containers.ContainerSpec](suite, "b")
+	ctest.AssertResource(suite, "a", func(*containers.ContainerSpec, *assert.Assertions) {})
+}

@@ -8,7 +8,6 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
-	"slices"
 
 	"github.com/cosi-project/runtime/pkg/controller"
 	"github.com/cosi-project/runtime/pkg/resource"
@@ -181,6 +180,8 @@ func (ctrl *ResolverConfigController) getDefault(cfg talosconfig.Config, hostnam
 	spec.NameServers = []network.NameServerSpec{
 		{Addr: netip.MustParseAddr(constants.DefaultPrimaryResolver)},
 		{Addr: netip.MustParseAddr(constants.DefaultSecondaryResolver)},
+		{Addr: netip.MustParseAddr(constants.DefaultPrimaryResolverV6)},
+		{Addr: netip.MustParseAddr(constants.DefaultSecondaryResolverV6)},
 	}
 	spec.ConfigLayer = network.ConfigDefault
 
@@ -231,7 +232,7 @@ func (ctrl *ResolverConfigController) parseMachineConfiguration(cfgProvider talo
 	resolvers := cfgProvider.NetworkResolverConfig().Resolvers()
 	searchDomains := cfgProvider.NetworkResolverConfig().SearchDomains()
 
-	if len(resolvers) == 0 && len(searchDomains) == 0 {
+	if len(resolvers) == 0 && !searchDomains.IsPresent() {
 		return spec, false
 	}
 
@@ -243,7 +244,13 @@ func (ctrl *ResolverConfigController) parseMachineConfiguration(cfgProvider talo
 		}
 	})
 
-	spec.SearchDomains = slices.Clone(searchDomains)
+	// when search domains are explicitly configured (present, possibly empty), mark them as an
+	// override so the merge controller replaces (rather than merges) DHCP/platform search domains
+	if domains, ok := searchDomains.Get(); ok {
+		spec.SearchDomains = domains
+		spec.SearchDomainsOverridden = true
+	}
+
 	spec.ConfigLayer = network.ConfigMachineConfiguration
 
 	return spec, true

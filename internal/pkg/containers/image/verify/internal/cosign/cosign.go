@@ -2,10 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-// Package cosign provides cosign-based image signature verification via Talos pull process.
+// Package cosign verifies cosign image signatures (sigstore bundles and legacy .sig signatures) via Talos pull process.
 package cosign
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -16,14 +17,9 @@ import (
 
 	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/errdefs"
-	"github.com/google/go-containerregistry/pkg/name"
-	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/distribution/reference"
 	digest "github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
-	"github.com/sigstore/cosign/v3/pkg/cosign"
-	"github.com/sigstore/cosign/v3/pkg/cosign/bundle"
-	"github.com/sigstore/cosign/v3/pkg/oci"
-	"github.com/sigstore/cosign/v3/pkg/oci/static"
 	sgbundle "github.com/sigstore/sigstore-go/pkg/bundle"
 	"github.com/sigstore/sigstore-go/pkg/verify"
 	"go.uber.org/zap"
@@ -52,7 +48,7 @@ type VerifyResult struct {
 // NotFound, working around CDNs (notably registry.k8s.io) where the HEAD-by-tag
 // and GET-by-digest requests can land on different regional backends with
 // inconsistent replication. When nil, the fallback is skipped.
-type TagFetcher func(ctx context.Context, repository name.Repository, tag string, expectedDigest digest.Digest) ([]byte, error)
+type TagFetcher func(ctx context.Context, repository reference.Named, tag string, expectedDigest digest.Digest) ([]byte, error)
 
 // VerifyImage verifies the given image reference and digest against the provided verification configuration.
 //
@@ -67,30 +63,31 @@ type TagFetcher func(ctx context.Context, repository name.Repository, tag string
 //
 // The verifiers are in opts, if any of the verifiers returns true for bundle verification, the image is considered verified.
 func VerifyImage(
-	ctx context.Context, logger *zap.Logger, resolver remotes.Resolver, tagFetcher TagFetcher, imageRef name.Digest, co cosign.CheckOpts,
+	ctx context.Context, logger *zap.Logger, resolver remotes.Resolver, tagFetcher TagFetcher, imageRef reference.Canonical, co CheckOpts,
 ) (*VerifyResult, error) {
 	logger = logger.With(zap.Stringer("image", imageRef))
 
-	imageDigest, err := v1.NewHash(imageRef.DigestStr())
-	if err != nil {
+	imageDigest := imageRef.Digest()
+
+	if err := imageDigest.Validate(); err != nil {
 		return nil, fmt.Errorf("failed to parse image digest: %w", err)
 	}
 
-	digestBytes, err := hex.DecodeString(imageDigest.Hex)
+	digestBytes, err := hex.DecodeString(imageDigest.Encoded())
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode digest hex: %w", err)
 	}
 
-	artifactPolicyOption := verify.WithArtifactDigest(imageDigest.Algorithm, digestBytes)
+	artifactPolicyOption := verify.WithArtifactDigest(imageDigest.Algorithm().String(), digestBytes)
 
 	// Step 1: try OCI referrers for new-style sigstore bundles.
-	fetcher, err := resolver.Fetcher(ctx, imageRef.Name())
+	fetcher, err := resolver.Fetcher(ctx, imageRef.String())
 	if err != nil {
 		return nil, fmt.Errorf("failed to get fetcher: %w", err)
 	}
 
 	if refFetcher, ok := fetcher.(remotes.ReferrersFetcher); ok {
-		referrers, err := refFetcher.FetchReferrers(ctx, digest.Digest(imageRef.DigestStr()),
+		referrers, err := refFetcher.FetchReferrers(ctx, imageRef.Digest(),
 			remotes.WithReferrerArtifactTypes(sigstoreBundleV03ArtifactType))
 		if err == nil {
 			bundleRefs := filterBundleReferrers(referrers)
@@ -139,7 +136,7 @@ func filterBundleReferrers(referrers []ocispec.Descriptor) []ocispec.Descriptor 
 //
 // Each referrer points to an OCI image manifest whose single layer contains the sigstore bundle JSON.
 func verifyBundleReferrers(
-	ctx context.Context, logger *zap.Logger, fetcher remotes.Fetcher, referrers []ocispec.Descriptor, artifactPolicyOption verify.ArtifactPolicyOption, co cosign.CheckOpts,
+	ctx context.Context, logger *zap.Logger, fetcher remotes.Fetcher, referrers []ocispec.Descriptor, artifactPolicyOption verify.ArtifactPolicyOption, co CheckOpts,
 ) (*VerifyResult, error) {
 	var lastErr error
 
@@ -152,9 +149,7 @@ func verifyBundleReferrers(
 			continue
 		}
 
-		co.NewBundleFormat = true
-
-		if _, err := cosign.VerifyNewBundle(ctx, &co, artifactPolicyOption, b); err != nil {
+		if err := co.verify(b, artifactPolicyOption); err != nil {
 			logger.Debug("bundle referrer verification failed", zap.String("digest", referrer.Digest.String()), zap.Error(err))
 			lastErr = err
 
@@ -184,13 +179,15 @@ func verifyBundleReferrers(
 //nolint:gocyclo
 func verifyFromBundleTag(
 	ctx context.Context, logger *zap.Logger, resolver remotes.Resolver, tagFetcher TagFetcher,
-	imageRef name.Digest, artifactPolicyOption verify.ArtifactPolicyOption, co cosign.CheckOpts,
+	imageRef reference.Canonical, artifactPolicyOption verify.ArtifactPolicyOption, co CheckOpts,
 ) (bool, *VerifyResult, error) {
-	bundleTag := strings.ReplaceAll(imageRef.DigestStr(), ":", "-")
+	bundleTag := strings.ReplaceAll(imageRef.Digest().String(), ":", "-")
 
 	logger.Debug("resolving bundle tag", zap.String("bundleTag", bundleTag))
 
-	resolvedName, desc, err := resolver.Resolve(ctx, imageRef.Repository.Name()+":"+bundleTag)
+	repository := reference.TrimNamed(imageRef)
+
+	resolvedName, desc, err := resolver.Resolve(ctx, repository.Name()+":"+bundleTag)
 	if err != nil {
 		logger.Debug("bundle tag not found", zap.String("bundleTag", bundleTag), zap.Error(err))
 
@@ -212,7 +209,7 @@ func verifyFromBundleTag(
 
 	switch desc.MediaType {
 	case ocispec.MediaTypeImageManifest:
-		manifest, err := fetchManifestWithTagFallback(ctx, logger, fetcher, tagFetcher, desc, imageRef.Repository, bundleTag)
+		manifest, err := fetchManifestWithTagFallback(ctx, logger, fetcher, tagFetcher, desc, repository, bundleTag)
 		if err != nil {
 			return false, nil, fmt.Errorf("failed to fetch bundle manifest: %w", err)
 		}
@@ -225,7 +222,7 @@ func verifyFromBundleTag(
 	case ocispec.MediaTypeImageIndex:
 		// The bundle tag may be an OCI image index wrapping individual bundle manifests.
 		// Walk each manifest entry and collect bundle layers from all of them.
-		index, err := fetchIndexWithTagFallback(ctx, logger, fetcher, tagFetcher, desc, imageRef.Repository, bundleTag)
+		index, err := fetchIndexWithTagFallback(ctx, logger, fetcher, tagFetcher, desc, repository, bundleTag)
 		if err != nil {
 			return false, nil, fmt.Errorf("failed to fetch bundle index: %w", err)
 		}
@@ -271,13 +268,15 @@ func verifyFromBundleTag(
 // cosign signature layers.
 func verifyFromLegacySigTag(
 	ctx context.Context, logger *zap.Logger, resolver remotes.Resolver, tagFetcher TagFetcher,
-	imageRef name.Digest, imageDigest v1.Hash, co cosign.CheckOpts,
+	imageRef reference.Canonical, imageDigest digest.Digest, co CheckOpts,
 ) (*VerifyResult, error) {
-	signatureTag := strings.ReplaceAll(imageRef.DigestStr(), ":", "-") + ".sig"
+	signatureTag := strings.ReplaceAll(imageRef.Digest().String(), ":", "-") + ".sig"
 
 	logger.Debug("resolving .sig tag", zap.String("signatureTag", signatureTag))
 
-	resolvedName, desc, err := resolver.Resolve(ctx, imageRef.Repository.Name()+":"+signatureTag)
+	repository := reference.TrimNamed(imageRef)
+
+	resolvedName, desc, err := resolver.Resolve(ctx, repository.Name()+":"+signatureTag)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
 			return nil, fmt.Errorf("legacy signature tag not found")
@@ -297,7 +296,7 @@ func verifyFromLegacySigTag(
 		return nil, fmt.Errorf("failed to get fetcher for .sig manifest: %w", err)
 	}
 
-	manifest, err := fetchManifestWithTagFallback(ctx, logger, fetcher, tagFetcher, desc, imageRef.Repository, signatureTag)
+	manifest, err := fetchManifestWithTagFallback(ctx, logger, fetcher, tagFetcher, desc, repository, signatureTag)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch .sig manifest: %w", err)
 	}
@@ -309,7 +308,7 @@ func verifyFromLegacySigTag(
 
 // verifyBundleLayers verifies layers from a .sig manifest that carry sigstore bundle JSON directly.
 func verifyBundleLayers(
-	ctx context.Context, logger *zap.Logger, fetcher remotes.Fetcher, layers []ocispec.Descriptor, artifactPolicyOption verify.ArtifactPolicyOption, co cosign.CheckOpts,
+	ctx context.Context, logger *zap.Logger, fetcher remotes.Fetcher, layers []ocispec.Descriptor, artifactPolicyOption verify.ArtifactPolicyOption, co CheckOpts,
 ) (*VerifyResult, error) {
 	var lastErr error
 
@@ -322,9 +321,7 @@ func verifyBundleLayers(
 			continue
 		}
 
-		co.NewBundleFormat = true
-
-		if _, err := cosign.VerifyNewBundle(ctx, &co, artifactPolicyOption, b); err != nil {
+		if err := co.verify(b, artifactPolicyOption); err != nil {
 			logger.Debug("bundle layer verification failed", zap.Int("layer", i), zap.Error(err))
 			lastErr = err
 
@@ -346,11 +343,11 @@ func verifyBundleLayers(
 }
 
 // verifyLegacyLayers verifies layers from a .sig manifest as legacy cosign signatures.
-func verifyLegacyLayers(ctx context.Context, logger *zap.Logger, fetcher remotes.Fetcher, layers []ocispec.Descriptor, imageDigest v1.Hash, co cosign.CheckOpts) (*VerifyResult, error) {
+func verifyLegacyLayers(ctx context.Context, logger *zap.Logger, fetcher remotes.Fetcher, layers []ocispec.Descriptor, imageDigest digest.Digest, co CheckOpts) (*VerifyResult, error) {
 	var lastErr error
 
 	for i, layer := range layers {
-		sig, err := buildLegacySignature(ctx, fetcher, layer)
+		sig, err := buildLegacySignature(ctx, fetcher, layer, co)
 		if err != nil {
 			logger.Debug("failed to build legacy signature from layer", zap.Int("layer", i), zap.Error(err))
 			lastErr = err
@@ -358,15 +355,22 @@ func verifyLegacyLayers(ctx context.Context, logger *zap.Logger, fetcher remotes
 			continue
 		}
 
-		co.NewBundleFormat = false
-
-		bundleVerified, err := cosign.VerifyImageSignature(ctx, sig, imageDigest, &co)
-		if err != nil {
+		if err = co.verify(sig, verify.WithArtifact(bytes.NewReader(sig.payload))); err != nil {
 			logger.Debug("legacy signature verification failed", zap.Int("layer", i), zap.Error(err))
 			lastErr = err
 
 			continue
 		}
+
+		// verify that the signed payload references the image digest being verified
+		if err = verifyClaim(sig.payload, imageDigest); err != nil {
+			logger.Debug("legacy signature claim verification failed", zap.Int("layer", i), zap.Error(err))
+			lastErr = err
+
+			continue
+		}
+
+		bundleVerified := len(sig.tlogEntries) > 0
 
 		logger.Debug("legacy signature verified", zap.Int("layer", i), zap.Bool("bundle_verified", bundleVerified))
 
@@ -431,7 +435,7 @@ func fetchIndex(ctx context.Context, fetcher remotes.Fetcher, desc ocispec.Descr
 //nolint:dupl // not a duplicate of fetchIndexWithTagFallback - decodes a different type
 func fetchManifestWithTagFallback(
 	ctx context.Context, logger *zap.Logger, fetcher remotes.Fetcher, tagFetcher TagFetcher,
-	desc ocispec.Descriptor, repo name.Repository, tag string,
+	desc ocispec.Descriptor, repo reference.Named, tag string,
 ) (ocispec.Manifest, error) {
 	manifest, err := fetchManifest(ctx, fetcher, desc)
 	if err == nil {
@@ -462,7 +466,7 @@ func fetchManifestWithTagFallback(
 //nolint:dupl // not a duplicate of fetchManifestWithTagFallback - decodes a different type
 func fetchIndexWithTagFallback(
 	ctx context.Context, logger *zap.Logger, fetcher remotes.Fetcher, tagFetcher TagFetcher,
-	desc ocispec.Descriptor, repo name.Repository, tag string,
+	desc ocispec.Descriptor, repo reference.Named, tag string,
 ) (ocispec.Index, error) {
 	index, err := fetchIndex(ctx, fetcher, desc)
 	if err == nil {
@@ -531,50 +535,4 @@ func fetchBundleFromLayer(ctx context.Context, fetcher remotes.Fetcher, layer oc
 	}
 
 	return b, nil
-}
-
-// buildLegacySignature constructs an oci.Signature from a cosign legacy signature layer.
-//
-// The layer content is the simple signing payload (the data that was signed). The cryptographic
-// signature and optional certificate/chain/Rekor bundle are read from the layer annotations.
-func buildLegacySignature(ctx context.Context, fetcher remotes.Fetcher, layer ocispec.Descriptor) (oci.Signature, error) {
-	// Fetch the layer content: the simple signing payload (what was signed).
-	rc, err := fetcher.Fetch(ctx, layer)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch signature layer: %w", err)
-	}
-
-	defer rc.Close() //nolint:errcheck
-
-	payload, err := io.ReadAll(io.LimitReader(rc, maxPayloadSize))
-	if err != nil {
-		return nil, fmt.Errorf("failed to read signature layer: %w", err)
-	}
-
-	// Base64-encoded cryptographic signature from layer annotation.
-	b64sig, ok := layer.Annotations[static.SignatureAnnotationKey]
-	if !ok {
-		return nil, errors.New("missing signature annotation")
-	}
-
-	var staticOpts []static.Option
-
-	// Certificate and intermediate chain for keyless (Fulcio-issued) signing.
-	if certPEM, ok := layer.Annotations[static.CertificateAnnotationKey]; ok {
-		chainPEM := layer.Annotations[static.ChainAnnotationKey]
-
-		staticOpts = append(staticOpts, static.WithCertChain([]byte(certPEM), []byte(chainPEM)))
-	}
-
-	// Rekor transparency log bundle, if present.
-	if bundleJSON, ok := layer.Annotations[static.BundleAnnotationKey]; ok {
-		var rb bundle.RekorBundle
-		if err := json.Unmarshal([]byte(bundleJSON), &rb); err != nil {
-			return nil, fmt.Errorf("failed to parse Rekor bundle annotation: %w", err)
-		}
-
-		staticOpts = append(staticOpts, static.WithBundle(&rb))
-	}
-
-	return static.NewSignature(payload, b64sig, staticOpts...)
 }

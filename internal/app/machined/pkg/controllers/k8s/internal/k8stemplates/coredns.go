@@ -12,7 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -22,22 +22,18 @@ import (
 // CoreDNSService returns the CoreDNS service object.
 func CoreDNSService(spec *k8s.BootstrapManifestsConfigSpec) runtime.Object {
 	obj := &corev1.Service{
-		TypeMeta: v1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: corev1.SchemeGroupVersion.Version,
+		Kind:       "Service",
+		APIVersion: corev1.SchemeGroupVersion.Version,
+		Name:       "kube-dns",
+		Namespace:  "kube-system",
+		Annotations: map[string]string{
+			"prometheus.io/scrape": "true",
+			"prometheus.io/port":   "9153",
 		},
-		ObjectMeta: v1.ObjectMeta{
-			Name:      "kube-dns",
-			Namespace: "kube-system",
-			Annotations: map[string]string{
-				"prometheus.io/scrape": "true",
-				"prometheus.io/port":   "9153",
-			},
-			Labels: map[string]string{
-				"k8s-app":                       "kube-dns",
-				"kubernetes.io/cluster-service": "true",
-				"kubernetes.io/name":            "CoreDNS",
-			},
+		Labels: map[string]string{
+			"k8s-app":                       "kube-dns",
+			"kubernetes.io/cluster-service": "true",
+			"kubernetes.io/name":            "CoreDNS",
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: map[string]string{
@@ -89,32 +85,24 @@ func CoreDNSService(spec *k8s.BootstrapManifestsConfigSpec) runtime.Object {
 // CoreDNSServiceAccount returns the CoreDNS service account object.
 func CoreDNSServiceAccount() runtime.Object {
 	return &corev1.ServiceAccount{
-		TypeMeta: v1.TypeMeta{
-			Kind:       "ServiceAccount",
-			APIVersion: corev1.SchemeGroupVersion.Version,
-		},
-		ObjectMeta: v1.ObjectMeta{
-			Name:      "coredns",
-			Namespace: "kube-system",
-		},
+		Kind:       "ServiceAccount",
+		APIVersion: corev1.SchemeGroupVersion.Version,
+		Name:       "coredns",
+		Namespace:  "kube-system",
 	}
 }
 
 // CoreDNSClusterRoleBinding returns the CoreDNS ClusterRoleBinding object.
 func CoreDNSClusterRoleBinding() runtime.Object {
 	return &rbacv1.ClusterRoleBinding{
-		TypeMeta: v1.TypeMeta{
-			Kind:       "ClusterRoleBinding",
-			APIVersion: rbacv1.SchemeGroupVersion.String(),
+		Kind:       "ClusterRoleBinding",
+		APIVersion: rbacv1.SchemeGroupVersion.String(),
+		Name:       "system:coredns",
+		Labels: map[string]string{
+			"kubernetes.io/bootstrapping": "rbac-defaults",
 		},
-		ObjectMeta: v1.ObjectMeta{
-			Name: "system:coredns",
-			Labels: map[string]string{
-				"kubernetes.io/bootstrapping": "rbac-defaults",
-			},
-			Annotations: map[string]string{
-				"rbac.authorization.kubernetes.io/autoupdate": "true",
-			},
+		Annotations: map[string]string{
+			"rbac.authorization.kubernetes.io/autoupdate": "true",
 		},
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: rbacv1.GroupName,
@@ -134,15 +122,11 @@ func CoreDNSClusterRoleBinding() runtime.Object {
 // CoreDNSClusterRole returns the CoreDNS ClusterRole object.
 func CoreDNSClusterRole() runtime.Object {
 	return &rbacv1.ClusterRole{
-		TypeMeta: v1.TypeMeta{
-			Kind:       "ClusterRole",
-			APIVersion: rbacv1.SchemeGroupVersion.String(),
-		},
-		ObjectMeta: v1.ObjectMeta{
-			Name: "system:coredns",
-			Labels: map[string]string{
-				"kubernetes.io/bootstrapping": "rbac-defaults",
-			},
+		Kind:       "ClusterRole",
+		APIVersion: rbacv1.SchemeGroupVersion.String(),
+		Name:       "system:coredns",
+		Labels: map[string]string{
+			"kubernetes.io/bootstrapping": "rbac-defaults",
 		},
 		Rules: []rbacv1.PolicyRule{
 			{
@@ -199,14 +183,10 @@ func CoreDNSConfigMap(spec *k8s.BootstrapManifestsConfigSpec) runtime.Object {
 `
 
 	return &corev1.ConfigMap{
-		TypeMeta: v1.TypeMeta{
-			Kind:       "ConfigMap",
-			APIVersion: corev1.SchemeGroupVersion.Version,
-		},
-		ObjectMeta: v1.ObjectMeta{
-			Name:      "coredns",
-			Namespace: "kube-system",
-		},
+		Kind:       "ConfigMap",
+		APIVersion: corev1.SchemeGroupVersion.Version,
+		Name:       "coredns",
+		Namespace:  "kube-system",
 		Data: map[string]string{
 			"Corefile": coreDNSConfig,
 		},
@@ -216,17 +196,13 @@ func CoreDNSConfigMap(spec *k8s.BootstrapManifestsConfigSpec) runtime.Object {
 // CoreDNSDeployment returns the CoreDNS Deployment object.
 func CoreDNSDeployment(spec *k8s.BootstrapManifestsConfigSpec) runtime.Object {
 	return &appsv1.Deployment{
-		TypeMeta: v1.TypeMeta{
-			Kind:       "Deployment",
-			APIVersion: appsv1.SchemeGroupVersion.String(),
-		},
-		ObjectMeta: v1.ObjectMeta{
-			Name:      "coredns",
-			Namespace: "kube-system",
-			Labels: map[string]string{
-				"k8s-app":            "kube-dns",
-				"kubernetes.io/name": "CoreDNS",
-			},
+		Kind:       "Deployment",
+		APIVersion: appsv1.SchemeGroupVersion.String(),
+		Name:       "coredns",
+		Namespace:  "kube-system",
+		Labels: map[string]string{
+			"k8s-app":            "kube-dns",
+			"kubernetes.io/name": "CoreDNS",
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: new(int32(2)),
@@ -236,13 +212,13 @@ func CoreDNSDeployment(spec *k8s.BootstrapManifestsConfigSpec) runtime.Object {
 					MaxUnavailable: new(intstr.FromInt(1)),
 				},
 			},
-			Selector: &v1.LabelSelector{
+			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					"k8s-app": "kube-dns",
 				},
 			},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: v1.ObjectMeta{
+				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
 						"k8s-app": "kube-dns",
 					},
@@ -252,16 +228,17 @@ func CoreDNSDeployment(spec *k8s.BootstrapManifestsConfigSpec) runtime.Object {
 						"kubernetes.io/os": "linux",
 					},
 					Affinity: &corev1.Affinity{
+						NodeAffinity: nodeAffinity,
 						PodAntiAffinity: &corev1.PodAntiAffinity{
 							PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{
 								{
 									Weight: 100,
 									PodAffinityTerm: corev1.PodAffinityTerm{
-										LabelSelector: &v1.LabelSelector{
-											MatchExpressions: []v1.LabelSelectorRequirement{
+										LabelSelector: &metav1.LabelSelector{
+											MatchExpressions: []metav1.LabelSelectorRequirement{
 												{
 													Key:      "k8s-app",
-													Operator: v1.LabelSelectorOpIn,
+													Operator: metav1.LabelSelectorOpIn,
 													Values:   []string{"kube-dns"},
 												},
 											},
@@ -273,7 +250,7 @@ func CoreDNSDeployment(spec *k8s.BootstrapManifestsConfigSpec) runtime.Object {
 						},
 					},
 					ServiceAccountName: "coredns",
-					PriorityClassName:  "system-cluster-critical",
+					PriorityClassName:  SystemClusterCriticalPriorityClassName,
 					Tolerations: []corev1.Toleration{
 						{
 							Key:      "node-role.kubernetes.io/control-plane",
@@ -332,12 +309,10 @@ func CoreDNSDeployment(spec *k8s.BootstrapManifestsConfigSpec) runtime.Object {
 								},
 							},
 							LivenessProbe: &corev1.Probe{
-								ProbeHandler: corev1.ProbeHandler{
-									HTTPGet: &corev1.HTTPGetAction{
-										Path:   "/health",
-										Port:   intstr.FromInt(8080),
-										Scheme: corev1.URISchemeHTTP,
-									},
+								HTTPGet: &corev1.HTTPGetAction{
+									Path:   "/health",
+									Port:   intstr.FromInt(8080),
+									Scheme: corev1.URISchemeHTTP,
 								},
 								InitialDelaySeconds: 60,
 								TimeoutSeconds:      5,
@@ -345,12 +320,10 @@ func CoreDNSDeployment(spec *k8s.BootstrapManifestsConfigSpec) runtime.Object {
 								FailureThreshold:    5,
 							},
 							ReadinessProbe: &corev1.Probe{
-								ProbeHandler: corev1.ProbeHandler{
-									HTTPGet: &corev1.HTTPGetAction{
-										Path:   "/ready",
-										Port:   intstr.FromInt(8181),
-										Scheme: corev1.URISchemeHTTP,
-									},
+								HTTPGet: &corev1.HTTPGetAction{
+									Path:   "/ready",
+									Port:   intstr.FromInt(8181),
+									Scheme: corev1.URISchemeHTTP,
 								},
 							},
 							SecurityContext: &corev1.SecurityContext{
@@ -367,16 +340,12 @@ func CoreDNSDeployment(spec *k8s.BootstrapManifestsConfigSpec) runtime.Object {
 					Volumes: []corev1.Volume{
 						{
 							Name: "config-volume",
-							VolumeSource: corev1.VolumeSource{
-								ConfigMap: &corev1.ConfigMapVolumeSource{
-									LocalObjectReference: corev1.LocalObjectReference{
-										Name: "coredns",
-									},
-									Items: []corev1.KeyToPath{
-										{
-											Key:  "Corefile",
-											Path: "Corefile",
-										},
+							ConfigMap: &corev1.ConfigMapVolumeSource{
+								Name: "coredns",
+								Items: []corev1.KeyToPath{
+									{
+										Key:  "Corefile",
+										Path: "Corefile",
 									},
 								},
 							},

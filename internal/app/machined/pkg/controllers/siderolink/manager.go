@@ -30,6 +30,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 
 	networkutils "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/network/utils"
+	"github.com/siderolabs/talos/internal/pkg/endpoint"
 	"github.com/siderolabs/talos/pkg/httpdefaults"
 	"github.com/siderolabs/talos/pkg/machinery/client/dialer"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
@@ -324,7 +325,7 @@ func (ctrl *ManagerController) Run(ctx context.Context, r controller.Runtime, lo
 
 		logger.Info(
 			"siderolink connection configured",
-			zap.String("endpoint", ctrl.pd.apiEndpont),
+			zap.String("endpoint", endpoint.Redact(ctrl.pd.apiEndpont)),
 			zap.String("node_uuid", ctrl.pd.nodeUUID),
 			zap.String("node_address", nodeAddress.String()),
 		)
@@ -364,11 +365,11 @@ func (ctrl *ManagerController) provision(ctx context.Context, r controller.Runti
 		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
 
+		proxy := dialer.NewDynamicProxy(httpdefaults.RootCAsTLSConfig)
+
 		conn, connErr := grpc.NewClient(
-			cfg.TypedSpec().Host,
-			withTransportCredentials(cfg.TypedSpec().Insecure),
-			grpc.WithSharedWriteBuffer(true),
-			grpc.WithContextDialer(dialer.DynamicProxyDialerWithTLSConfig(httpdefaults.RootCAsTLSConfig)),
+			proxy.Target(cfg.TypedSpec().Host),
+			append([]grpc.DialOption{withTransportCredentials(cfg.TypedSpec().Insecure)}, proxy.DialOptions()...)...,
 		)
 		if connErr != nil {
 			return nil, fmt.Errorf("error dialing SideroLink endpoint %q: %w", cfg.TypedSpec().Host, connErr)

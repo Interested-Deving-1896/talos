@@ -70,3 +70,166 @@ func TestExtensionServiceConfigMerge(t *testing.T) {
 	assert.Equal(t, "hello world", cfgLeft.ConfigFiles()[0].Content())
 	assert.Equal(t, "bar", cfgLeft.ConfigFiles()[1].Content())
 }
+
+func TestExtensionServiceConfigValidate(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		cfg  func() *extensions.ServiceConfigV1Alpha1
+
+		expectedError string
+	}{
+		{
+			name: "valid",
+			cfg: func() *extensions.ServiceConfigV1Alpha1 {
+				cfg := extensions.NewServicesConfigV1Alpha1()
+				cfg.ServiceName = "nut-client"
+				cfg.ServiceEnvironment = []string{"FOO=BAR"}
+
+				return cfg
+			},
+		},
+		{
+			name: "empty name",
+			cfg: func() *extensions.ServiceConfigV1Alpha1 {
+				cfg := extensions.NewServicesConfigV1Alpha1()
+				cfg.ServiceEnvironment = []string{"FOO=BAR"}
+
+				return cfg
+			},
+			expectedError: "name is required",
+		},
+		{
+			name: "path traversal",
+			cfg: func() *extensions.ServiceConfigV1Alpha1 {
+				cfg := extensions.NewServicesConfigV1Alpha1()
+				cfg.ServiceName = "../../../etc/cri/conf.d"
+				cfg.ServiceEnvironment = []string{"FOO=BAR"}
+
+				return cfg
+			},
+			expectedError: `name "../../../etc/cri/conf.d" is invalid`,
+		},
+		{
+			name: "uppercase",
+			cfg: func() *extensions.ServiceConfigV1Alpha1 {
+				cfg := extensions.NewServicesConfigV1Alpha1()
+				cfg.ServiceName = "Foo"
+				cfg.ServiceEnvironment = []string{"FOO=BAR"}
+
+				return cfg
+			},
+			expectedError: `name "Foo" is invalid`,
+		},
+		{
+			name: "no files or environment",
+			cfg: func() *extensions.ServiceConfigV1Alpha1 {
+				cfg := extensions.NewServicesConfigV1Alpha1()
+				cfg.ServiceName = "foo"
+
+				return cfg
+			},
+			expectedError: `no config files found for extension "foo"`,
+		},
+		{
+			name: "mount path dot-dot",
+			cfg: func() *extensions.ServiceConfigV1Alpha1 {
+				cfg := extensions.NewServicesConfigV1Alpha1()
+				cfg.ServiceName = "foo"
+				cfg.ServiceConfigFiles = []extensions.ConfigFile{
+					{
+						ConfigFileContent:   "bar",
+						ConfigFileMountPath: "/..",
+					},
+				}
+
+				return cfg
+			},
+			expectedError: `extension mount path "/.." is invalid for extension "foo"`,
+		},
+		{
+			name: "mount path root",
+			cfg: func() *extensions.ServiceConfigV1Alpha1 {
+				cfg := extensions.NewServicesConfigV1Alpha1()
+				cfg.ServiceName = "foo"
+				cfg.ServiceConfigFiles = []extensions.ConfigFile{
+					{
+						ConfigFileContent:   "bar",
+						ConfigFileMountPath: "/",
+					},
+				}
+
+				return cfg
+			},
+			expectedError: `extension mount path "/" is invalid for extension "foo"`,
+		},
+		{
+			name: "mount paths sharing a parent",
+			cfg:  withMountPaths("/etc/a/b", "/etc/a-b", "/etc/a/c"),
+		},
+		{
+			name:          "mount path relative",
+			cfg:           withMountPaths("../tailscale/etc/auth"),
+			expectedError: `extension mount path "../tailscale/etc/auth" is invalid for extension "foo"`,
+		},
+		{
+			name:          "mount path not clean",
+			cfg:           withMountPaths("/../tailscale/etc/auth"),
+			expectedError: `extension mount path "/../tailscale/etc/auth" is invalid for extension "foo"`,
+		},
+		{
+			name:          "mount path inner dot-dot",
+			cfg:           withMountPaths("/foo/../../../tailscale/etc/auth"),
+			expectedError: `extension mount path "/foo/../../../tailscale/etc/auth" is invalid for extension "foo"`,
+		},
+		{
+			name:          "mount path trailing slash",
+			cfg:           withMountPaths("/etc/foo/"),
+			expectedError: `extension mount path "/etc/foo/" is invalid for extension "foo"`,
+		},
+		{
+			name:          "mount path duplicated",
+			cfg:           withMountPaths("/etc/foo", "/etc/foo"),
+			expectedError: `extension mount path "/etc/foo" is duplicated for extension "foo"`,
+		},
+		{
+			name:          "mount path under another",
+			cfg:           withMountPaths("/etc/foo/bar/baz", "/etc/foo"),
+			expectedError: `extension mount path "/etc/foo/bar/baz" is under "/etc/foo" for extension "foo"`,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := test.cfg().Validate(validationMode{})
+			if test.expectedError != "" {
+				require.EqualError(t, err, test.expectedError)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func withMountPaths(mountPaths ...string) func() *extensions.ServiceConfigV1Alpha1 {
+	return func() *extensions.ServiceConfigV1Alpha1 {
+		cfg := extensions.NewServicesConfigV1Alpha1()
+		cfg.ServiceName = "foo"
+
+		for _, mountPath := range mountPaths {
+			cfg.ServiceConfigFiles = append(cfg.ServiceConfigFiles, extensions.ConfigFile{
+				ConfigFileContent:   "bar",
+				ConfigFileMountPath: mountPath,
+			})
+		}
+
+		return cfg
+	}
+}
+
+type validationMode struct{}
+
+func (validationMode) String() string        { return "" }
+func (validationMode) RequiresInstall() bool { return false }
+func (validationMode) InContainer() bool     { return false }

@@ -6,19 +6,18 @@
 package provider
 
 import (
-	"bytes"
 	"context"
 	stdlibtls "crypto/tls"
 	stdx509 "crypto/x509"
+	"errors"
 	"fmt"
 	"sync"
 
 	"github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/siderolabs/crypto/tls"
-	"github.com/siderolabs/crypto/x509"
-	"github.com/siderolabs/gen/xslices"
 
+	"github.com/siderolabs/talos/pkg/machinery/pemutils"
 	"github.com/siderolabs/talos/pkg/machinery/resources/secrets"
 )
 
@@ -74,6 +73,8 @@ func NewTLSConfig(ctx context.Context, resources state.State, skipClientCertVeri
 }
 
 // Watch for changes in API certificates and updates the TLSConfig.
+//
+//nolint:gocyclo
 func (tlsConfig *TLSConfig) Watch(ctx context.Context, onUpdate func()) error {
 	for {
 		var event state.Event
@@ -91,6 +92,11 @@ func (tlsConfig *TLSConfig) Watch(ctx context.Context, onUpdate func()) error {
 			// ignore, we'll get another event
 			continue
 		case state.Errored:
+			if ctx.Err() != nil || errors.Is(event.Error, context.Canceled) {
+				// shutting down
+				return nil //nolint:nilerr // we're shutting down, so this is not an error
+			}
+
 			return fmt.Errorf("error watching API certificates: %w", event.Error)
 		}
 
@@ -158,15 +164,7 @@ func (p *certificateProvider) Update(apiCerts *secrets.API) error {
 
 	p.serverCert = &serverCert
 
-	p.ca = bytes.Join(
-		xslices.Map(
-			apiCerts.TypedSpec().AcceptedCAs,
-			func(cert *x509.PEMEncodedCertificate) []byte {
-				return cert.Crt
-			},
-		),
-		nil,
-	)
+	p.ca = pemutils.JoinCertificates(apiCerts.TypedSpec().AcceptedCAs)
 
 	p.caCertPool = stdx509.NewCertPool()
 

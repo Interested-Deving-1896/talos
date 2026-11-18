@@ -1,0 +1,60 @@
+; libvirt/qemu sVirt dynamic labeling.
+(type svirt_t)
+(call system_container_p (svirt_t))
+(typepermissive svirt_t)
+
+(type svirt_tcg_t)
+(call system_container_p (svirt_tcg_t))
+(typepermissive svirt_tcg_t)
+
+(type svirt_image_t)
+(call common_f (svirt_image_t))
+
+(type virt_content_t)
+(call common_f (virt_content_t))
+
+; libvirtd runs as init_t and transitions QEMU via setexeccon.
+(allow init_t self (process (setexec)))
+(allow init_t svirt_t (process (transition dyntransition)))
+(allow init_t svirt_tcg_t (process (transition dyntransition)))
+
+; machined connects directly to guest VNC sockets.
+(allow init_t svirt_t (unix_stream_socket (connectto)))
+(allow init_t svirt_tcg_t (unix_stream_socket (connectto)))
+
+; sVirt domains access their disk images and read-only content.
+(allow svirt_t svirt_image_t (fs_classes (rw)))
+(allow svirt_t virt_content_t (fs_classes (ro)))
+(allow svirt_tcg_t svirt_image_t (fs_classes (rw)))
+(allow svirt_tcg_t virt_content_t (fs_classes (ro)))
+
+; macvtap character devices, one per guest interface attached to a host link.
+;
+; devtmpfs labels these device_t on creation, which is enough to open them, but
+; libvirt insists on looking the default context up in file_contexts before it
+; relabels the fd into the guest's category set. A miss there is fatal to domain
+; start, not a fallback to the devtmpfs label, so the entry below has to exist.
+(type tap_device_t)
+(call protected_device_f (tap_device_t))
+(filecon "/dev/tap[0-9]+" char (system_u object_r tap_device_t (systemLow systemLow)))
+
+; libvirtd opens the device while it is still device_t and relabels the fd.
+(allow init_t device_t (chr_file (relabelfrom)))
+(allow init_t tap_device_t (chr_file (relabelto)))
+(allow init_t tap_device_t (fs_classes (rw)))
+
+; The guest reaches its network through the tap fd it inherits from libvirtd.
+(allow svirt_t tap_device_t (fs_classes (rw)))
+(allow svirt_tcg_t tap_device_t (fs_classes (rw)))
+
+; Storage pool volumes: the writable disks of a virtual machine.
+;
+; A pool is a directory under a user volume's mount, so its files are created
+; ephemeral_t. sVirt relabels a disk into the guest's category set before the
+; domain starts, and a missing relabel rule is fatal to domain start rather
+; than a fallback -- the same way the tap device entry above is.
+;
+; virtstoraged creates the volume and virtqemud relabels it; both run as init_t,
+; which, unlike svirt_t, is not typepermissive.
+(allow init_t ephemeral_t (fs_classes (relabelfrom)))
+(allow init_t svirt_image_t (fs_classes (relabelto rw)))

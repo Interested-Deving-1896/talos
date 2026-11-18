@@ -137,7 +137,7 @@ func ParseCmdlineNetwork(cmdline *procfs.Cmdline, linkNameResolver *network.Link
 
 					ip, err = netip.ParseAddr(fields[0])
 					if err != nil {
-						return settings, fmt.Errorf("cmdline address parse failure: %s", err)
+						return settings, fmt.Errorf("cmdline address parse failure: %w", err)
 					}
 
 					// default is to have complete address masked
@@ -145,7 +145,7 @@ func ParseCmdlineNetwork(cmdline *procfs.Cmdline, linkNameResolver *network.Link
 				case 2:
 					linkConfig.Gateway, err = netip.ParseAddr(fields[2])
 					if err != nil {
-						return settings, fmt.Errorf("cmdline gateway parse failure: %s", err)
+						return settings, fmt.Errorf("cmdline gateway parse failure: %w", err)
 					}
 				case 3:
 					var (
@@ -157,7 +157,7 @@ func ParseCmdlineNetwork(cmdline *procfs.Cmdline, linkNameResolver *network.Link
 					if err != nil {
 						netmask, err = netip.ParseAddr(fields[3])
 						if err != nil {
-							return settings, fmt.Errorf("cmdline netmask parse failure: %s", err)
+							return settings, fmt.Errorf("cmdline netmask parse failure: %w", err)
 						}
 
 						ones, _ = net.IPMask(netmask.AsSlice()).Size()
@@ -283,7 +283,7 @@ func ParseCmdlineNetwork(cmdline *procfs.Cmdline, linkNameResolver *network.Link
 			bondLinkSpec.MTU = uint32(mtu)
 		}
 
-		if err := SetBondMasterLegacy(&bondLinkSpec, &bondOptions); err != nil {
+		if err := SetBondMasterLegacy(&bondLinkSpec, &bondOptions, linkNameResolver.Resolve); err != nil {
 			return settings, fmt.Errorf("error setting bond master: %w", err)
 		}
 

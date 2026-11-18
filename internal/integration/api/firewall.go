@@ -14,18 +14,22 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/hashicorp/go-cleanhttp"
+	"github.com/siderolabs/go-retry/retry"
 	"golang.org/x/sync/errgroup"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/siderolabs/talos/internal/integration/base"
 	"github.com/siderolabs/talos/pkg/machinery/client"
+	"github.com/siderolabs/talos/pkg/machinery/config/machine"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
+	networkcfg "github.com/siderolabs/talos/pkg/machinery/config/types/network"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/nethelpers"
 	"github.com/siderolabs/talos/pkg/machinery/resources/network"
@@ -50,8 +54,9 @@ func (suite *FirewallSuite) SetupTest() {
 		suite.T().Skip("without full cluster state can't guarantee availability of kubelet IPs")
 	}
 
-	// make sure we abort at some point in time, but give enough room for Resets
-	suite.ctx, suite.ctxCancel = context.WithTimeout(context.Background(), 30*time.Second)
+	// make sure we abort at some point in time, but give enough room for Resets and for the
+	// NodePort to become reachable while retrying under network chaos (packet loss/latency).
+	suite.ctx, suite.ctxCancel = context.WithTimeout(context.Background(), 3*time.Minute)
 }
 
 // TearDownTest ...
@@ -65,7 +70,7 @@ func (suite *FirewallSuite) TearDownTest() {
 func (suite *FirewallSuite) TestKubeletAccess() {
 	allNodes := suite.DiscoverNodeInternalIPs(suite.ctx)
 
-	_, err := safe.StateGetByID[*network.NfTablesChain](client.WithNode(suite.ctx, allNodes[0]), suite.Client.COSI, "ingress")
+	_, err := safe.StateGetByID[*network.NfTablesChain](client.WithNode(suite.ctx, allNodes[0]), suite.Client.State(), "ingress")
 	firewallEnabled := err == nil
 
 	eg, ctx := errgroup.WithContext(suite.ctx)
@@ -126,7 +131,7 @@ var nodePortServiceYAML []byte
 func (suite *FirewallSuite) TestNodePortAccess() {
 	allNodes := suite.DiscoverNodeInternalIPs(suite.ctx)
 
-	chain, err := safe.StateGetByID[*network.NfTablesChain](client.WithNode(suite.ctx, allNodes[0]), suite.Client.COSI, "ingress")
+	chain, err := safe.StateGetByID[*network.NfTablesChain](client.WithNode(suite.ctx, allNodes[0]), suite.Client.State(), "ingress")
 	firewallEnabled := err == nil
 	firewallDefaultBlock := firewallEnabled && chain.TypedSpec().Policy == nethelpers.VerdictDrop
 
@@ -150,6 +155,11 @@ func (suite *FirewallSuite) TestNodePortAccess() {
 
 	suite.ApplyManifests(suite.ctx, localPathStorage)
 
+	// A NodePort without a ready endpoint only proves that kube-proxy rejects the
+	// connection. Wait for the workload first, especially when the image comes
+	// from the image cache or an air-gapped registry.
+	suite.Require().NoError(suite.WaitForDeploymentAvailable(suite.ctx, time.Minute, "default", "test-nginx", 1))
+
 	// fetch the NodePort service
 	// read back Service to figure out the ports
 	svc, err := suite.Clientset.CoreV1().Services("default").Get(suite.ctx, "test-nginx", metav1.GetOptions{})
@@ -163,44 +173,263 @@ func (suite *FirewallSuite) TestNodePortAccess() {
 
 	suite.Require().NotZero(nodePort)
 
-	suite.T().Log("sleeping for 5 seconds to allow kube-proxy to update nftables")
+	// probe dials the NodePort once. In the default-block case a single successful connection
+	// is a hard failure; otherwise a not-yet-reachable NodePort is retryable (see below).
+	probe := func(ctx context.Context, node string) error {
+		attemptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
 
-	time.Sleep(5 * time.Second)
+		var d net.Dialer
+
+		conn, err := d.DialContext(attemptCtx, "tcp", net.JoinHostPort(node, strconv.Itoa(nodePort)))
+		if conn != nil {
+			conn.Close() //nolint:errcheck
+		}
+
+		if firewallDefaultBlock {
+			if err == nil {
+				return errors.New("nodePort API should not be available")
+			}
+
+			if !errors.Is(err, os.ErrDeadlineExceeded) && !errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("unexpected error: %w", err)
+			}
+
+			return nil
+		}
+
+		// The NodePort must become reachable, but that takes a moment: the service proxy may not
+		// be ready yet (connection refused) and, under network chaos, packets may be dropped or
+		// delayed (i/o timeout). Both are transient, so retry rather than failing on first attempt.
+		if err != nil {
+			return retry.ExpectedError(fmt.Errorf("nodePort API not available yet: %w", err))
+		}
+
+		return nil
+	}
 
 	eg, ctx := errgroup.WithContext(suite.ctx)
 
 	for _, node := range allNodes {
 		eg.Go(func() error {
-			attemptCtx, cancel := context.WithTimeout(ctx, time.Second)
-			defer cancel()
-
-			var d net.Dialer
-
-			conn, err := d.DialContext(attemptCtx, "tcp", net.JoinHostPort(node, strconv.Itoa(nodePort)))
-			if conn != nil {
-				conn.Close() //nolint:errcheck
-			}
-
-			if firewallDefaultBlock {
-				if err == nil {
-					return errors.New("nodePort API should not be available")
-				}
-
-				if !errors.Is(err, os.ErrDeadlineExceeded) && !errors.Is(err, context.DeadlineExceeded) {
-					return fmt.Errorf("unexpected error: %w", err)
-				}
-			} else if err != nil {
-				// ignore connection refused, as it's not firewall, but rather service proxy not ready yet
-				if !strings.Contains(err.Error(), "connection refused") {
-					return fmt.Errorf("nodePort API should be available: %w", err)
-				}
-			}
-
-			return nil
+			return retry.Constant(time.Minute, retry.WithUnits(time.Second)).RetryWithContext(ctx, func(ctx context.Context) error {
+				return probe(ctx, node)
+			})
 		})
 	}
 
-	suite.Require().NoError(eg.Wait())
+	if err := eg.Wait(); err != nil {
+		suite.describeTestNginx()
+		suite.Require().NoError(err)
+	}
+}
+
+// describeTestNginx dumps pod status, container states and events for the test-nginx
+// deployment to help diagnose why the NodePort never became reachable.
+func (suite *FirewallSuite) describeTestNginx() {
+	dumpCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pods, err := suite.Clientset.CoreV1().Pods("default").List(dumpCtx, metav1.ListOptions{LabelSelector: "app=test-nginx"})
+	if err != nil {
+		suite.T().Logf("failed to list test-nginx pods: %v", err)
+
+		return
+	}
+
+	if len(pods.Items) == 0 {
+		suite.T().Log("no test-nginx pods found")
+	}
+
+	for _, pod := range pods.Items {
+		suite.T().Logf("pod %s: phase=%s node=%s reason=%q message=%q",
+			pod.Name, pod.Status.Phase, pod.Spec.NodeName, pod.Status.Reason, pod.Status.Message)
+
+		for _, cs := range pod.Status.ContainerStatuses {
+			switch {
+			case cs.State.Waiting != nil:
+				suite.T().Logf("  container %s waiting: %s: %s", cs.Name, cs.State.Waiting.Reason, cs.State.Waiting.Message)
+			case cs.State.Terminated != nil:
+				suite.T().Logf("  container %s terminated: %s: %s", cs.Name, cs.State.Terminated.Reason, cs.State.Terminated.Message)
+			case cs.State.Running != nil:
+				suite.T().Logf("  container %s running, ready=%t", cs.Name, cs.Ready)
+			}
+		}
+
+		events, err := suite.Clientset.CoreV1().Events("default").List(dumpCtx, metav1.ListOptions{
+			FieldSelector: "involvedObject.name=" + pod.Name,
+		})
+		if err != nil {
+			suite.T().Logf("  failed to list events for pod %s: %v", pod.Name, err)
+
+			continue
+		}
+
+		for _, ev := range events.Items {
+			suite.T().Logf("  event %s %s: %s", ev.Type, ev.Reason, ev.Message)
+		}
+	}
+}
+
+const (
+	// managementLinkAlias is the alias the provisioner gives the management link of every node.
+	managementLinkAlias = "net0"
+
+	// probeTargetNamespace is the namespace the probe target pod runs in.
+	probeTargetNamespace = "default"
+)
+
+//nolint:gocyclo
+func (suite *FirewallSuite) TestLinkIngress() {
+	if suite.BGPCLOSEnabled {
+		suite.T().Skip("skipping LinkIngress tests on full-CLOS clusters: nodes have no shared management link")
+	}
+
+	if suite.Cluster.Provisioner() != base.ProvisionerQEMU {
+		suite.T().Skip("skipping LinkIngress tests on non qemu provisioner")
+	}
+
+	target := suite.RandomDiscoveredNodeInternalIP(machine.TypeWorker)
+	targetCtx := client.WithNode(suite.ctx, target)
+
+	var prober string
+
+	for _, node := range suite.DiscoverNodeInternalIPs(suite.ctx) {
+		if node != target {
+			prober = node
+
+			break
+		}
+	}
+
+	suite.Require().NotEmpty(prober, "expected at least two nodes")
+
+	targetAddr, err := netip.ParseAddr(target)
+	suite.Require().NoError(err)
+
+	targetNode, err := suite.GetK8sNodeByInternalIP(suite.ctx, target)
+	suite.Require().NoError(err)
+
+	probeTarget, err := suite.NewPod("link-ingress-target")
+	suite.Require().NoError(err)
+
+	probeTarget = probeTarget.WithNodeName(targetNode.Name).WithNamespace(probeTargetNamespace)
+
+	suite.Require().NoError(probeTarget.Create(suite.ctx, time.Minute))
+
+	suite.T().Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cleanupCancel()
+
+		probeTarget.Delete(cleanupCtx) //nolint:errcheck
+	})
+
+	targetPod, err := suite.Clientset.CoreV1().Pods(probeTargetNamespace).Get(suite.ctx, probeTarget.Name(), metav1.GetOptions{})
+	suite.Require().NoError(err)
+
+	probeAddr, err := netip.ParseAddr(targetPod.Status.PodIP)
+	suite.Require().NoError(err)
+
+	links, err := safe.ReaderListAll[*network.LinkStatus](targetCtx, suite.Client.State())
+	suite.Require().NoError(err)
+
+	var linkName string
+
+	for link := range links.All() {
+		if link.TypedSpec().Alias == managementLinkAlias {
+			linkName = link.Metadata().ID()
+
+			break
+		}
+	}
+
+	suite.Require().NotEmpty(linkName, "expected to find a link aliased %q", managementLinkAlias)
+
+	targetCfg, err := suite.ReadConfigFromNode(targetCtx)
+	suite.Require().NoError(err)
+
+	var linkIngressEnabled bool
+
+	for _, doc := range targetCfg.Documents() {
+		// the provisioner's default config refers to the link by its alias, not by the kernel name
+		if ingress, ok := doc.(*networkcfg.LinkIngressConfigV1Alpha1); ok && (ingress.Name() == linkName || ingress.Name() == managementLinkAlias) {
+			linkIngressEnabled = true
+
+			break
+		}
+	}
+
+	suite.T().Logf(
+		"link %q on node %q (link ingress enabled: %t), probing pod %s/%s (%s) from node %q",
+		linkName, target, linkIngressEnabled, probeTargetNamespace, probeTarget.Name(), probeAddr, prober,
+	)
+
+	proberNode, err := suite.GetK8sNodeByInternalIP(suite.ctx, prober)
+	suite.Require().NoError(err)
+
+	probePod, err := suite.NewPrivilegedPod("link-ingress-probe")
+	suite.Require().NoError(err)
+
+	probePod = probePod.WithNodeName(proberNode.Name).WithQuiet(true)
+
+	suite.Require().NoError(probePod.Create(suite.ctx, time.Minute))
+
+	suite.T().Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cleanupCancel()
+
+		probePod.Delete(cleanupCtx) //nolint:errcheck
+	})
+
+	probePrefix := netip.PrefixFrom(probeAddr, probeAddr.BitLen())
+
+	proberLinkCfg := networkcfg.NewLinkConfigV1Alpha1(managementLinkAlias)
+	proberLinkCfg.LinkRoutes = []networkcfg.RouteConfig{
+		{
+			RouteDestination: meta.Prefix{Prefix: probePrefix},
+			RouteGateway:     meta.Addr{Addr: targetAddr},
+		},
+	}
+
+	suite.T().Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cleanupCancel()
+
+		// drop just the route the test added
+		suite.PatchMachineConfig(client.WithNode(cleanupCtx, prober), map[string]any{
+			"apiVersion": "v1alpha1",
+			"kind":       networkcfg.LinkKind,
+			"name":       managementLinkAlias,
+			"routes": []any{
+				map[string]any{
+					"destination": probePrefix.String(),
+					"$patch":      "delete",
+				},
+			},
+		})
+	})
+
+	suite.PatchMachineConfig(client.WithNode(suite.ctx, prober), proberLinkCfg)
+
+	assertProbe := func(expectReachable bool) {
+		suite.Require().NoError(retry.Constant(30*time.Second, retry.WithUnits(time.Second)).RetryWithContext(
+			suite.ctx,
+			func(ctx context.Context) error {
+				_, _, err := probePod.Exec(ctx, fmt.Sprintf("ping -c 1 -W 1 %s", probeAddr))
+
+				switch {
+				case expectReachable && err != nil:
+					return retry.ExpectedErrorf("probe address is not reachable yet: %s", err)
+				case !expectReachable && err == nil:
+					return retry.ExpectedErrorf("probe address is still reachable")
+				}
+
+				return nil
+			},
+		))
+	}
+
+	assertProbe(!linkIngressEnabled)
 }
 
 func init() {

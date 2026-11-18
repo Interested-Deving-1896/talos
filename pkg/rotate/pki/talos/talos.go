@@ -23,6 +23,7 @@ import (
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
+	"github.com/siderolabs/talos/pkg/machinery/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/encoder"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
@@ -177,7 +178,7 @@ func (r *rotator) fetchCurrentCA(ctx context.Context) error {
 		r.opts.ClusterInfo.NodesByType(machine.TypeControlPlane)...,
 	)[0]
 
-	osRoot, err := safe.StateGetByID[*secretsres.OSRoot](client.WithNode(ctx, firstNode.InternalIP.String()), r.opts.CurrentClient.COSI, secretsres.OSRootID)
+	osRoot, err := safe.StateGetByID[*secretsres.OSRoot](client.WithNode(ctx, firstNode.InternalIP.String()), r.opts.CurrentClient.State(), secretsres.OSRootID)
 	if err != nil {
 		return fmt.Errorf("error fetching existing Talos CA: %w", err)
 	}
@@ -374,8 +375,10 @@ func (r *rotator) patchAllNodes(ctx context.Context, c *client.Client, patchFunc
 				continue
 			}
 
-			if err := helpers.PatchNodeConfig(ctx, c, node.InternalIP.String(), r.opts.EncoderOption, func(config *v1alpha1.Config) error {
-				return patchFunc(machineType, config)
+			if err := helpers.PatchNodeConfig(ctx, c, node.InternalIP.String(), r.opts.EncoderOption, func(provider config.Provider) (config.Provider, error) {
+				return provider.PatchV1Alpha1(func(c *v1alpha1.Config) error {
+					return patchFunc(machineType, c)
+				})
 			}); err != nil {
 				return fmt.Errorf("error patching node %s: %w", node.InternalIP, err)
 			}

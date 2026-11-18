@@ -21,12 +21,14 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	"github.com/containerd/containerd/v2/pkg/oci"
 	"github.com/containerd/errdefs"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/siderolabs/talos/internal/app/machined/pkg/system/events"
-	"github.com/siderolabs/talos/internal/app/machined/pkg/system/pid"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/system/runner"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/system/runner/internal/lastlog"
 	"github.com/siderolabs/talos/internal/pkg/cgroup"
+	"github.com/siderolabs/talos/internal/pkg/containerpid"
 	"github.com/siderolabs/talos/internal/pkg/selinux"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 )
@@ -37,14 +39,15 @@ type containerdRunner struct {
 	opts         *runner.Options
 	logToConsole bool
 
-	stop    chan struct{}
-	stopped chan struct{}
-
 	client      *containerd.Client
 	ctx         context.Context //nolint:containedctx
 	container   containerd.Container
 	stdinCloser *StdinCloser
 }
+
+const taskWaitRetryInterval = time.Second
+
+var errTaskWaitClosed = errors.New("task wait stream closed without an exit status")
 
 // NewRunner creates runner.Runner that runs a container in containerd.
 func NewRunner(logToConsole bool, args *runner.Args, setters ...runner.Option) runner.Runner {
@@ -52,8 +55,6 @@ func NewRunner(logToConsole bool, args *runner.Args, setters ...runner.Option) r
 		args:         args,
 		opts:         runner.DefaultOptions(),
 		logToConsole: logToConsole,
-		stop:         make(chan struct{}),
-		stopped:      make(chan struct{}),
 	}
 
 	for _, setter := range setters {
@@ -74,6 +75,18 @@ func (c *containerdRunner) Open() error {
 	if err != nil {
 		return err
 	}
+
+	// Callers do not Close a runner whose Open failed, so anything that fails past this point has to
+	// release the client itself or it leaks along with its gRPC connection.
+	opened := false
+
+	defer func() {
+		if !opened {
+			c.client.Close() //nolint:errcheck
+
+			c.client = nil
+		}
+	}()
 
 	var image containerd.Image
 
@@ -110,35 +123,47 @@ func (c *containerdRunner) Open() error {
 		return fmt.Errorf("failed to create container %q: %w", c.args.ID, err)
 	}
 
+	opened = true
+
 	return nil
 }
 
 // Close implements runner.Runner interface.
+//
+// The client is closed whatever happens to the container: a task that would not die after SIGKILL is
+// still holding its container, so deleting it fails, and returning there would leak the client.
 func (c *containerdRunner) Close() error {
+	var errs error
+
 	if c.container != nil {
-		err := c.container.Delete(c.ctx, containerd.WithSnapshotCleanup)
-		if err != nil {
-			return err
+		if err := c.container.Delete(c.ctx, containerd.WithSnapshotCleanup); err != nil {
+			errs = errors.Join(errs, err)
 		}
 	}
 
-	if c.client == nil {
-		return nil
+	if c.client != nil {
+		errs = errors.Join(errs, c.client.Close())
 	}
 
-	return c.client.Close()
+	return errs
 }
 
-// Run implements runner.Runner interface
+// Run implements runner.Runner interface.
+//
+// Canceling ctx starts the graceful stop; every containerd call keeps using c.ctx, which is not
+// derived from it, because the kill and delete have to run after the cancellation rather than be
+// canceled by it.
+//
+// A non-zero exit is reported both ways: in Status.ExitCode, and as an error, because the restart
+// policies decide purely on the error and a task that exits non-zero must not read as success.
 //
 //nolint:gocyclo,cyclop
-func (c *containerdRunner) Run(eventSink events.Recorder, pidRecorder pid.Recorder) error {
-	defer close(c.stopped)
-
+func (c *containerdRunner) Run(ctx context.Context, eventSink events.Recorder, onStart runner.OnStart) (runner.Status, error) {
 	var (
-		task containerd.Task
-		logW io.WriteCloser
-		err  error
+		task   containerd.Task
+		logW   io.WriteCloser
+		status runner.Status
+		err    error
 	)
 
 	// attempt to clean up a task if it already exists
@@ -148,33 +173,38 @@ func (c *containerdRunner) Run(eventSink events.Recorder, pidRecorder pid.Record
 
 		s, err = task.Wait(c.ctx)
 		if err != nil {
-			return fmt.Errorf("failed to wait for the task %q: %w", c.args.ID, err)
+			return status, fmt.Errorf("failed to wait for the task %q: %w", c.args.ID, err)
 		}
 
 		err = task.Kill(c.ctx, syscall.SIGKILL, containerd.WithKillAll)
 		if err != nil && !errdefs.IsNotFound(err) {
-			return fmt.Errorf("failed to kill the task %q: %w", c.args.ID, err)
+			return status, fmt.Errorf("failed to kill the task %q: %w", c.args.ID, err)
 		}
 
 		select {
 		case <-s:
-		case <-c.stop:
-			return nil
+		case <-ctx.Done():
+			return status, nil
 		}
 
 		if _, err = task.Delete(c.ctx); err != nil {
-			return fmt.Errorf("failed to clean up task %q: %w", c.args.ID, err)
+			return status, fmt.Errorf("failed to clean up task %q: %w", c.args.ID, err)
 		}
 	}
 
-	logW, err = c.opts.LoggingManager.ServiceLog(c.args.ID).Writer()
-	if err != nil {
-		return fmt.Errorf("error creating log: %w", err)
+	logID := c.opts.LogID
+	if logID == "" {
+		logID = c.args.ID
 	}
 
-	cg, err := cgroup.CreateCgroup(c.opts.CgroupPath)
+	logW, err = c.opts.LoggingManager.ServiceLog(logID).Writer()
 	if err != nil {
-		return fmt.Errorf("error creating cgroup: %w", err)
+		return status, fmt.Errorf("error creating log: %w", err)
+	}
+
+	cg, err := c.createCgroup()
+	if err != nil {
+		return status, fmt.Errorf("error creating cgroup: %w", err)
 	}
 
 	// If the task is not cleaned up by containerd or another error
@@ -200,7 +230,7 @@ func (c *containerdRunner) Run(eventSink events.Recorder, pidRecorder pid.Record
 
 	r, err := c.StdinReader()
 	if err != nil {
-		return fmt.Errorf("failed to create stdin reader: %w", err)
+		return status, fmt.Errorf("failed to create stdin reader: %w", err)
 	}
 
 	creator := cio.NewCreator(cio.WithStreams(r, w, w))
@@ -208,7 +238,7 @@ func (c *containerdRunner) Run(eventSink events.Recorder, pidRecorder pid.Record
 	// Create the task and start it.
 	task, err = c.container.NewTask(c.ctx, creator)
 	if err != nil {
-		return fmt.Errorf("failed to create task: %q: %w", c.args.ID, err)
+		return status, fmt.Errorf("failed to create task: %q: %w", c.args.ID, err)
 	}
 
 	if r != nil {
@@ -219,83 +249,169 @@ func (c *containerdRunner) Run(eventSink events.Recorder, pidRecorder pid.Record
 	defer task.Delete(c.ctx) //nolint:errcheck
 
 	if err = task.Start(c.ctx); err != nil {
-		return fmt.Errorf("failed to start task: %q: %w", c.args.ID, err)
+		return status, fmt.Errorf("failed to start task: %q: %w", c.args.ID, err)
 	}
 
-	eventSink(events.StateRunning, "Started task %s (PID %d) for container %s", task.ID(), task.Pid(), c.container.ID())
+	// The task runs whether or not its PID is known here: without one it only cannot be recorded,
+	// which is not worth taking the task down for.
+	pid, err := c.resolvePID(task)
 
-	if err := pidRecorder(c.args.ID, int32(task.Pid()), false); err != nil {
-		return fmt.Errorf("failed to record pid for task %q: %w", c.args.ID, err)
+	switch {
+	case err == nil:
+		eventSink(events.StateRunning, "Started task %s (PID %d) for container %s", task.ID(), pid, c.container.ID())
+	case errors.Is(err, containerpid.ErrGone):
+		eventSink(events.StateRunning, "Started task %s for container %s, its init was gone before its PID was resolved", task.ID(), c.container.ID())
+	default:
+		log.Printf("failed to resolve PID of task %q, it runs without a recorded PID: %v", c.args.ID, err)
+
+		eventSink(events.StateRunning, "Started task %s (PID is not known) for container %s", task.ID(), c.container.ID())
 	}
 
-	defer func() {
-		if err := pidRecorder(c.args.ID, int32(task.Pid()), true); err != nil {
-			log.Printf("error clearing pid: %v", err)
+	status.Started = true
+
+	if onStart != nil {
+		onStart(pid)
+	}
+
+	recovering := false
+
+taskWaitLoop:
+	for {
+		statusC, waitErr := task.Wait(c.ctx)
+		if waitErr != nil {
+			return status, fmt.Errorf("failed waiting for task %q: %w", c.args.ID, waitErr)
 		}
-	}()
+
+		select {
+		case taskStatus, ok := <-statusC:
+			retry, statusErr := retryTaskWait(taskStatus, ok)
+			if statusErr != nil {
+				return status, fmt.Errorf("failed waiting for task %q: %w", c.args.ID, statusErr)
+			}
+
+			if !retry {
+				code := taskStatus.ExitCode()
+				status.ExitCode = int(code) //nolint:gosec
+
+				if code != 0 {
+					return status, fmt.Errorf("task %q failed: exit code %d (last log %q)", c.args.ID, code, lastLog.GetLastLog())
+				}
+
+				return status, nil
+			}
+
+			if !recovering {
+				log.Printf("task wait stream interrupted, waiting for containerd: %v", taskStatus.Error())
+			}
+
+			recovering = true
+
+			select {
+			case <-ctx.Done():
+				break taskWaitLoop
+			case <-time.After(taskWaitRetryInterval):
+			}
+		case <-ctx.Done():
+			break taskWaitLoop
+		}
+	}
+
+	// graceful stop the task
+	eventSink(
+		events.StateStopping,
+		"Sending SIGTERM to task %s (PID %d, container %s)",
+		task.ID(),
+		pid,
+		c.container.ID(),
+	)
+
+	if err = task.Kill(c.ctx, syscall.SIGTERM, containerd.WithKillAll); err != nil {
+		return status, fmt.Errorf("error sending SIGTERM: %w", err)
+	}
 
 	statusC, err := task.Wait(c.ctx)
 	if err != nil {
-		return fmt.Errorf("failed waiting for task: %q: %w", c.args.ID, err)
-	}
-
-	select {
-	case status := <-statusC:
-		code := status.ExitCode()
-		if code != 0 {
-			return fmt.Errorf("task %q failed: exit code %d (last log %q)", c.args.ID, code, lastLog.GetLastLog())
-		}
-
-		return nil
-	case <-c.stop:
-		// graceful stop the task
-		eventSink(
-			events.StateStopping,
-			"Sending SIGTERM to task %s (PID %d, container %s)",
-			task.ID(),
-			task.Pid(),
-			c.container.ID(),
-		)
-
-		if err = task.Kill(c.ctx, syscall.SIGTERM, containerd.WithKillAll); err != nil {
-			return fmt.Errorf("error sending SIGTERM: %w", err)
-		}
+		return status, fmt.Errorf("failed waiting for task after SIGTERM: %w", err)
 	}
 
 	select {
 	case <-statusC:
 		// stopped process exited
-		return nil
+		return status, nil
 	case <-time.After(c.opts.GracefulShutdownTimeout):
 		// kill the process
 		eventSink(
 			events.StateStopping,
 			"Sending SIGKILL to task %s (PID %d, container %s)",
 			task.ID(),
-			task.Pid(),
+			pid,
 			c.container.ID(),
 		)
 
 		if err = task.Kill(c.ctx, syscall.SIGKILL, containerd.WithKillAll); err != nil {
-			return fmt.Errorf("error sending SIGKILL: %w", err)
+			return status, fmt.Errorf("error sending SIGKILL: %w", err)
 		}
 	}
 
-	<-statusC
+	// Bounded, because SIGKILL is not the end of every story: a task stuck in uninterruptible sleep
+	// never reaps, and waiting for it forever would hold up whatever is driving the stop.
+	select {
+	case <-statusC:
+	case <-time.After(constants.TaskKillWaitTimeout):
+		return status, fmt.Errorf("task %q did not exit after SIGKILL", c.args.ID)
+	}
 
-	return logW.Close()
+	return status, logW.Close()
 }
 
-// Stop implements runner.Runner interface.
-func (c *containerdRunner) Stop() error {
-	close(c.stop)
+// resolvePID translates the PID of the task, as containerd reports it, into the PID namespace of
+// machined: the CRI containerd runs in the sandbox PID namespace when workload isolation is on.
+//
+// The PID is 0 on error, which is [containerpid.ErrGone] if the task init has already exited.
+func (c *containerdRunner) resolvePID(task containerd.Task) (int32, error) {
+	// The system containerd always shares the PID namespace of machined, so there is nothing to
+	// translate, and nothing which could fail on the way: apid, trustd and the extension services
+	// would otherwise depend on one more containerd call to get their PID recorded.
+	if c.opts.ContainerdAddress == constants.SystemContainerdAddress {
+		return int32(task.Pid()), nil //nolint:gosec
+	}
 
-	<-c.stopped
+	var cgroupPath string
 
-	c.stop = make(chan struct{})
-	c.stopped = make(chan struct{})
+	if c.opts.CgroupPath != "" {
+		cgroupPath = cgroup.Path(c.opts.CgroupPath)
+	}
 
-	return nil
+	return containerpid.ResolveTask(c.ctx, c.client, cgroupPath, task)
+}
+
+func retryTaskWait(status containerd.ExitStatus, ok bool) (bool, error) {
+	if !ok {
+		return false, errTaskWaitClosed
+	}
+
+	if err := status.Error(); err != nil {
+		if isContainerdUnavailable(err) {
+			return true, nil
+		}
+
+		return false, err
+	}
+
+	return false, nil
+}
+
+func isContainerdUnavailable(err error) bool {
+	return errdefs.IsUnavailable(err) || status.Code(err) == codes.Unavailable
+}
+
+// createCgroup creates the cgroup for the task, with caller-supplied limits when there are any.
+func (c *containerdRunner) createCgroup() (cgroup.CommonCgroup, error) {
+	if c.opts.CgroupResources != nil {
+		return cgroup.CreateCgroupWithResources(c.opts.CgroupPath, c.opts.CgroupResources)
+	}
+
+	return cgroup.CreateCgroup(c.opts.CgroupPath)
 }
 
 func (c *containerdRunner) newContainerOpts(
@@ -339,10 +455,15 @@ func (c *containerdRunner) newOCISpecOpts(image oci.Image) []oci.SpecOpts {
 		specOpts,
 		oci.WithProcessArgs(c.args.ProcessArgs...),
 		oci.WithEnv(c.opts.Env),
-		oci.WithHostHostsFile,
-		oci.WithHostResolvconf,
 		oci.WithNoNewPrivileges,
 	)
+
+	if c.opts.HostNetworkFiles {
+		specOpts = append(specOpts,
+			oci.WithHostHostsFile,
+			oci.WithHostResolvconf,
+		)
+	}
 
 	if c.opts.OOMScoreAdj != 0 {
 		specOpts = append(
@@ -363,17 +484,14 @@ func (c *containerdRunner) newOCISpecOpts(image oci.Image) []oci.SpecOpts {
 		c.opts.OCISpecOpts...,
 	)
 
-	if c.opts.OverrideSeccompProfile != nil {
-		specOpts = append(
-			specOpts,
-			WithCustomSeccompProfile(c.opts.OverrideSeccompProfile),
-		)
-	} else {
-		specOpts = append(
-			specOpts,
-			seccomp.WithDefaultProfile(), // add seccomp profile last, as it depends on process capabilities
-		)
+	// Applied after every caller option, so that it sees the final process user and capability
+	// sets. Ahead of seccomp is fine: the default profile only looks at the bounding and effective
+	// sets, which this leaves alone.
+	if c.opts.AmbientCapabilitiesForNonRoot {
+		specOpts = append(specOpts, WithAmbientFromPermittedForNonRoot)
 	}
+
+	specOpts = append(specOpts, c.seccompSpecOpt())
 
 	if selinux.IsEnabled() {
 		if c.opts.SelinuxLabel != "" {
@@ -390,6 +508,23 @@ func (c *containerdRunner) newOCISpecOpts(image oci.Image) []oci.SpecOpts {
 	}
 
 	return specOpts
+}
+
+// seccompSpecOpt returns the seccomp option for the container.
+//
+// It must be applied after every other process option: the default profile depends on the
+// process capabilities, and an explicit profile (or unconfined) must not be replaced by anything.
+func (c *containerdRunner) seccompSpecOpt() oci.SpecOpts {
+	switch {
+	case c.opts.SeccompUnconfined:
+		return oci.WithSeccompUnconfined
+	case c.opts.SeccompProfile != nil:
+		return WithSeccompProfile(c.opts.SeccompProfile)
+	case c.opts.OverrideSeccompProfile != nil:
+		return WithCustomSeccompProfile(c.opts.OverrideSeccompProfile)
+	default:
+		return seccomp.WithDefaultProfile()
+	}
 }
 
 func (c *containerdRunner) String() string {

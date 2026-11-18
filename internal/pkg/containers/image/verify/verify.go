@@ -14,8 +14,7 @@ import (
 	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/errdefs"
 	"github.com/cosi-project/runtime/pkg/state"
-	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/sigstore/cosign/v3/pkg/cosign"
+	"github.com/distribution/reference"
 	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore/pkg/cryptoutils"
 	sigsig "github.com/sigstore/sigstore/pkg/signature"
@@ -23,6 +22,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/siderolabs/talos/internal/pkg/containers/image/imageref"
 	ourcosign "github.com/siderolabs/talos/internal/pkg/containers/image/verify/internal/cosign"
 	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/resources/security"
@@ -34,6 +34,10 @@ type TagFetcher = ourcosign.TagFetcher
 
 // ImageSignature verifies image signature within Talos source code.
 //
+// The image reference is normalized with [imageref] before anything else: the verification rules
+// are matched against the canonical reference, and the digested reference returned on success is
+// in the same namespace, so that the image which was verified is the image which gets pulled.
+//
 // tagFetcher (optional) is invoked when the resolver's digest-based manifest
 // fetch returns NotFound — see [TagFetcher].
 //
@@ -43,21 +47,29 @@ func ImageSignature(
 ) (*machine.ImageServiceVerifyResponse, error) {
 	logger = logger.With(zap.String("image_ref", imageRef))
 
-	inRef, err := name.ParseReference(imageRef)
+	namedRef, err := imageref.Parse(imageRef)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "image reference is invalid: %s", err)
 	}
 
-	ruleMatcher, err := security.ImageVerificationRuleMatcher(ctx, resources)
+	normalizedRef := namedRef.String()
+
+	logger = logger.With(zap.String("normalized_image_ref", normalizedRef))
+
+	ruleMatcher, err := NewRuleMatcher(ctx, resources)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to create image verification rule matcher: %s", err)
 	}
 
-	logger.Debug("finding matching image verification rule for image reference", zap.Stringer("image_ref_context", inRef.Context()))
+	logger.Debug("finding matching image verification rule for image reference")
 
-	matchedRule := ruleMatcher(inRef.Context().String())
+	matchedRule, err := ruleMatcher(normalizedRef)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "failed to match image verification rules: %s", err)
+	}
+
 	if matchedRule == nil {
-		logger.Info("no matched image verification rule, allowing by default", zap.Stringer("image_ref_context", inRef.Context()))
+		logger.Info("no matched image verification rule, allowing by default")
 
 		return &machine.ImageServiceVerifyResponse{
 			Verified: false,
@@ -81,13 +93,9 @@ func ImageSignature(
 	}
 
 	// resolve the image reference to a digest reference if needed
-	var (
-		digestRef name.Digest
-		ok        bool
-	)
-
-	if digestRef, ok = inRef.(name.Digest); !ok {
-		_, desc, err := resolver.Resolve(ctx, inRef.String())
+	digestRef, ok := namedRef.(reference.Canonical)
+	if !ok {
+		_, desc, err := resolver.Resolve(ctx, normalizedRef)
 		if err != nil {
 			if errdefs.IsNotFound(err) {
 				logger.Info("image reference not found during resolution", zap.Error(err))
@@ -98,14 +106,14 @@ func ImageSignature(
 			return nil, status.Errorf(codes.Internal, "failed to resolve image reference: %s", err)
 		}
 
-		digestRef, err = name.NewDigest(inRef.Context().Name() + "@" + desc.Digest.String())
+		digestRef, err = reference.WithDigest(reference.TrimNamed(namedRef), desc.Digest)
 		if err != nil {
 			return nil, status.Errorf(codes.Internal, "failed to construct digest reference: %s", err)
 		}
 	}
 
-	// convert the rule to cosign check opts
-	checkOpts, err := cosignCheckOptsFromRule(ctx, matchedRule.TypedSpec(), resources)
+	// convert the rule to signature check opts
+	checkOpts, err := checkOptsFromRule(ctx, matchedRule.TypedSpec(), resources)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to convert verification rule to cosign check options: %s", err)
 	}
@@ -145,40 +153,33 @@ func getTrustedRoot(ctx context.Context, resources state.State) (root.TrustedMat
 	return root.NewTrustedRootFromJSON([]byte(tufData.TypedSpec().JSONData))
 }
 
-func cosignCheckOptsFromRule(ctx context.Context, rule *security.ImageVerificationRuleSpec, resources state.State) (cosign.CheckOpts, error) {
+func checkOptsFromRule(ctx context.Context, rule *security.ImageVerificationRuleSpec, resources state.State) (ourcosign.CheckOpts, error) {
 	switch {
 	case rule.KeylessVerifier != nil:
 		trustedRoot, err := getTrustedRoot(ctx, resources)
 		if err != nil {
-			return cosign.CheckOpts{}, fmt.Errorf("failed to get trusted root: %w", err)
+			return ourcosign.CheckOpts{}, fmt.Errorf("failed to get trusted root: %w", err)
 		}
 
-		return cosign.CheckOpts{
-			TrustedMaterial: trustedRoot,
-			Identities: []cosign.Identity{
-				{
-					Subject:       rule.KeylessVerifier.Subject,
-					SubjectRegExp: rule.KeylessVerifier.SubjectRegex,
-					Issuer:        rule.KeylessVerifier.Issuer,
-				},
-			},
-		}, nil
+		return ourcosign.NewKeylessCheckOpts(
+			trustedRoot,
+			rule.KeylessVerifier.Issuer,
+			rule.KeylessVerifier.Subject,
+			rule.KeylessVerifier.SubjectRegex,
+		)
 	case rule.PublicKeyVerifier != nil:
 		pub, err := cryptoutils.UnmarshalPEMToPublicKey([]byte(rule.PublicKeyVerifier.Certificate))
 		if err != nil {
-			return cosign.CheckOpts{}, fmt.Errorf("failed to unmarshal public key: %w", err)
+			return ourcosign.CheckOpts{}, fmt.Errorf("failed to unmarshal public key: %w", err)
 		}
 
 		verifier, err := sigsig.LoadVerifier(pub, crypto.SHA256)
 		if err != nil {
-			return cosign.CheckOpts{}, fmt.Errorf("failed to load public key: %w", err)
+			return ourcosign.CheckOpts{}, fmt.Errorf("failed to load public key: %w", err)
 		}
 
-		return cosign.CheckOpts{
-			Offline:     true,
-			SigVerifier: verifier,
-		}, nil
+		return ourcosign.NewPublicKeyCheckOpts(verifier), nil
 	default:
-		return cosign.CheckOpts{}, fmt.Errorf("unsupported verifier type in rule")
+		return ourcosign.CheckOpts{}, fmt.Errorf("unsupported verifier type in rule")
 	}
 }

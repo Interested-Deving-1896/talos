@@ -17,10 +17,10 @@ import (
 	"slices"
 
 	"github.com/google/uuid"
+	"github.com/siderolabs/gen/xerrors"
 	"github.com/siderolabs/gen/xslices"
 	"github.com/siderolabs/go-blockdevice/v2/blkid"
 	"github.com/siderolabs/go-blockdevice/v2/block"
-	"github.com/siderolabs/go-blockdevice/v2/partitioning"
 	"github.com/siderolabs/go-blockdevice/v2/partitioning/gpt"
 	"github.com/siderolabs/go-pointer"
 	"github.com/siderolabs/go-procfs/procfs"
@@ -117,7 +117,7 @@ func Install(ctx context.Context, p runtime.Platform, mode Mode, opts *Options) 
 	if overlayPresent() {
 		extraOptionsBytes, err := os.ReadFile(constants.ImagerOverlayExtraOptionsPath)
 		if err != nil {
-			return err
+			return xerrors.NewTaggedf[DependencyTag]("%w", err)
 		}
 
 		var extraOptions overlay.ExtraOptions
@@ -126,7 +126,7 @@ func Install(ctx context.Context, p runtime.Platform, mode Mode, opts *Options) 
 		decoder.KnownFields(true)
 
 		if err := decoder.Decode(&extraOptions); err != nil {
-			return fmt.Errorf("failed to decode extra options: %w", err)
+			return xerrors.NewTaggedf[InvalidInputTag]("failed to decode extra options: %w", err)
 		}
 
 		opts.OverlayInstaller = executor.New(constants.ImagerOverlayInstallerDefaultPath)
@@ -145,13 +145,13 @@ func Install(ctx context.Context, p runtime.Platform, mode Mode, opts *Options) 
 
 	// first defaults, then extra kernel args to allow extra kernel args to override defaults
 	if err := cmdline.AppendAll(kernel.DefaultArgs(quirks.Quirks{})); err != nil {
-		return err
+		return xerrors.NewTagged[InvalidInputTag](err)
 	}
 
 	if opts.OverlayInstaller != nil {
 		overlayOpts, getOptsErr := opts.OverlayInstaller.GetOptions(ctx, opts.ExtraOptions)
 		if getOptsErr != nil {
-			return fmt.Errorf("failed to get overlay installer options: %w", getOptsErr)
+			return xerrors.NewTaggedf[DependencyTag]("failed to get overlay installer options: %w", getOptsErr)
 		}
 
 		opts.OverlayName = overlayOpts.Name
@@ -174,16 +174,16 @@ func Install(ctx context.Context, p runtime.Platform, mode Mode, opts *Options) 
 		procfs.WithOverwriteArgs(constants.KernelParamPlatform),
 		procfs.WithDeleteNegatedArgs(),
 	); err != nil {
-		return err
+		return xerrors.NewTagged[InvalidInputTag](err)
 	}
 
 	i, err := NewInstaller(ctx, cmdline, mode, opts)
 	if err != nil {
-		return err
+		return xerrors.NewTagged[InstallTag](err)
 	}
 
 	if err = i.Install(ctx, mode); err != nil {
-		return err
+		return xerrors.NewTagged[InstallTag](err)
 	}
 
 	i.options.Printf("installation of %s complete", version.Tag)
@@ -379,7 +379,7 @@ func (i *Installer) Install(ctx context.Context, mode Mode) (err error) {
 		return fmt.Errorf("failed to create partitions: %w", err)
 	}
 
-	if err := i.formatPartitions(ctx, mode, partitionOptions); err != nil {
+	if err := i.formatPartitions(ctx, bd, mode, partitionOptions); err != nil {
 		return fmt.Errorf("failed to format partitions: %w", err)
 	}
 
@@ -402,7 +402,7 @@ func (i *Installer) Install(ctx context.Context, mode Mode) (err error) {
 		return fmt.Errorf("failed to install bootloader: %w", err)
 	}
 
-	if err = i.handleMeta(ctx, mode, bootInstallResult.PreviousLabel, info); err != nil {
+	if err = i.handleMeta(ctx, bd, mode, bootInstallResult.PreviousLabel, info); err != nil {
 		return fmt.Errorf("failed to handle META partition: %w", err)
 	}
 
@@ -410,14 +410,19 @@ func (i *Installer) Install(ctx context.Context, mode Mode) (err error) {
 }
 
 //nolint:gocyclo,cyclop
-func (i *Installer) handleMeta(ctx context.Context, mode Mode, previousLabel string, info *blkid.Info) error {
+func (i *Installer) handleMeta(ctx context.Context, bd *block.Device, mode Mode, previousLabel string, info *blkid.Info) error {
 	switch mode {
 	case ModeInstall, ModeUpgrade:
 		var metaPartitionName string
 
 		for _, partition := range info.Parts {
 			if pointer.SafeDeref(partition.PartitionLabel) == constants.MetaPartitionLabel {
-				metaPartitionName = partitioning.DevName(i.options.DiskPath, partition.PartitionIndex)
+				var err error
+
+				metaPartitionName, err = bd.GetPartitionDevName(partition.PartitionIndex)
+				if err != nil {
+					return fmt.Errorf("failed to get META partition device name: %w", err)
+				}
 
 				break
 			}
@@ -583,21 +588,9 @@ func (i *Installer) getBootPartitions(ctx context.Context, mode Mode, bootloader
 
 	bootloaderOptions := i.generateBootloaderOptions(ctx, mode, nil)
 
-	partitionOptions, err := bootloader.GenerateAssets(bootloaderOptions)
+	partitionOptions, err := bootloader.PrepareBootPartitions(bootloaderOptions)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate bootloader assets: %w", err)
-	}
-
-	efiPartitionPresent := slices.ContainsFunc(partitionOptions, func(p partition.Options) bool {
-		return p.Label == constants.EFIPartitionLabel && p.SourceDirectory != ""
-	})
-
-	// We need to move out bootloaderOptions.MountPrefix+/boot/EFI to bootloaderOptions.MountPrefix+/EFI otherwise
-	// BOOT partition will be populated with EFI directory inside boot directory.
-	if efiPartitionPresent {
-		if err := os.Rename(filepath.Join(bootloaderOptions.MountPrefix, constants.EFIMountPoint), filepath.Join(bootloaderOptions.MountPrefix, "EFI")); err != nil {
-			return nil, fmt.Errorf("failed to move EFI directory: %w", err)
-		}
+		return nil, fmt.Errorf("failed to prepare bootloader partitions: %w", err)
 	}
 
 	return partitionOptions, nil
@@ -696,12 +689,15 @@ func (i *Installer) createPartitions(ctx context.Context, mode Mode, bd *block.D
 // formatPartitions formats the created partitions populating them with filesystems and data as required.
 //
 //nolint:gocyclo
-func (i *Installer) formatPartitions(ctx context.Context, mode Mode, parts []partition.Options) error {
+func (i *Installer) formatPartitions(ctx context.Context, bd *block.Device, mode Mode, parts []partition.Options) error {
 	switch mode {
 	case ModeInstall:
 		// format also populates partitions, so we need to make sure source directories are set
 		for idx, p := range parts {
-			devName := partitioning.DevName(i.options.DiskPath, uint(idx+1))
+			devName, err := bd.GetPartitionDevName(uint(idx + 1))
+			if err != nil {
+				return fmt.Errorf("failed to get partition device name for partition %s: %w", p.Label, err)
+			}
 
 			if err := partition.Format(ctx, devName, &p.FormatOptions, i.options.Version, i.options.Printf); err != nil {
 				return fmt.Errorf("failed to format partition %s: %w", devName, err)

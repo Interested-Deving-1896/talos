@@ -11,6 +11,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/siderolabs/talos/cmd/talosctl/pkg/talos/helpers"
+	"github.com/siderolabs/talos/cmd/talosctl/pkg/talos/safeout"
 	"github.com/siderolabs/talos/pkg/cluster"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
@@ -49,10 +51,25 @@ PKI can be rotated by applying machine config changes to the controlplane nodes.
 			return err
 		}
 
-		return WithClient(cmd.Context(), rotateCA)
+		ctx := cmd.Context()
+
+		clientFactory, err := NewClientFactory(ctx, &rotateCACmdFlags)
+		if err != nil {
+			return err
+		}
+
+		defer clientFactory.Close() //nolint:errcheck
+
+		ctx, c, _, err := clientFactory.BuildClientEnforceSingleNode(ctx, "rotate-ca")
+		if err != nil {
+			return err
+		}
+
+		return rotateCA(ctx, c)
 	},
 }
 
+//nolint:gocyclo
 func rotateCA(ctx context.Context, c *client.Client) error {
 	commentsFlags := encoder.CommentsDisabled
 	if rotateCACmdFlags.withDocs {
@@ -65,7 +82,7 @@ func rotateCA(ctx context.Context, c *client.Client) error {
 
 	encoderOpt := encoder.WithComments(commentsFlags)
 
-	clusterInfo, err := buildClusterInfo(ctx, rotateCACmdFlags.clusterState)
+	clusterInfo, err := buildClusterInfo(ctx, c, rotateCACmdFlags.clusterState)
 	if err != nil {
 		return err
 	}
@@ -83,10 +100,12 @@ func rotateCA(ctx context.Context, c *client.Client) error {
 			return fmt.Errorf("error rotating Talos CA: %w", err)
 		}
 
-		// re-create client with new Talos PKI
-		c, err = client.New(ctx, client.WithConfig(newTalosconfig))
-		if err != nil {
-			return fmt.Errorf("failed to create new client with rotated Talos CA: %w", err)
+		if !rotateCACmdFlags.dryRun { // in dry-run mode we skip this step
+			// re-create client with new Talos PKI
+			c, err = client.New(ctx, client.WithConfig(newTalosconfig))
+			if err != nil {
+				return fmt.Errorf("failed to create new client with rotated Talos CA: %w", err)
+			}
 		}
 	}
 
@@ -124,7 +143,7 @@ func rotateTalosCA(ctx context.Context, oldClient *client.Client, encoderOpt enc
 
 		EncoderOption: encoderOpt,
 
-		Printf: func(format string, args ...any) { fmt.Printf(format, args...) },
+		Printf: func(format string, args ...any) { safeout.Printf(format, args...) },
 	}
 
 	newTalosconfig, err := talos.Rotate(ctx, options)
@@ -133,12 +152,12 @@ func rotateTalosCA(ctx context.Context, oldClient *client.Client, encoderOpt enc
 	}
 
 	if rotateCACmdFlags.dryRun {
-		fmt.Println("> Dry-run mode enabled, no changes were made to the cluster, re-run with `--dry-run=false` to apply the changes.")
+		safeout.Println("> Dry-run mode enabled, no changes were made to the cluster, re-run with `--dry-run=false` to apply the changes.")
 
 		return nil, nil
 	}
 
-	fmt.Printf("> Writing new talosconfig to %q\n", rotateCACmdFlags.output)
+	safeout.Printf("> Writing new talosconfig to %q\n", rotateCACmdFlags.output)
 
 	return newTalosconfig, newTalosconfig.Save(rotateCACmdFlags.output)
 }
@@ -156,7 +175,7 @@ func rotateKubernetesCA(ctx context.Context, c *client.Client, encoderOpt encode
 
 		EncoderOption: encoderOpt,
 
-		Printf: func(format string, args ...any) { fmt.Printf(format, args...) },
+		Printf: func(format string, args ...any) { safeout.Printf(format, args...) },
 	}
 
 	if err := kubernetes.Rotate(ctx, options); err != nil {
@@ -164,12 +183,12 @@ func rotateKubernetesCA(ctx context.Context, c *client.Client, encoderOpt encode
 	}
 
 	if rotateCACmdFlags.dryRun {
-		fmt.Println("> Dry-run mode enabled, no changes were made to the cluster, re-run with `--dry-run=false` to apply the changes.")
+		safeout.Println("> Dry-run mode enabled, no changes were made to the cluster, re-run with `--dry-run=false` to apply the changes.")
 
 		return nil
 	}
 
-	fmt.Printf("> Kubernetes CA rotation done, new 'kubeconfig' can be fetched with `talosctl kubeconfig`.\n")
+	safeout.Printf("> Kubernetes CA rotation done, new 'kubeconfig' can be fetched with `talosctl kubeconfig`.\n")
 
 	return nil
 }
@@ -179,7 +198,7 @@ func init() {
 	rotateCACmd.Flags().StringVar(&rotateCACmdFlags.clusterState.InitNode, "init-node", "", "specify IPs of init node")
 	rotateCACmd.Flags().StringSliceVar(&rotateCACmdFlags.clusterState.ControlPlaneNodes, "control-plane-nodes", nil, "specify IPs of control plane nodes")
 	rotateCACmd.Flags().StringSliceVar(&rotateCACmdFlags.clusterState.WorkerNodes, "worker-nodes", nil, "specify IPs of worker nodes")
-	rotateCACmd.Flags().StringVar(&rotateCACmdFlags.forceEndpoint, "k8s-endpoint", "", "use endpoint instead of kubeconfig default")
+	helpers.KubernetesEndpointVar(rotateCACmd.Flags(), &rotateCACmdFlags.forceEndpoint, "k8s-endpoint", "", "use endpoint instead of kubeconfig default")
 	rotateCACmd.Flags().BoolVarP(&rotateCACmdFlags.withExamples, "with-examples", "", true, "patch all machine configs with the commented examples")
 	rotateCACmd.Flags().BoolVarP(&rotateCACmdFlags.withDocs, "with-docs", "", true, "patch all machine configs adding the documentation for each field")
 	rotateCACmd.Flags().StringVarP(&rotateCACmdFlags.output, "output", "o", "talosconfig", "path to the output new `talosconfig`")

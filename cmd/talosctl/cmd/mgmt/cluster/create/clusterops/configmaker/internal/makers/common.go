@@ -28,6 +28,7 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
+	clustercfg "github.com/siderolabs/talos/pkg/machinery/config/types/cluster"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/siderolink"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/provision"
@@ -76,9 +77,15 @@ type Maker[ExtraOps any] struct {
 	GenOps          []generate.Option
 	ConfigBundleOps []bundle.Option
 
+	// PerNodePatches holds config patches applied to a single node (keyed by node index) after the base
+	// machine config is generated, for per-node uniqueness a shared control-plane/worker patch cannot
+	// express (e.g. a unique BGP loopback per node in full-CLOS).
+	PerNodePatches map[int][]configpatcher.Patch
+
 	EOps ExtraOps
 
 	extraOptionsProvider ExtraOptionsProvider
+	userConfigBundleOps  []bundle.Option
 }
 
 // SetExtraOptionsProvider sets extra options provider containing the provider specific logic.
@@ -197,9 +204,41 @@ func (m *Maker[T]) initConfigBundleOps() error {
 		return err
 	}
 
-	m.ConfigBundleOps = slices.Clone(configPatchBundleOps)
+	m.ConfigBundleOps = []bundle.Option{}
+	m.userConfigBundleOps = configPatchBundleOps
+
+	if m.Ops.WithStaticEndpoints {
+		staticEndpointsPatch, err := m.getStaticEndpointsPatch()
+		if err != nil {
+			return err
+		}
+
+		m.ConfigBundleOps = append(m.ConfigBundleOps, bundle.WithPatch([]configpatcher.Patch{staticEndpointsPatch}))
+	}
 
 	return nil
+}
+
+// getStaticEndpointsPatch builds a StaticEndpointsConfig document listing IPs of all controlplane nodes.
+func (m *Maker[T]) getStaticEndpointsPatch() (configpatcher.Patch, error) {
+	if !m.VersionContract.Greater(config.TalosVersion1_14) {
+		return nil, fmt.Errorf("static endpoints are not supported for Talos version %q", m.Ops.TalosVersion)
+	}
+
+	staticEndpoints := clustercfg.NewStaticEndpointsConfigV1Alpha1()
+
+	for _, node := range m.ClusterRequest.Nodes {
+		if node.Type.IsControlPlane() {
+			staticEndpoints.EndpointAddresses = append(staticEndpoints.EndpointAddresses, node.IPs...)
+		}
+	}
+
+	ctr, err := container.New(staticEndpoints)
+	if err != nil {
+		return nil, err
+	}
+
+	return configpatcher.NewStrategicMergePatch(ctr), nil
 }
 
 func (m *Maker[T]) initVersionContract() error {
@@ -214,12 +253,16 @@ func (m *Maker[T]) initVersionContract() error {
 		return fmt.Errorf("error parsing Talos version %q: %w", m.Ops.TalosVersion, err)
 	}
 
+	if m.Ops.SkipEtcdK8sConfig {
+		versionContract = versionContract.DisableEtcd().DisableKubernetes()
+	}
+
 	m.VersionContract = versionContract
 
 	return nil
 }
 
-// GetClusterConfigs prepares and returns the cluster create request data. This method is ment to be called after the implemeting maker
+// GetClusterConfigs prepares and returns the cluster create request data. This method is meant to be called after the implementing maker
 // logic has been run.
 func (m *Maker[T]) GetClusterConfigs() (clusterops.ClusterConfigs, error) {
 	var configBundle *bundle.Bundle
@@ -273,11 +316,12 @@ func (m *Maker[T]) applyOmniConfigs() error {
 	return nil
 }
 
+//nolint:gocyclo
 func (m *Maker[T]) finalizeMachineConfigs() (*bundle.Bundle, error) {
 	// These options needs to be generated after the implementing maker has made changes to the cluster request.
-	provisionGenOps, provisionBundleOps := m.Provisioner.GenOptions(m.ClusterRequest.Network, m.VersionContract)
+	provisionGenOps, provisionBundleOps := m.Provisioner.GenOptions(m.ClusterRequest, m.VersionContract)
 	m.GenOps = slices.Concat(m.GenOps, provisionGenOps)
-	m.ConfigBundleOps = slices.Concat(m.ConfigBundleOps, provisionBundleOps)
+	m.ConfigBundleOps = slices.Concat(m.ConfigBundleOps, provisionBundleOps, m.userConfigBundleOps)
 	m.GenOps = slices.Concat(m.GenOps, []generate.Option{generate.WithEndpointList(m.Endpoints)})
 
 	m.ConfigBundleOps = append(
@@ -331,6 +375,27 @@ func (m *Maker[T]) finalizeMachineConfigs() (*bundle.Bundle, error) {
 			if err != nil {
 				return nil, err
 			}
+		}
+	}
+
+	// apply per-node patches last, so per-node uniqueness (e.g. a unique full-CLOS loopback) overrides
+	// the shared base config.
+	for i := range m.ClusterRequest.Nodes {
+		patches := m.PerNodePatches[i]
+		if len(patches) == 0 {
+			continue
+		}
+
+		node := &m.ClusterRequest.Nodes[i]
+
+		out, err := configpatcher.Apply(configpatcher.WithConfig(node.Config), patches)
+		if err != nil {
+			return nil, err
+		}
+
+		node.Config, err = out.Config()
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -453,6 +518,10 @@ func (m *Maker[T]) initGenOps() error {
 				generate.WithKubeSpanEnabled(m.Ops.EnableKubeSpan),
 			},
 		)
+	}
+
+	if m.Ops.SkipUnattendedInstallConfig {
+		genOptions = append(genOptions, generate.WithSkipUnattendedInstallConfig(true))
 	}
 
 	m.GenOps = genOptions

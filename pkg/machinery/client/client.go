@@ -39,18 +39,108 @@ type Client struct {
 	options *Options
 	conn    *grpcConnectionWrapper
 
-	MachineClient   machineapi.MachineServiceClient
-	TimeClient      timeapi.TimeServiceClient
-	ClusterClient   clusterapi.ClusterServiceClient
-	StorageClient   storageapi.StorageServiceClient
-	InspectClient   inspectapi.InspectServiceClient
-	ImageClient     machineapi.ImageServiceClient
-	DebugClient     machineapi.DebugServiceClient
+	// Deprecated: use MachineService instead.
+	MachineClient machineapi.MachineServiceClient
+	// Deprecated: use TimeService instead.
+	TimeClient timeapi.TimeServiceClient
+	// Deprecated: use ClusterService instead.
+	ClusterClient clusterapi.ClusterServiceClient
+	// Deprecated: use StorageService instead.
+	StorageClient storageapi.StorageServiceClient
+	// Deprecated: use MachineStorageService instead.
+	MachineStorageClient machineapi.StorageServiceClient
+	// Deprecated: use LVMService instead.
+	LVMClient machineapi.LVMServiceClient
+	// Deprecated: use MDService instead.
+	MDClient machineapi.MDServiceClient
+	// Deprecated: use InspectService instead.
+	InspectClient inspectapi.InspectServiceClient
+	// Deprecated: use ImageService instead.
+	ImageClient machineapi.ImageServiceClient
+	// Deprecated: use DebugService instead.
+	DebugClient machineapi.DebugServiceClient
+	// Deprecated: use HypervisorService instead.
+	HypervisorClient machineapi.HypervisorServiceClient
+	// Deprecated: use LifecycleService instead.
 	LifecycleClient machineapi.LifecycleServiceClient
+	// Deprecated: use ContentLibraryService instead.
+	ContentLibraryClient machineapi.ContentLibraryServiceClient
 
+	// Deprecated: use State instead.
 	COSI state.State
 
+	// Deprecated: use InspectService with FilterMessages instead.
 	Inspect *InspectClient
+}
+
+// State returns the COSI state of the Talos API.
+func (c *Client) State() state.State {
+	return c.COSI
+}
+
+// MachineService returns the client of the machine service.
+func (c *Client) MachineService() machineapi.MachineServiceClient {
+	return c.MachineClient
+}
+
+// TimeService returns the client of the time service.
+func (c *Client) TimeService() timeapi.TimeServiceClient {
+	return c.TimeClient
+}
+
+// ClusterService returns the client of the cluster service.
+func (c *Client) ClusterService() clusterapi.ClusterServiceClient {
+	return c.ClusterClient
+}
+
+// StorageService returns the client of the storage service.
+func (c *Client) StorageService() storageapi.StorageServiceClient {
+	return c.StorageClient
+}
+
+// MachineStorageService returns the client of the storage service of the machine API.
+func (c *Client) MachineStorageService() machineapi.StorageServiceClient {
+	return c.MachineStorageClient
+}
+
+// LVMService returns the client of the LVM service.
+func (c *Client) LVMService() machineapi.LVMServiceClient {
+	return c.LVMClient
+}
+
+// MDService returns the client of the MD service.
+func (c *Client) MDService() machineapi.MDServiceClient {
+	return c.MDClient
+}
+
+// InspectService returns the client of the inspect service.
+func (c *Client) InspectService() inspectapi.InspectServiceClient {
+	return c.InspectClient
+}
+
+// ImageService returns the client of the image service.
+func (c *Client) ImageService() machineapi.ImageServiceClient {
+	return c.ImageClient
+}
+
+// DebugService returns the client of the debug service.
+func (c *Client) DebugService() machineapi.DebugServiceClient {
+	return c.DebugClient
+}
+
+// HypervisorService returns the client of the hypervisor service.
+func (c *Client) HypervisorService() machineapi.HypervisorServiceClient {
+	return c.HypervisorClient
+}
+
+// LifecycleService returns the client of the lifecycle service.
+func (c *Client) LifecycleService() machineapi.LifecycleServiceClient {
+	return c.LifecycleClient
+}
+
+// ContentLibraryService returns the client of the content library service.
+func (c *Client) ContentLibraryService() machineapi.ContentLibraryServiceClient {
+	return c.ContentLibraryClient
 }
 
 func (c *Client) resolveConfigContext() error {
@@ -171,13 +261,18 @@ func New(_ context.Context, opts ...OptionFunc) (c *Client, err error) {
 	c.TimeClient = timeapi.NewTimeServiceClient(c.conn)
 	c.ClusterClient = clusterapi.NewClusterServiceClient(c.conn)
 	c.StorageClient = storageapi.NewStorageServiceClient(c.conn)
+	c.MachineStorageClient = machineapi.NewStorageServiceClient(c.conn)
+	c.LVMClient = machineapi.NewLVMServiceClient(c.conn)
+	c.MDClient = machineapi.NewMDServiceClient(c.conn)
 	c.InspectClient = inspectapi.NewInspectServiceClient(c.conn)
 	c.ImageClient = machineapi.NewImageServiceClient(c.conn)
 	c.DebugClient = machineapi.NewDebugServiceClient(c.conn)
+	c.HypervisorClient = machineapi.NewHypervisorServiceClient(c.conn)
 	c.LifecycleClient = machineapi.NewLifecycleServiceClient(c.conn)
+	c.ContentLibraryClient = machineapi.NewContentLibraryServiceClient(c.conn)
 
 	c.Inspect = &InspectClient{c.InspectClient}
-	c.COSI = state.WrapCore(client.NewAdapter(cosiv1alpha1.NewStateClient(c.conn)))
+	c.COSI = state.WrapCore(client.NewAdapter(cosiv1alpha1.NewStateClient(c.conn), c.options.stateOptions...))
 
 	return c, nil
 }
@@ -433,7 +528,15 @@ func (c *Client) Dmesg(ctx context.Context, follow, tail bool) (machineapi.Machi
 
 // Logs implements the proto.MachineServiceClient interface.
 func (c *Client) Logs(ctx context.Context, namespace string, driver common.ContainerDriver, id string, follow bool, tailLines int32) (stream machineapi.MachineService_LogsClient, err error) {
+	return c.LogsWithKind(ctx, namespace, driver, id, follow, tailLines, machineapi.LogKind_LOG_KIND_UNSPECIFIED)
+}
+
+// LogsWithKind selects a log source explicitly without changing legacy Logs routing.
+func (c *Client) LogsWithKind(
+	ctx context.Context, namespace string, driver common.ContainerDriver, id string, follow bool, tailLines int32, kind machineapi.LogKind,
+) (stream machineapi.MachineService_LogsClient, err error) {
 	stream, err = c.MachineClient.Logs(ctx, &machineapi.LogsRequest{
+		Kind:      kind,
 		Namespace: namespace,
 		Driver:    driver,
 		Id:        id,
@@ -577,7 +680,7 @@ func WithUpgradeGRPCCallOptions(opts ...grpc.CallOption) UpgradeOption {
 
 // Upgrade initiates a Talos upgrade and implements the proto.MachineServiceClient interface.
 //
-// Deprecated: use LifecycleClient instead.
+// Deprecated: use LifecycleService instead.
 func (c *Client) Upgrade(ctx context.Context, image string, stage, force bool, callOptions ...grpc.CallOption) (*machineapi.UpgradeResponse, error) {
 	return c.UpgradeWithOptions(
 		ctx,
@@ -591,7 +694,7 @@ func (c *Client) Upgrade(ctx context.Context, image string, stage, force bool, c
 
 // UpgradeWithOptions initiates a Talos upgrade with the given options.
 //
-// Deprecated: use LifecycleClient instead.
+// Deprecated: use LifecycleService instead.
 func (c *Client) UpgradeWithOptions(ctx context.Context, opts ...UpgradeOption) (*machineapi.UpgradeResponse, error) {
 	var options UpgradeOptions
 
@@ -617,7 +720,7 @@ func (c *Client) ServiceList(ctx context.Context, callOptions ...grpc.CallOption
 
 // ServiceInfo provides info about a service and node metadata.
 type ServiceInfo struct {
-	Metadata *common.Metadata
+	Metadata *common.Metadata //nolint:staticcheck // legacy API
 	Service  *machineapi.ServiceInfo
 }
 
@@ -928,7 +1031,7 @@ func ReadStream(stream MachineStream) (io.ReadCloser, error) {
 		for {
 			data, err := stream.Recv()
 			if err != nil {
-				if errors.Is(err, io.EOF) || StatusCode(err) == codes.Canceled || StatusCode(err) == codes.DeadlineExceeded {
+				if errors.Is(err, io.EOF) {
 					return
 				}
 
@@ -944,7 +1047,7 @@ func ReadStream(stream MachineStream) (io.ReadCloser, error) {
 				}
 			}
 
-			if data.Metadata != nil && data.Metadata.Error != "" {
+			if data.Metadata != nil && data.Metadata.Error != "" { //nolint:staticcheck // legacy behavior
 				pw.CloseWithError(metaToErr(data.Metadata))
 
 				return
@@ -955,6 +1058,7 @@ func ReadStream(stream MachineStream) (io.ReadCloser, error) {
 	return pr, stream.CloseSend()
 }
 
+//nolint:staticcheck
 func metaToErr(md *common.Metadata) error {
 	if md.Status == nil {
 		return errors.New(md.Error)
@@ -1012,7 +1116,7 @@ func (c *Client) MetaDelete(ctx context.Context, key uint8, callOptions ...grpc.
 
 // ImageList lists images in the CRI.
 //
-// Deprecated: use ImageServiceClient instead.
+// Deprecated: use ImageService instead.
 func (c *Client) ImageList(ctx context.Context, namespace common.ContainerdNamespace, callOptions ...grpc.CallOption) (machineapi.MachineService_ImageListClient, error) {
 	return c.MachineClient.ImageList(
 		ctx,
@@ -1025,7 +1129,7 @@ func (c *Client) ImageList(ctx context.Context, namespace common.ContainerdNames
 
 // ImagePull pre-pulls an image to the CRI.
 //
-// Deprecated: use ImageServiceClient instead.
+// Deprecated: use ImageService instead.
 func (c *Client) ImagePull(ctx context.Context, namespace common.ContainerdNamespace, imageRef string, callOptions ...grpc.CallOption) error {
 	resp, err := c.MachineClient.ImagePull(
 		ctx,
@@ -1046,6 +1150,44 @@ func (c *Client) BlockDeviceWipe(ctx context.Context, req *storageapi.BlockDevic
 	resp, err := c.StorageClient.BlockDeviceWipe(ctx, req, callOptions...)
 
 	_, err = FilterMessages(resp, err)
+
+	return err
+}
+
+// LogicalVolumeRemove removes a single LVM logical volume via LVMService.
+//
+// Multi-node fan-out is the caller's responsibility: dispatch one call per
+// node with client.WithNode (see talosctl/multiplex.Unary), because
+// google.protobuf.Empty cannot be augmented with per-node metadata by apid's
+// one-to-many proxy path.
+func (c *Client) LogicalVolumeRemove(ctx context.Context, req *machineapi.LVMServiceLogicalVolumeRemoveRequest, callOptions ...grpc.CallOption) error {
+	_, err := c.LVMClient.LogicalVolumeRemove(ctx, req, callOptions...)
+
+	return err
+}
+
+// VolumeGroupRemove removes a single LVM volume group via LVMService.
+// See LogicalVolumeRemove for multi-node fan-out semantics.
+func (c *Client) VolumeGroupRemove(ctx context.Context, req *machineapi.LVMServiceVolumeGroupRemoveRequest, callOptions ...grpc.CallOption) error {
+	_, err := c.LVMClient.VolumeGroupRemove(ctx, req, callOptions...)
+
+	return err
+}
+
+// PhysicalVolumeRemove wipes LVM metadata from a single physical volume via LVMService.
+// See LogicalVolumeRemove for multi-node fan-out semantics.
+func (c *Client) PhysicalVolumeRemove(ctx context.Context, req *machineapi.LVMServicePhysicalVolumeRemoveRequest, callOptions ...grpc.CallOption) error {
+	_, err := c.LVMClient.PhysicalVolumeRemove(ctx, req, callOptions...)
+
+	return err
+}
+
+// MDDestroy stops an MD array and clears its member superblocks via MDService.
+//
+// Multi-node fan-out is the caller's responsibility: dispatch one call per
+// node with client.WithNode (see client/multiplex.Unary).
+func (c *Client) MDDestroy(ctx context.Context, req *machineapi.MDDestroyRequest, callOptions ...grpc.CallOption) error {
+	_, err := c.MDClient.Destroy(ctx, req, callOptions...)
 
 	return err
 }

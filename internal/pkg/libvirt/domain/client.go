@@ -1,0 +1,746 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+// Package domain manages transient QEMU domains owned by this machine.
+package domain
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/xml"
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"slices"
+	"time"
+
+	libvirt "github.com/digitalocean/go-libvirt"
+	"github.com/digitalocean/go-libvirt/socket/dialers"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+	"libvirt.org/go/libvirtxml"
+
+	"github.com/siderolabs/talos/pkg/machinery/constants"
+)
+
+const operationTimeout = 5 * time.Second
+
+// Connector opens bounded sessions against one modular QEMU daemon.
+type Connector struct {
+	socket string
+	uri    string
+}
+
+// New configures the daemon endpoint without opening a connection.
+func New(socket, uri string) *Connector {
+	return &Connector{socket: socket, uri: uri}
+}
+
+// Open bounds dialing, handshake, operations, and disconnect. go-libvirt RPCs
+// have no context argument, so cancellation closes the transport.
+func (c *Connector) Open(ctx context.Context) (Client, error) {
+	sessionCtx, cancel := context.WithTimeout(ctx, operationTimeout)
+
+	conn, err := (&net.Dialer{}).DialContext(sessionCtx, "unix", c.socket)
+	if err != nil {
+		cancel()
+
+		return nil, err
+	}
+
+	return c.OpenConn(sessionCtx, conn, cancel)
+}
+
+// OpenPersistent opens one inventory session for an event-driven controller.
+// Only connection establishment is time-bounded; the caller closes the session.
+func (c *Connector) OpenPersistent(ctx context.Context) (Client, error) {
+	startupCtx, startupCancel := context.WithTimeout(ctx, operationTimeout)
+	defer startupCancel()
+
+	conn, err := (&net.Dialer{}).DialContext(startupCtx, "unix", c.socket)
+	if err != nil {
+		return nil, err
+	}
+
+	stopStartupClose := context.AfterFunc(startupCtx, func() { closeTransport(conn) })
+	defer stopStartupClose()
+
+	sessionCtx, cancel := context.WithCancel(ctx)
+
+	return c.OpenConn(sessionCtx, conn, cancel)
+}
+
+// OpenConn connects over an already-connected transport for this connector.
+// It takes ownership of conn and cancel; ctx must bound the full session.
+func (c *Connector) OpenConn(ctx context.Context, conn net.Conn, cancel context.CancelFunc) (Client, error) {
+	rpc := libvirt.NewWithDialer(dialers.NewAlreadyConnected(conn))
+	client := &client{rpc: rpc, conn: conn, cancel: cancel}
+
+	client.stopClose = context.AfterFunc(ctx, func() { closeTransport(conn) })
+	if err := rpc.ConnectToURI(libvirt.ConnectURI(c.uri)); err != nil {
+		client.Close()
+
+		return nil, err
+	}
+
+	client.disconnect = rpc.Disconnect
+
+	return client, nil
+}
+
+// Changing the namespace changes ownership of all existing domains.
+var namespace = uuid.NewHash(sha256.New(), uuid.NameSpaceURL, []byte("https://talos.dev/virtual-machine-domains"), 8)
+
+// UUID derives a stable, host-specific domain identity from a validated machine UUID and name.
+func UUID(machine uuid.UUID, name string) uuid.UUID {
+	return uuid.NewHash(sha256.New(), namespace, append(machine[:], []byte(name)...), 8)
+}
+
+// ParseMachineUUID validates the machine UUID every domain of a host is named under, as published
+// by SystemInformation. A nil UUID is refused: it would name every host's domains alike.
+func ParseMachineUUID(machine string) (uuid.UUID, error) {
+	parsed, err := uuid.Parse(machine)
+	if err != nil || parsed == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("invalid machine UUID %q", machine)
+	}
+
+	return parsed, nil
+}
+
+// Domain identifies a domain by name and UUID; it does not prove ownership.
+type Domain struct {
+	Name string
+	UUID uuid.UUID
+}
+
+// Info holds selected fields from libvirt DomainGetInfo. Memory is in KiB.
+type Info struct {
+	State        uint32
+	MaxMemoryKiB uint64
+	MemoryKiB    uint64
+	VCPUs        uint32
+}
+
+// GuestInterface is one network interface as reported by the qemu-guest-agent.
+type GuestInterface struct {
+	Name         string
+	HardwareAddr string
+	IPs          []netip.Prefix
+}
+
+// Client represents one bounded reconciliation session; callers must Close it.
+type Client interface {
+	Domains() ([]Domain, error)
+	Active(Domain) (bool, error)
+	Info(Domain) (Info, error)
+	GuestInterfaces(Domain) ([]GuestInterface, error)
+	Start(Domain, string, ...StartOption) error
+	Shutdown(Domain) error
+	Reboot(Domain) error
+	Remove(Domain) error
+	Close()
+}
+
+type domainRPC interface {
+	listRPC
+	definitionRPC
+	lifecycleRPC
+}
+
+type listRPC interface {
+	ConnectListAllDomains(int32, libvirt.ConnectListAllDomainsFlags) ([]libvirt.Domain, uint32, error)
+	DomainLookupByName(string) (libvirt.Domain, error)
+}
+
+type definitionRPC interface {
+	DomainGetXMLDesc(libvirt.Domain, libvirt.DomainXMLFlags) (string, error)
+	DomainIsPersistent(libvirt.Domain) (int32, error)
+	DomainCreateXML(string, libvirt.DomainCreateFlags) (libvirt.Domain, error)
+}
+
+type lifecycleRPC interface {
+	DomainIsActive(libvirt.Domain) (int32, error)
+	DomainGetInfo(libvirt.Domain) (uint8, uint64, uint64, uint16, uint64, error)
+	DomainInterfaceAddresses(libvirt.Domain, uint32, uint32) ([]libvirt.DomainInterface, error)
+	DomainDestroy(libvirt.Domain) error
+	DomainShutdownFlags(libvirt.Domain, libvirt.DomainShutdownFlagValues) error
+	DomainReboot(libvirt.Domain, libvirt.DomainRebootFlagValues) error
+	DomainHasManagedSaveImage(libvirt.Domain, uint32) (int32, error)
+	DomainManagedSaveRemove(libvirt.Domain, uint32) error
+	DomainUndefineFlags(libvirt.Domain, libvirt.DomainUndefineFlagsValues) error
+}
+
+type client struct {
+	rpc        domainRPC
+	conn       net.Conn
+	cancel     context.CancelFunc
+	stopClose  func() bool
+	disconnect func() error
+}
+
+func (c *client) Close() {
+	defer closeTransport(c.conn)
+	defer c.cancel()
+	defer c.stopClose()
+
+	if c.disconnect != nil {
+		if err := c.disconnect(); err != nil {
+			zap.L().Debug("failed to disconnect from libvirt", zap.Error(err))
+		}
+	}
+}
+
+func closeTransport(conn net.Conn) {
+	if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		zap.L().Debug("failed to close libvirt transport", zap.Error(err))
+	}
+}
+
+func (c *client) Domains() ([]Domain, error) {
+	// The first argument is need_results (1 = return the list), not a result limit.
+	// Zero flags include both active and inactive domains.
+	domains, _, err := c.rpc.ConnectListAllDomains(1, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]Domain, 0, len(domains))
+	for _, d := range domains {
+		result = append(result, Domain{Name: d.Name, UUID: uuid.UUID(d.UUID)})
+	}
+
+	return result, nil
+}
+
+func (c *client) Active(domain Domain) (bool, error) {
+	found, exists, err := c.lookup(domain)
+	if err != nil || !exists {
+		return false, err
+	}
+
+	active, err := c.rpc.DomainIsActive(found)
+	if err != nil {
+		return false, err
+	}
+
+	return active == 1, nil
+}
+
+// Info reads raw libvirt domain state and counters for any domain in the inventory.
+func (c *client) Info(domain Domain) (Info, error) {
+	found, exists, err := c.lookup(domain)
+	if err != nil {
+		return Info{}, err
+	}
+
+	if !exists {
+		return Info{}, fmt.Errorf("domain %q disappeared before reading info", domain.Name)
+	}
+
+	state, maxMemory, memory, vcpus, _, err := c.rpc.DomainGetInfo(found)
+	if err != nil {
+		return Info{}, err
+	}
+
+	return Info{
+		State:        uint32(state),
+		MaxMemoryKiB: maxMemory,
+		MemoryKiB:    memory,
+		VCPUs:        uint32(vcpus),
+	}, nil
+}
+
+// GuestInterfaces reports interfaces as seen by the qemu-guest-agent running inside the guest.
+func (c *client) GuestInterfaces(domain Domain) ([]GuestInterface, error) {
+	found, exists, err := c.lookup(domain)
+	if err != nil {
+		return nil, err
+	}
+
+	if !exists {
+		return nil, fmt.Errorf("domain %q disappeared before reading guest interfaces", domain.Name)
+	}
+
+	raw, err := c.rpc.DomainInterfaceAddresses(found, uint32(libvirt.DomainInterfaceAddressesSrcAgent), 0)
+	if err != nil {
+		return nil, err
+	}
+
+	ifaces := make([]GuestInterface, 0, len(raw))
+
+	for _, iface := range raw {
+		converted := GuestInterface{
+			Name: iface.Name,
+		}
+
+		if len(iface.Hwaddr) > 0 {
+			converted.HardwareAddr = iface.Hwaddr[0]
+		}
+
+		for _, addr := range iface.Addrs {
+			ip, err := netip.ParseAddr(addr.Addr)
+			if err != nil {
+				return nil, fmt.Errorf("parse guest interface %q address: %w", iface.Name, err)
+			}
+
+			prefix := netip.PrefixFrom(ip, int(addr.Prefix))
+			if !prefix.IsValid() {
+				return nil, fmt.Errorf("invalid guest interface %q prefix %s/%d", iface.Name, ip, addr.Prefix)
+			}
+
+			converted.IPs = append(converted.IPs, prefix)
+		}
+
+		ifaces = append(ifaces, converted)
+	}
+
+	return ifaces, nil
+}
+
+func (c *client) lookup(d Domain) (libvirt.Domain, bool, error) {
+	found, err := c.rpc.DomainLookupByName(d.Name)
+	if err != nil {
+		if rpcErr, ok := errors.AsType[libvirt.Error](err); ok && rpcErr.Code == uint32(libvirt.ErrNoDomain) {
+			return libvirt.Domain{}, false, nil
+		}
+
+		return libvirt.Domain{}, false, err
+	}
+
+	if found.UUID != libvirt.UUID(d.UUID) {
+		return libvirt.Domain{}, false, fmt.Errorf("domain %q is not owned by this machine", d.Name)
+	}
+
+	return found, true, nil
+}
+
+func validateDomain(d Domain) error {
+	if d.Name == "" || d.UUID == uuid.Nil {
+		return errors.New("domain name and UUID must be nonempty")
+	}
+
+	return nil
+}
+
+type startOptions struct {
+	admissions []func() error
+}
+
+// StartOption configures one Start call.
+type StartOption func(*startOptions)
+
+// WithStartAdmission adds a check Start runs only when it is about to create or
+// replace the domain: after an unchanged active domain has been left alone, and
+// before an existing domain is removed. An error aborts Start and is returned
+// as is, leaving any existing domain untouched.
+func WithStartAdmission(check func() error) StartOption {
+	return func(o *startOptions) {
+		o.admissions = append(o.admissions, check)
+	}
+}
+
+// Admit runs the admission checks of opts in order, stopping at the first error.
+// Client implementations call it at the point Start would create or replace a domain.
+func Admit(opts ...StartOption) error {
+	var o startOptions
+
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	for _, check := range o.admissions {
+		if err := check(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// Start creates an active transient domain or replaces an owned domain when its
+// definition changes. Replacing a running domain interrupts the guest.
+func (c *client) Start(d Domain, renderedXML string, opts ...StartOption) error {
+	if err := validateDomain(d); err != nil {
+		return err
+	}
+
+	desired, digest, err := domainDefinition(d, renderedXML)
+	if err != nil {
+		return err
+	}
+
+	found, exists, err := c.lookup(d)
+	if err != nil {
+		return err
+	}
+
+	restart, err := c.needsRestart(found, exists, digest)
+	if err != nil {
+		return err
+	}
+
+	if !restart {
+		return nil
+	}
+
+	if err = Admit(opts...); err != nil {
+		return err
+	}
+
+	if exists {
+		if err = c.Remove(d); err != nil {
+			return err
+		}
+	}
+
+	return c.createTransient(d, desired)
+}
+
+func (c *client) createTransient(d Domain, desired string) error {
+	found, err := c.rpc.DomainCreateXML(desired, 0)
+	if err != nil {
+		return err
+	}
+
+	if found.UUID != libvirt.UUID(d.UUID) {
+		return fmt.Errorf("started domain %q has unexpected UUID", d.Name)
+	}
+
+	persistent, err := c.rpc.DomainIsPersistent(found)
+	if err != nil {
+		return err
+	}
+
+	if persistent != 0 {
+		return fmt.Errorf("started domain %q is unexpectedly persistent", d.Name)
+	}
+
+	return nil
+}
+
+const metadataNamespace = "https://talos.dev/libvirt/domain"
+
+type definitionDigests struct {
+	Full          string `xml:",chardata"`
+	Configuration string `xml:"configuration,attr"`
+}
+
+func domainDefinition(d Domain, renderedXML string) (string, definitionDigests, error) {
+	var desc libvirtxml.Domain
+
+	if err := desc.Unmarshal(renderedXML); err != nil {
+		return "", definitionDigests{}, fmt.Errorf("invalid domain XML: %w", err)
+	}
+
+	if desc.Name != d.Name {
+		return "", definitionDigests{}, fmt.Errorf("domain XML name %q does not match %q", desc.Name, d.Name)
+	}
+
+	desc.UUID = d.UUID.String()
+
+	// Serial capture belongs to the owned backend definition, where the host-specific
+	// identity is known. Keep the PTY for exclusive live attachment and let virtlogd
+	// bound retention. Never accept a log path from the rendered input.
+	setSerialCapture(&desc, d.UUID)
+
+	canonical, err := desc.Marshal()
+	if err != nil {
+		return "", definitionDigests{}, fmt.Errorf("marshal domain XML: %w", err)
+	}
+
+	configuration, err := profileIndependentDigest(desc)
+	if err != nil {
+		return "", definitionDigests{}, err
+	}
+
+	digests := definitionDigests{
+		Full:          fmt.Sprintf("%x", sha256.Sum256([]byte(canonical))),
+		Configuration: configuration,
+	}
+
+	if desc.Metadata == nil {
+		desc.Metadata = &libvirtxml.DomainMetadata{}
+	}
+
+	desc.Metadata.XML += fmt.Sprintf(
+		`<talos:definition xmlns:talos="%s" configuration="%s">%s</talos:definition>`,
+		metadataNamespace, digests.Configuration, digests.Full,
+	)
+
+	definition, err := desc.Marshal()
+	if err != nil {
+		return "", definitionDigests{}, fmt.Errorf("marshal domain metadata: %w", err)
+	}
+
+	return definition, digests, nil
+}
+
+func setSerialCapture(desc *libvirtxml.Domain, id uuid.UUID) {
+	if desc.Devices == nil {
+		return
+	}
+
+	for i := range desc.Devices.Serials {
+		serial := &desc.Devices.Serials[i]
+		if serial.Source != nil && serial.Source.Pty != nil {
+			serial.Log = &libvirtxml.DomainChardevLog{
+				File:   fmt.Sprintf("%s/vm-%s-serial%d.log", constants.LogMountPoint, id, i),
+				Append: "on",
+			}
+		}
+	}
+}
+
+// profileIndependentDigest excludes only fields controlled by a hardware profile.
+// Topology, vCPU count, tuning, memory, devices and all other VM intent remain in
+// this digest so a profile edit cannot hide an unrelated definition change.
+func profileIndependentDigest(desc libvirtxml.Domain) (string, error) {
+	if desc.OS != nil && desc.OS.Type != nil {
+		os := *desc.OS
+		kind := *os.Type
+		kind.Machine = ""
+		os.Type = &kind
+		desc.OS = &os
+	}
+
+	if desc.CPU != nil {
+		cpu := *desc.CPU
+		cpu.Mode = ""
+		cpu.Match = ""
+		cpu.Check = ""
+		cpu.Migratable = ""
+		cpu.Model = nil
+		cpu.Features = nil
+		desc.CPU = &cpu
+	}
+
+	canonical, err := desc.Marshal()
+	if err != nil {
+		return "", fmt.Errorf("marshal profile-independent domain XML: %w", err)
+	}
+
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(canonical))), nil
+}
+
+func (c *client) needsRestart(found libvirt.Domain, exists bool, desired definitionDigests) (bool, error) {
+	if !exists {
+		return true, nil
+	}
+
+	current, err := c.definitionMetadata(found)
+	if err != nil {
+		return false, err
+	}
+
+	persistent, err := c.rpc.DomainIsPersistent(found)
+	if err != nil {
+		return false, err
+	}
+
+	if persistent != 0 {
+		return true, nil
+	}
+
+	active, err := c.rpc.DomainIsActive(found)
+	if err != nil {
+		return false, err
+	}
+
+	if active == 0 {
+		return true, nil
+	}
+
+	// A profile-only edit takes effect at the next stop/start. Both digests are
+	// stored by libvirt, so this survives a machined reconnect without pretending
+	// libvirt's expanded live CPU XML is identical to the requested profile.
+	return current.Full != desired.Full &&
+		(current.Configuration == "" || current.Configuration != desired.Configuration), nil
+}
+
+func (c *client) definitionMetadata(found libvirt.Domain) (definitionDigests, error) {
+	currentXML, err := c.rpc.DomainGetXMLDesc(found, 0)
+	if err != nil {
+		return definitionDigests{}, err
+	}
+
+	var current libvirtxml.Domain
+
+	if err = current.Unmarshal(currentXML); err != nil {
+		return definitionDigests{}, err
+	}
+
+	if current.Metadata == nil {
+		return definitionDigests{}, fmt.Errorf("domain %q has no Talos ownership metadata", found.Name)
+	}
+
+	var metadata struct {
+		Definition definitionDigests `xml:"https://talos.dev/libvirt/domain definition"`
+	}
+
+	if err = xml.Unmarshal([]byte("<metadata>"+current.Metadata.XML+"</metadata>"), &metadata); err != nil {
+		return definitionDigests{}, fmt.Errorf("invalid domain metadata: %w", err)
+	}
+
+	if metadata.Definition.Full == "" {
+		return definitionDigests{}, fmt.Errorf("domain %q has no Talos ownership metadata", found.Name)
+	}
+
+	return metadata.Definition, nil
+}
+
+func (c *client) removeManagedSave(found libvirt.Domain) error {
+	persistent, err := c.rpc.DomainIsPersistent(found)
+	if err != nil || persistent == 0 {
+		return err
+	}
+
+	saved, err := c.rpc.DomainHasManagedSaveImage(found, 0)
+	if err != nil || saved == 0 {
+		return err
+	}
+
+	return c.rpc.DomainManagedSaveRemove(found, 0)
+}
+
+func (c *client) stopIfActive(found libvirt.Domain) error {
+	active, err := c.rpc.DomainIsActive(found)
+	if err != nil || active == 0 {
+		return err
+	}
+
+	return c.rpc.DomainDestroy(found)
+}
+
+// owned looks a claimed domain up and proves Talos defined it.
+//
+// It reports exists=false both when there is no such domain and when the domain went away between
+// the inventory which named it and this call.
+func (c *client) owned(d Domain) (libvirt.Domain, bool, error) {
+	if err := validateDomain(d); err != nil {
+		return libvirt.Domain{}, false, err
+	}
+
+	found, exists, err := c.lookup(d)
+	if err != nil || !exists {
+		return libvirt.Domain{}, false, err
+	}
+
+	if _, err = c.definitionMetadata(found); err != nil {
+		return libvirt.Domain{}, false, err
+	}
+
+	return found, true, nil
+}
+
+// hasCode reports whether err is a libvirt error with one of codes.
+func hasCode(err error, codes ...libvirt.ErrorNumber) bool {
+	rpcErr, ok := errors.AsType[libvirt.Error](err)
+
+	return ok && slices.Contains(codes, libvirt.ErrorNumber(rpcErr.Code))
+}
+
+// Shutdown asks the guest of a claimed domain to power itself off by pressing the virtual ACPI
+// power button.
+//
+// The request is delivered, not obeyed: a guest which ignores the button keeps running, and
+// nothing here waits for or enforces an outcome. The domain is transient, so a guest which does
+// power off takes its domain with it.
+//
+// A domain which is gone needs nothing pressed. One libvirt refuses the press for, such as a paused
+// domain, reports ErrDomainNotRunning: nothing was delivered.
+func (c *client) Shutdown(d Domain) error {
+	found, exists, err := c.owned(d)
+	if err != nil || !exists {
+		return err
+	}
+
+	err = c.rpc.DomainShutdownFlags(found, libvirt.DomainShutdownAcpiPowerBtn)
+
+	switch {
+	case err == nil, hasCode(err, libvirt.ErrNoDomain):
+		return nil
+	case hasCode(err, libvirt.ErrOperationInvalid):
+		return fmt.Errorf("%w: %w", ErrDomainNotRunning, err)
+	default:
+		return err
+	}
+}
+
+// ErrDomainNotRunning says a domain exists but is not running, so a guest cannot be asked anything.
+var ErrDomainNotRunning = errors.New("domain is not running")
+
+// Reboot asks the guest of a claimed domain to restart itself through its virtual ACPI power
+// button. As with Shutdown, the request is delivered rather than obeyed.
+//
+// The domain object, its definition and its ownership metadata all survive a reboot, so nothing
+// downstream sees the definition change: that is libvirt's default
+// <on_reboot>restart</on_reboot>, which nothing in the rendered definition overrides. Were it
+// destroy instead, a reboot would read downstream as the domain going away, and the controller
+// would cold-boot it from the definition which is live rather than leave it alone.
+func (c *client) Reboot(d Domain) error {
+	found, exists, err := c.owned(d)
+	if err != nil {
+		return err
+	}
+
+	if !exists {
+		return ErrDomainNotRunning
+	}
+
+	active, err := c.rpc.DomainIsActive(found)
+	if err != nil {
+		return err
+	}
+
+	if active == 0 {
+		return ErrDomainNotRunning
+	}
+
+	if err = c.rpc.DomainReboot(found, libvirt.DomainRebootAcpiPowerBtn); err != nil {
+		if hasCode(err, libvirt.ErrNoDomain, libvirt.ErrOperationInvalid) {
+			return ErrDomainNotRunning
+		}
+
+		return err
+	}
+
+	return nil
+}
+
+// Remove destroys a claimed domain. Previously defined persistent domains are
+// also undefined so upgrading the controller cannot leave them behind.
+func (c *client) Remove(d Domain) error {
+	if err := validateDomain(d); err != nil {
+		return err
+	}
+
+	found, exists, err := c.lookup(d)
+	if err != nil || !exists {
+		return err
+	}
+
+	if _, err = c.definitionMetadata(found); err != nil {
+		return err
+	}
+
+	persistent, err := c.rpc.DomainIsPersistent(found)
+	if err != nil {
+		return err
+	}
+
+	if err = c.stopIfActive(found); err != nil {
+		return err
+	}
+
+	if persistent == 0 {
+		return nil
+	}
+
+	if err = c.removeManagedSave(found); err != nil {
+		return err
+	}
+
+	return c.rpc.DomainUndefineFlags(found, libvirt.DomainUndefineManagedSave|libvirt.DomainUndefineNvram)
+}

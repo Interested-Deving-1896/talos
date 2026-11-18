@@ -6,20 +6,18 @@
 package provider
 
 import (
-	"bytes"
 	"context"
 	stdlibtls "crypto/tls"
 	stdx509 "crypto/x509"
+	"errors"
 	"fmt"
-	"log"
 	"sync"
 
 	"github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/siderolabs/crypto/tls"
-	"github.com/siderolabs/crypto/x509"
-	"github.com/siderolabs/gen/xslices"
 
+	"github.com/siderolabs/talos/pkg/machinery/pemutils"
 	"github.com/siderolabs/talos/pkg/machinery/resources/secrets"
 )
 
@@ -91,7 +89,12 @@ func (tlsConfig *TLSConfig) Watch(ctx context.Context) error {
 			// ignore, we'll get another event
 			continue
 		case state.Errored:
-			log.Printf("error watching for trustd certificates: %s", event.Error)
+			if ctx.Err() != nil || errors.Is(event.Error, context.Canceled) {
+				// shutting down
+				return nil //nolint:nilerr // we're shutting down, so this is not an error
+			}
+
+			return fmt.Errorf("error watching for trustd certificates: %w", event.Error)
 		}
 
 		trustdCerts := event.Resource.(*secrets.Trustd) //nolint:forcetypeassert
@@ -129,15 +132,7 @@ func (p *certificateProvider) Update(trustdCerts *secrets.Trustd) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.ca = bytes.Join(
-		xslices.Map(
-			trustdCerts.TypedSpec().AcceptedCAs,
-			func(cert *x509.PEMEncodedCertificate) []byte {
-				return cert.Crt
-			},
-		),
-		nil,
-	)
+	p.ca = pemutils.JoinCertificates(trustdCerts.TypedSpec().AcceptedCAs)
 
 	p.caCertPool = stdx509.NewCertPool()
 	if !p.caCertPool.AppendCertsFromPEM(p.ca) {

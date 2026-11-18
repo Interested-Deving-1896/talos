@@ -1,0 +1,17 @@
+apiVersion: v1alpha1
+kind: VirtualMachineConfig
+name: vm1
+powerState: running
+cpu:
+    count: 4
+memory:
+    size: 4GiB
+firmware:
+    type: uefi
+networking:
+    interfaces:
+        - name: net0
+          link: eth0
+          trustGuestRxFilters: true
+        - name: net1
+          link: eth1

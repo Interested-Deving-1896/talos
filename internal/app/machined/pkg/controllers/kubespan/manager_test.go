@@ -136,9 +136,7 @@ func (suite *ManagerSuite) TestReconcile() {
 				constants.KubeSpanDefaultRoutingTable,
 				nethelpers.FamilyInet4,
 				netip.Prefix{},
-				netip.Addr{},
 				1,
-				"kubespan",
 			),
 		),
 		func(res *network.RouteSpec, asrt *assert.Assertions) {},
@@ -153,9 +151,7 @@ func (suite *ManagerSuite) TestReconcile() {
 				constants.KubeSpanDefaultRoutingTable,
 				nethelpers.FamilyInet6,
 				netip.Prefix{},
-				netip.Addr{},
 				1,
-				"kubespan",
 			),
 		),
 		func(res *network.RouteSpec, asrt *assert.Assertions) {},
@@ -229,6 +225,8 @@ func (suite *ManagerSuite) TestReconcile() {
 	peer2.TypedSpec().Label = "worker-2"
 	peer2.TypedSpec().AllowedIPs = []netip.Prefix{
 		netip.MustParsePrefix("10.244.2.0/24"),
+		netip.MustParsePrefix("fd00:0:0:2::/64"),
+		netip.MustParsePrefix("fd8a:4396:731e:e702:9c83:cbff:fed0:f94b/128"),
 	}
 	peer2.TypedSpec().Endpoints = []netip.AddrPort{
 		netip.MustParseAddrPort("172.20.0.4:51280"),
@@ -311,6 +309,7 @@ func (suite *ManagerSuite) TestReconcile() {
 						IncludeSubnets: []netip.Prefix{
 							netip.MustParsePrefix("10.244.1.0/24"),
 							netip.MustParsePrefix("10.244.2.0/24"),
+							netip.MustParsePrefix("fd00:0:0:2::/64"),
 						},
 					},
 					SetMark: &network.NfTablesMark{
@@ -320,6 +319,103 @@ func (suite *ManagerSuite) TestReconcile() {
 					Verdict: new(nethelpers.VerdictAccept),
 				},
 				spec.Rules[1],
+			)
+		},
+	)
+
+	// check the outgoing chain: the ND exemption must be present and installed
+	// before the destination-address ClampMSS/SetMark rules, otherwise locally
+	// generated Neighbor Discovery packets would still be hijacked into the tunnel.
+	ctest.AssertResource(
+		suite,
+		"kubespan_outgoing",
+		func(res *network.NfTablesChain, asrt *assert.Assertions) {
+			spec := res.TypedSpec()
+
+			asrt.Equal(nethelpers.ChainTypeRoute, spec.Type)
+			asrt.Equal(nethelpers.ChainHookOutput, spec.Hook)
+			asrt.Equal(nethelpers.ChainPriorityFilter, spec.Priority)
+			asrt.Equal(nethelpers.VerdictAccept, spec.Policy)
+
+			asrt.Len(spec.Rules, 5)
+
+			if len(spec.Rules) != 5 {
+				return
+			}
+
+			asrt.Equal(
+				network.NfTablesRule{
+					MatchMark: &network.NfTablesMark{
+						Mask:  constants.KubeSpanDefaultFirewallMask,
+						Value: constants.KubeSpanDefaultFirewallMark,
+					},
+					Verdict: new(nethelpers.VerdictAccept),
+				},
+				spec.Rules[0],
+			)
+
+			asrt.Equal(
+				network.NfTablesRule{
+					MatchOIfName: &network.NfTablesIfNameMatch{
+						InterfaceNames: []string{"lo"},
+					},
+					Verdict: new(nethelpers.VerdictAccept),
+				},
+				spec.Rules[1],
+			)
+
+			asrt.Equal(
+				network.NfTablesRule{
+					MatchLayer4: &network.NfTablesLayer4Match{
+						Protocol: nethelpers.ProtocolICMPv6,
+						MatchICMPType: &network.NfTablesICMPTypeMatch{
+							Types: []nethelpers.ICMPType{
+								nethelpers.ICMPv6TypeNeighborSolicitation,
+								nethelpers.ICMPv6TypeNeighborAdvertisement,
+								nethelpers.ICMPv6TypeRedirect,
+							},
+						},
+					},
+					MatchHopLimit: &network.NfTablesHopLimitMatch{
+						HopLimit: 255,
+					},
+					Verdict: new(nethelpers.VerdictAccept),
+				},
+				spec.Rules[2],
+			)
+
+			asrt.Equal(
+				network.NfTablesRule{
+					MatchDestinationAddress: &network.NfTablesAddressMatch{
+						IncludeSubnets: []netip.Prefix{
+							netip.MustParsePrefix("10.244.1.0/24"),
+							netip.MustParsePrefix("10.244.2.0/24"),
+							netip.MustParsePrefix("fd00:0:0:2::/64"),
+						},
+					},
+					ClampMSS: &network.NfTablesClampMSS{
+						MTU: uint16(cfg.TypedSpec().MTU),
+					},
+				},
+				spec.Rules[3],
+			)
+
+			asrt.Equal(
+				network.NfTablesRule{
+					MatchDestinationAddress: &network.NfTablesAddressMatch{
+						IncludeSubnets: []netip.Prefix{
+							netip.MustParsePrefix("10.244.1.0/24"),
+							netip.MustParsePrefix("10.244.2.0/24"),
+							netip.MustParsePrefix("fd00:0:0:2::/64"),
+						},
+					},
+					SetMark: &network.NfTablesMark{
+						Mask: ^uint32(constants.KubeSpanDefaultFirewallMask),
+						Xor:  constants.KubeSpanDefaultForceFirewallMark,
+					},
+					Verdict: new(nethelpers.VerdictAccept),
+				},
+				spec.Rules[4],
 			)
 		},
 	)
@@ -392,6 +488,7 @@ func (suite *ManagerSuite) TestReconcile() {
 						IncludeSubnets: []netip.Prefix{
 							netip.MustParsePrefix("10.244.1.0/24"),
 							netip.MustParsePrefix("10.244.2.0/24"),
+							netip.MustParsePrefix("fd00:0:0:2::/64"),
 						},
 					},
 					SetMark: &network.NfTablesMark{
@@ -459,16 +556,14 @@ func TestManagerSuite(t *testing.T) {
 
 	suite.Run(t, &ManagerSuite{
 		mockWireguard: mockWireguard,
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 5 * time.Second,
-			AfterSetup: func(s *ctest.DefaultSuite) {
-				s.Require().NoError(s.Runtime().RegisterController(&kubespanctrl.ManagerController{
-					WireguardClientFactory: func() (kubespanctrl.WireguardClient, error) {
-						return mockWireguard, nil
-					},
-					PeerReconcileInterval: time.Second,
-				}))
-			},
+		Timeout:       5 * time.Second,
+		AfterSetup: func(s *ctest.DefaultSuite) {
+			s.Require().NoError(s.Runtime().RegisterController(&kubespanctrl.ManagerController{
+				WireguardClientFactory: func() (kubespanctrl.WireguardClient, error) {
+					return mockWireguard, nil
+				},
+				PeerReconcileInterval: time.Second,
+			}))
 		},
 	})
 }

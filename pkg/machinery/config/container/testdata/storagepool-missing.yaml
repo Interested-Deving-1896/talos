@@ -1,0 +1,5 @@
+apiVersion: v1alpha1
+kind: StoragePoolConfig
+name: vm-images
+volume:
+  name: vm-data

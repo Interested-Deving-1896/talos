@@ -16,6 +16,7 @@ import (
 	"github.com/cosi-project/runtime/pkg/resource/typed"
 
 	"github.com/siderolabs/talos/pkg/machinery/proto"
+	"github.com/siderolabs/talos/pkg/machinery/redactable"
 )
 
 // ProbeSpecType is type of ProbeSpec resource.
@@ -27,6 +28,7 @@ type ProbeSpec = typed.Resource[ProbeSpecSpec, ProbeSpecExtension]
 // ProbeSpecSpec describes the Probe.
 //
 //gotagsrewrite:gen
+//redactgen:gen
 type ProbeSpecSpec struct {
 	// Interval between the probes.
 	Interval time.Duration `yaml:"interval" protobuf:"1"`
@@ -51,7 +53,16 @@ func (spec *ProbeSpecSpec) ID() (resource.ID, error) {
 	var zeroHTTP HTTPProbeSpec
 
 	if spec.HTTP != zeroHTTP {
-		return fmt.Sprintf("http:%s", spec.HTTP.URL.String()), nil
+		u := spec.HTTP.URL
+
+		if u.User != nil {
+			redactedUrl := *u
+			redactedUrl.User = nil
+
+			u = &redactedUrl
+		}
+
+		return fmt.Sprintf("http:%s", u.String()), nil
 	}
 
 	return "", errors.New("no probe type specified")
@@ -77,7 +88,7 @@ type TCPProbeSpec struct {
 //gotagsrewrite:gen
 type HTTPProbeSpec struct {
 	// URL to probe: http:// or https:// URL.
-	URL *url.URL `yaml:"url" protobuf:"1"`
+	URL *url.URL `yaml:"url" protobuf:"1" redact:"replace"`
 	// Timeout for the probe.
 	Timeout time.Duration `yaml:"timeout" protobuf:"2"`
 }
@@ -100,6 +111,7 @@ func (ProbeSpecExtension) ResourceDefinition() meta.ResourceDefinitionSpec {
 		Aliases:          []resource.Type{},
 		DefaultNamespace: NamespaceName,
 		PrintColumns:     []meta.PrintColumn{},
+		Sensitivity:      meta.Sensitive,
 	}
 }
 
@@ -110,4 +122,7 @@ func init() {
 	if err != nil {
 		panic(err)
 	}
+
+	// the spec is sensitive, but it is safe to be read in the redacted form
+	redactable.Register[ProbeSpecSpec, ProbeSpecExtension]()
 }

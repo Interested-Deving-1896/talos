@@ -1,0 +1,22 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+package containers
+
+// Exported for tests.
+var (
+	AllocateSELinuxLevels = allocateSELinuxLevels
+	SELinuxPair           = selinuxPair
+	SELinuxPairCount      = selinuxPairCount
+	DecodeSeccompProfile  = decodeSeccompProfile
+	RunProbeLoop          = runProbeLoop
+	NetNSPath             = netNSPath
+	NetNSDialer           = netNSDialer
+	OpenTaskNetNS         = openTaskNetNS
+	TaskNetNSDialer       = taskNetNSDialer
+	TaskCgroupPath        = taskCgroupPath
+	CheckCgroup           = checkCgroup
+
+	LogContainerStatusTransition = logContainerStatusTransition
+)

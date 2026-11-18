@@ -5,7 +5,6 @@
 package k8s
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -17,11 +16,11 @@ import (
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/siderolabs/crypto/x509"
 	"github.com/siderolabs/gen/optional"
-	"github.com/siderolabs/gen/xslices"
 	"go.uber.org/zap"
 
 	"github.com/siderolabs/talos/internal/pkg/selinux"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
+	"github.com/siderolabs/talos/pkg/machinery/pemutils"
 	"github.com/siderolabs/talos/pkg/machinery/resources/k8s"
 	"github.com/siderolabs/talos/pkg/machinery/resources/secrets"
 )
@@ -161,11 +160,6 @@ func (ctrl *RenderSecretsStaticPodController) Run(ctx context.Context, r control
 		k8sCerts := certsRes.TypedSpec()
 		etcdEncryption := etcdEncryptionConfig.TypedSpec()
 
-		serviceAccountKey, err := rootK8sSecrets.ServiceAccount.GetKey()
-		if err != nil {
-			return fmt.Errorf("error parsing service account key: %w", err)
-		}
-
 		type secret struct {
 			getter       func() *x509.PEMEncodedCertificateAndKey
 			certFilename string
@@ -194,7 +188,11 @@ func (ctrl *RenderSecretsStaticPodController) Run(ctx context.Context, r control
 				gid:          constants.KubernetesAPIServerRunGroup,
 				secrets: []secret{
 					{
-						getter:       func() *x509.PEMEncodedCertificateAndKey { return rootEtcdSecrets.EtcdCA },
+						getter: func() *x509.PEMEncodedCertificateAndKey {
+							return &x509.PEMEncodedCertificateAndKey{
+								Crt: pemutils.JoinCertificates(rootEtcdSecrets.AcceptedCAs),
+							}
+						},
 						certFilename: "etcd-client-ca.crt",
 					},
 					{
@@ -205,7 +203,7 @@ func (ctrl *RenderSecretsStaticPodController) Run(ctx context.Context, r control
 					{
 						getter: func() *x509.PEMEncodedCertificateAndKey {
 							return &x509.PEMEncodedCertificateAndKey{
-								Crt: bytes.Join(xslices.Map(rootK8sSecrets.AcceptedCAs, func(ca *x509.PEMEncodedCertificate) []byte { return ca.Crt }), nil),
+								Crt: pemutils.JoinCertificates(rootK8sSecrets.AcceptedCAs),
 							}
 						},
 						certFilename: "ca.crt",
@@ -223,15 +221,19 @@ func (ctrl *RenderSecretsStaticPodController) Run(ctx context.Context, r control
 					{
 						getter: func() *x509.PEMEncodedCertificateAndKey {
 							return &x509.PEMEncodedCertificateAndKey{
-								Crt: serviceAccountKey.GetPublicKeyPEM(),
-								Key: serviceAccountKey.GetPrivateKeyPEM(),
+								Crt: pemutils.JoinKeys(rootK8sSecrets.ServiceAccountAcceptedKeys),
+								Key: rootK8sSecrets.ServiceAccount.Key,
 							}
 						},
 						certFilename: "service-account.pub",
 						keyFilename:  "service-account.key",
 					},
 					{
-						getter:       func() *x509.PEMEncodedCertificateAndKey { return rootK8sSecrets.AggregatorCA },
+						getter: func() *x509.PEMEncodedCertificateAndKey {
+							return &x509.PEMEncodedCertificateAndKey{
+								Crt: pemutils.JoinCertificates(rootK8sSecrets.AcceptedAggregatorCAs),
+							}
+						},
 						certFilename: "aggregator-ca.crt",
 					},
 					{
@@ -264,8 +266,7 @@ func (ctrl *RenderSecretsStaticPodController) Run(ctx context.Context, r control
 					{
 						getter: func() *x509.PEMEncodedCertificateAndKey {
 							return &x509.PEMEncodedCertificateAndKey{
-								Crt: serviceAccountKey.GetPublicKeyPEM(),
-								Key: serviceAccountKey.GetPrivateKeyPEM(),
+								Key: rootK8sSecrets.ServiceAccount.Key,
 							}
 						},
 						keyFilename: "service-account.key",

@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/siderolabs/talos/pkg/grpc/middleware/authz"
+	grpclog "github.com/siderolabs/talos/pkg/grpc/middleware/log"
 	"github.com/siderolabs/talos/pkg/machinery/resources/runtime"
 	"github.com/siderolabs/talos/pkg/machinery/role"
 )
@@ -50,14 +51,18 @@ type Authorizer struct {
 	// AllowedServices is a list of globs matching service names allowed to connect.
 	AllowedServices []AllowedService
 
-	// Logger.
-	Logger func(format string, v ...any)
-}
+	// SelfMountNamespace, SelfExeDev and SelfExeIno describe the identity of the process running
+	// the authorizer (mount namespace and executable device/inode).
+	//
+	// They are used to recognize the kernel static usermode helper, which re-executes this same
+	// binary in this same mount namespace (e.g. `/sbin/poweroff` -> machined). When SelfExeIno is
+	// zero the check is disabled.
+	SelfMountNamespace string
+	SelfExeDev         uint64
+	SelfExeIno         uint64
 
-func (a *Authorizer) logf(format string, v ...any) {
-	if a.Logger != nil {
-		a.Logger(format, v...)
-	}
+	// UsermodeHelperRoles is the role set granted to a recognized usermode helper.
+	UsermodeHelperRoles role.Set
 }
 
 func (a *Authorizer) matchService(servicePID *runtime.ServicePID, pid int32, mountNamespace string) (role.Set, bool) {
@@ -72,13 +77,31 @@ func (a *Authorizer) matchService(servicePID *runtime.ServicePID, pid int32, mou
 	return role.Set{}, false
 }
 
-// authorize returns error if the calling process is not authorized (doesn't have a valid PID) to call the given gRPC method.
+// matchUsermodeHelper reports whether the peer is the kernel static usermode helper: this same
+// binary (same executable inode), re-executed by the kernel in this same mount namespace as root.
+//
+// This is intended to distinguish the kernel usermode helper from typical containerized processes:
+// peers in a different mount namespace and/or running a different executable inode won't match.
+func (a *Authorizer) matchUsermodeHelper(creds PeerCredentials) bool {
+	if a.SelfExeIno == 0 {
+		// not configured -> disabled
+		return false
+	}
+
+	return creds.UID == 0 &&
+		creds.ExeDev == a.SelfExeDev && creds.ExeIno == a.SelfExeIno &&
+		creds.MountNamespace != "" && creds.MountNamespace == a.SelfMountNamespace
+}
+
+// Authorize returns the role set allowed for the calling process based on Unix peer credentials.
+//
+// It returns ErrNotAuthorized when the peer PID/mount namespace cannot be mapped to an allowed service (or usermode helper).
 //
 //nolint:gocyclo
-func (a *Authorizer) authorize(ctx context.Context) (role.Set, error) {
+func (a *Authorizer) Authorize(ctx context.Context) (role.Set, error) {
 	peerCreds, ok := GetPeerCredentials(ctx)
 	if !ok {
-		a.logf("no peer credentials found in context")
+		grpclog.Annotatef(ctx, "no peer credentials found in context")
 
 		return role.Set{}, ErrNotAuthorized
 	}
@@ -99,10 +122,19 @@ func (a *Authorizer) authorize(ctx context.Context) (role.Set, error) {
 	for servicePID := range servicePIDs.All() {
 		allowedRoles, matched := a.matchService(servicePID, pid, mountNamespace)
 		if matched {
-			a.logf("authorized based on PID (%d) match with service %q (allowed roles %s)", pid, servicePID.Metadata().ID(), allowedRoles.Strings())
+			grpclog.Annotatef(ctx, "authorized based on PID (%d) match with service %q (allowed roles %s)", pid, servicePID.Metadata().ID(), allowedRoles.Strings())
 
 			return allowedRoles, nil
 		}
+	}
+
+	// recognize the kernel static usermode helper (e.g. /sbin/poweroff -> machined): it re-executes
+	// this same binary in this same mount namespace, but has an ephemeral PID that never appears as
+	// a service PID, so it would otherwise fall through to the watch below and time out.
+	if a.matchUsermodeHelper(peerCreds) {
+		grpclog.Annotatef(ctx, "authorized usermode helper (PID %d) with roles %s", pid, a.UsermodeHelperRoles.Strings())
+
+		return a.UsermodeHelperRoles, nil
 	}
 
 	// perform a watch to wait for the PID to appear in the state, as it might not be there yet if the service is just starting
@@ -115,7 +147,7 @@ func (a *Authorizer) authorize(ctx context.Context) (role.Set, error) {
 	for {
 		select {
 		case <-ctx.Done():
-			a.logf("timed out waiting for runner state to be populated with PID")
+			grpclog.Annotatef(ctx, "timed out waiting for runner state to be populated with PID (%d)", pid)
 
 			return role.Set{}, ErrNotAuthorized
 		case wrappedEvent := <-eventCh:
@@ -128,7 +160,7 @@ func (a *Authorizer) authorize(ctx context.Context) (role.Set, error) {
 
 				allowedRoles, matched := a.matchService(servicePID, pid, mountNamespace)
 				if matched {
-					a.logf("authorized based on PID (%d) match with service %q (allowed roles %s)", pid, servicePID.Metadata().ID(), allowedRoles.Strings())
+					grpclog.Annotatef(ctx, "authorized based on PID (%d) match with service %q (allowed roles %s)", pid, servicePID.Metadata().ID(), allowedRoles.Strings())
 
 					return allowedRoles, nil
 				}
@@ -144,7 +176,7 @@ func (a *Authorizer) authorize(ctx context.Context) (role.Set, error) {
 // UnaryInterceptor returns grpc UnaryServerInterceptor.
 func (a *Authorizer) UnaryInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		allowedRoles, err := a.authorize(ctx)
+		allowedRoles, err := a.Authorize(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -162,7 +194,7 @@ func (a *Authorizer) StreamInterceptor() grpc.StreamServerInterceptor {
 	return func(srv any, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
 		ctx := stream.Context()
 
-		allowedRoles, err := a.authorize(ctx)
+		allowedRoles, err := a.Authorize(ctx)
 		if err != nil {
 			return err
 		}

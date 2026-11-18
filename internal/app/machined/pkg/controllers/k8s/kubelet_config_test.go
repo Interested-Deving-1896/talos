@@ -16,7 +16,9 @@ import (
 	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
 	k8sctrl "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/k8s"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
+	k8scfg "github.com/siderolabs/talos/pkg/machinery/config/types/k8s"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
+	"github.com/siderolabs/talos/pkg/machinery/config/types/runtime"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/resources/config"
@@ -46,29 +48,29 @@ func (suite *KubeletConfigSuite) TestReconcile() {
 			&v1alpha1.Config{
 				ConfigVersion: "v1alpha1",
 				MachineConfig: &v1alpha1.MachineConfig{
-					MachineKubelet: &v1alpha1.KubeletConfig{
-						KubeletImage:      "kubelet",
-						KubeletClusterDNS: []string{"10.0.0.1"},
-						KubeletExtraArgs: meta.Args{
+					MachineKubelet: &v1alpha1.KubeletConfig{ //nolint:staticcheck // legacy config
+						KubeletImage:      "kubelet",            //nolint:staticcheck // legacy config
+						KubeletClusterDNS: []string{"10.0.0.1"}, //nolint:staticcheck // legacy config
+						KubeletExtraArgs: meta.Args{ //nolint:staticcheck // legacy config
 							"enable-feature": meta.NewArgValue("foo", nil),
 						},
-						KubeletExtraMounts: []v1alpha1.ExtraMount{
+						KubeletExtraMounts: []v1alpha1.ExtraMount{ //nolint:staticcheck // testing deprecated field
 							{
 								Destination: "/tmp",
 								Source:      "/var",
 								Type:        "tmpfs",
 							},
 						},
-						KubeletExtraConfig: meta.Unstructured{
+						KubeletExtraConfig: meta.Unstructured{ //nolint:staticcheck // testing deprecated field
 							Object: map[string]any{
 								"serverTLSBootstrap": true,
 							},
 						},
-						KubeletDefaultRuntimeSeccompProfileEnabled: new(true),
+						KubeletDefaultRuntimeSeccompProfileEnabled: new(true), //nolint:staticcheck // testing deprecated field
 					},
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
@@ -76,7 +78,7 @@ func (suite *KubeletConfigSuite) TestReconcile() {
 					ExternalCloudProviderConfig: &v1alpha1.ExternalCloudProviderConfig{
 						ExternalEnabled: new(true),
 					},
-					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{ //nolint:staticcheck // testing deprecated field
 						DNSDomain: "service.svc",
 					},
 				},
@@ -130,18 +132,18 @@ func (suite *KubeletConfigSuite) TestReconcileDefaults() {
 			&v1alpha1.Config{
 				ConfigVersion: "v1alpha1",
 				MachineConfig: &v1alpha1.MachineConfig{
-					MachineKubelet: &v1alpha1.KubeletConfig{
-						KubeletImage: "kubelet",
+					MachineKubelet: &v1alpha1.KubeletConfig{ //nolint:staticcheck // legacy config
+						KubeletImage: "kubelet", //nolint:staticcheck // legacy config
 					},
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
 					},
-					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{
-						ServiceSubnet: []string{constants.DefaultIPv4ServiceNet},
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{ //nolint:staticcheck // testing deprecated field
+						ServiceSubnet: []string{constants.DefaultIPv4ServiceCIDR},
 					},
 				},
 			},
@@ -159,6 +161,117 @@ func (suite *KubeletConfigSuite) TestReconcileDefaults() {
 		asrt.Empty(spec.ExtraArgs)
 		asrt.Empty(spec.ExtraMounts)
 		asrt.False(spec.CloudProviderExternal)
+		asrt.Zero(spec.KubepodsMemoryLimit)
+	})
+}
+
+func (suite *KubeletConfigSuite) TestReconcileKubepodsMemoryLimit() {
+	u, err := url.Parse("https://foo:6443")
+	suite.Require().NoError(err)
+
+	suite.createStaticPodServerStatus()
+
+	v1alpha1Cfg := &v1alpha1.Config{
+		ConfigVersion: "v1alpha1",
+		MachineConfig: &v1alpha1.MachineConfig{
+			MachineKubelet: &v1alpha1.KubeletConfig{ //nolint:staticcheck // legacy config
+				KubeletImage: "kubelet", //nolint:staticcheck // legacy config
+			},
+		},
+		ClusterConfig: &v1alpha1.ClusterConfig{
+			ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
+				Endpoint: &v1alpha1.Endpoint{
+					URL: u,
+				},
+			},
+			ClusterNetwork: &v1alpha1.ClusterNetworkConfig{ //nolint:staticcheck // testing deprecated field
+				ServiceSubnet: []string{constants.DefaultIPv4ServiceCIDR},
+			},
+		},
+	}
+
+	workloadResources := runtime.NewWorkloadResourceConfigV1Alpha1()
+	workloadResources.KubepodsConfig = &runtime.WorkloadResourceRoot{
+		MemoryConfig: &runtime.WorkloadMemoryResource{MemoryLimit: meta.MustByteSize("16GiB")},
+	}
+	workloadResources.TalosContainersConfig = &runtime.WorkloadResourceRoot{
+		MemoryConfig: &runtime.WorkloadMemoryResource{MemoryLimit: meta.MustByteSize("4GiB")},
+	}
+
+	ctr, err := container.New(v1alpha1Cfg, workloadResources)
+	suite.Require().NoError(err)
+
+	cfg := config.NewMachineConfig(ctr)
+	suite.Create(cfg)
+
+	ctest.AssertResource(suite, k8s.KubeletID, func(r *k8s.KubeletConfig, asrt *assert.Assertions) {
+		asrt.Equal(uint64(16<<30), r.TypedSpec().KubepodsMemoryLimit)
+	})
+
+	containersOnly := runtime.NewWorkloadResourceConfigV1Alpha1()
+	containersOnly.TalosContainersConfig = workloadResources.TalosContainersConfig
+
+	ctr, err = container.New(v1alpha1Cfg, containersOnly)
+	suite.Require().NoError(err)
+
+	replacement := config.NewMachineConfig(ctr)
+	replacement.Metadata().SetVersion(cfg.Metadata().Version())
+	suite.Update(replacement)
+
+	ctest.AssertResource(suite, k8s.KubeletID, func(r *k8s.KubeletConfig, asrt *assert.Assertions) {
+		asrt.Zero(r.TypedSpec().KubepodsMemoryLimit)
+	})
+}
+
+func (suite *KubeletConfigSuite) TestReconcileCredentialProvider() {
+	u, err := url.Parse("https://foo:6443")
+	suite.Require().NoError(err)
+
+	suite.createStaticPodServerStatus()
+
+	v1alpha1Cfg := &v1alpha1.Config{
+		ConfigVersion: "v1alpha1",
+		MachineConfig: &v1alpha1.MachineConfig{},
+		ClusterConfig: &v1alpha1.ClusterConfig{
+			ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
+				Endpoint: &v1alpha1.Endpoint{
+					URL: u,
+				},
+			},
+			ClusterNetwork: &v1alpha1.ClusterNetworkConfig{ //nolint:staticcheck // testing deprecated field
+				ServiceSubnet: []string{constants.DefaultIPv4ServiceCIDR},
+			},
+		},
+	}
+
+	credentialProviderCfg := k8scfg.NewKubeCredentialProviderConfigV1Alpha1()
+	credentialProviderCfg.CredentialProviderConfig.Object = map[string]any{
+		"apiVersion": "kubelet.config.k8s.io/v1",
+		"kind":       "CredentialProviderConfig",
+	}
+	credentialProviderCfg.CredentialProviderConfigFiles = []k8scfg.KubeCredentialProviderConfigFileV1Alpha1{
+		{
+			FileName:    "azure.json",
+			FileContent: "{}",
+		},
+	}
+
+	ctr, err := container.New(v1alpha1Cfg, credentialProviderCfg)
+	suite.Require().NoError(err)
+
+	suite.Create(config.NewMachineConfig(ctr))
+
+	ctest.AssertResource(suite, k8s.KubeletID, func(r *k8s.KubeletConfig, asrt *assert.Assertions) {
+		spec := r.TypedSpec()
+
+		asrt.Equal(
+			map[string]any{
+				"apiVersion": "kubelet.config.k8s.io/v1",
+				"kind":       "CredentialProviderConfig",
+			},
+			spec.CredentialProviderConfig,
+		)
+		asrt.Equal(map[string]string{"azure.json": "{}"}, spec.CredentialProviderFiles)
 	})
 }
 
@@ -166,11 +279,9 @@ func TestKubeletConfigSuite(t *testing.T) {
 	t.Parallel()
 
 	suite.Run(t, &KubeletConfigSuite{
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 10 * time.Second,
-			AfterSetup: func(suite *ctest.DefaultSuite) {
-				suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewKubeletConfigController()))
-			},
+		Timeout: 10 * time.Second,
+		AfterSetup: func(suite *ctest.DefaultSuite) {
+			suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewKubeletConfigController()))
 		},
 	})
 }

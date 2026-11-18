@@ -1,0 +1,548 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+package storage
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net"
+	"os"
+	"strings"
+	"syscall"
+
+	libvirt "github.com/digitalocean/go-libvirt"
+	"libvirt.org/go/libvirtxml"
+
+	"github.com/siderolabs/talos/internal/pkg/libvirt/storage/copyowner"
+)
+
+// volumeMode is the permission a created volume is given.
+//
+// Set explicitly rather than inherited: libvirt's own default for a directory pool depends on the
+// daemon's configuration, which lives in the extension rather than here, and a volume the guest
+// cannot open is indistinguishable from one that was never created.
+const volumeMode = 0o600
+
+const rawFormat = "raw"
+
+// errVolumeExists reports a name already taken in the pool. CreateVolume never overwrites.
+var errVolumeExists = errors.New("volume already exists")
+
+// ErrVolumeObservationUnavailable identifies a read RPC interrupted by transport loss.
+// A received rejection or a malformed completed reply is not an outage.
+var ErrVolumeObservationUnavailable = errors.New("volume observation unavailable")
+
+// ErrCopyFormatUnsupported identifies a definitive format rejection after observing a copy.
+var ErrCopyFormatUnsupported = errors.New("copy source must be a self-contained raw image or ISO")
+
+func volumeReadRPCError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	// The SDK returns XDR decode failures from completed replies as opaque errors,
+	// including an EOF inside its decoder. Only direct transport errors are evidence
+	// of lost observation; unknown errors and unsupported procedures stay permanent.
+	if rpcErr, ok := errors.AsType[libvirt.Error](err); ok {
+		if rpcErr.Code != uint32(libvirt.ErrNoConnect) {
+			return err
+		}
+
+		return fmt.Errorf("%w: %w", ErrVolumeObservationUnavailable, err)
+	}
+
+	for _, interrupted := range []error{
+		libvirt.ErrInterrupted,
+		context.Canceled,
+		context.DeadlineExceeded,
+		io.EOF,
+		io.ErrUnexpectedEOF,
+		io.ErrClosedPipe,
+		io.ErrShortWrite,
+		net.ErrClosed,
+	} {
+		if errors.Is(err, interrupted) {
+			return fmt.Errorf("%w: %w", ErrVolumeObservationUnavailable, err)
+		}
+	}
+
+	if netErr, ok := errors.AsType[*net.OpError](err); ok && netErr != nil {
+		return fmt.Errorf("%w: %w", ErrVolumeObservationUnavailable, err)
+	}
+
+	return err
+}
+
+// Volume is an observed volume within a pool.
+type Volume struct {
+	// Name is the volume's name within its pool, which is its file name in the pool directory.
+	Name string
+	// Path is the absolute host path of the volume's file.
+	Path string
+	// Format is the volume's on-disk format, as libvirt reports it: "raw", "qcow2", and so on.
+	Format string
+	// Capacity is the volume's logical size in bytes -- what a guest sees, not what the file
+	// occupies.
+	Capacity uint64
+}
+
+// Volume looks a volume up by name within a pool.
+//
+// A miss refreshes the pool once before being reported: libvirt rereads a directory pool when it
+// activates it and at no other time, so a volume which appeared since -- including one this host
+// created before its last restart -- is otherwise invisible.
+func (c *Client) Volume(pool Pool, name string) (Volume, bool, error) {
+	p, exists, err := c.lookup(pool)
+	if err != nil {
+		return Volume{}, false, err
+	}
+
+	if !exists {
+		return Volume{}, false, fmt.Errorf("storage pool %q is not defined", pool.Name)
+	}
+
+	return c.volume(p, name, true)
+}
+
+// volume looks a volume up, optionally refreshing the pool once on a miss.
+func (c *Client) volume(p libvirt.StoragePool, name string, refresh bool) (Volume, bool, error) {
+	vol, err := c.rpc.StorageVolLookupByName(p, name)
+	if err != nil {
+		if !isNoStorageVol(err) {
+			return Volume{}, false, volumeReadRPCError(err)
+		}
+
+		if !refresh {
+			return Volume{}, false, nil
+		}
+
+		if err = c.rpc.StoragePoolRefresh(p, 0); err != nil {
+			return Volume{}, false, fmt.Errorf("failed to refresh storage pool %q: %w", p.Name, volumeReadRPCError(err))
+		}
+
+		return c.volume(p, name, false)
+	}
+
+	return c.describeVolume(vol, name)
+}
+
+// describeVolume reads a volume's path, format and logical capacity.
+func (c *Client) describeVolume(vol libvirt.StorageVol, name string) (Volume, bool, error) {
+	path, err := c.rpc.StorageVolGetPath(vol)
+	if err != nil {
+		return Volume{}, false, volumeReadRPCError(err)
+	}
+
+	text, err := c.rpc.StorageVolGetXMLDesc(vol, 0)
+	if err != nil {
+		return Volume{}, false, volumeReadRPCError(err)
+	}
+
+	var desc libvirtxml.StorageVolume
+	if err = desc.Unmarshal(text); err != nil {
+		return Volume{}, false, err
+	}
+
+	var format string
+
+	if desc.Target != nil && desc.Target.Format != nil {
+		format = desc.Target.Format.Type
+	}
+
+	// Capacity, not allocation: allocation is what the file occupies on the host, which for a
+	// sparse volume says nothing about the size the guest is offered.
+	_, capacity, _, err := c.rpc.StorageVolGetInfo(vol)
+	if err != nil {
+		return Volume{}, false, volumeReadRPCError(err)
+	}
+
+	return Volume{Name: name, Path: path, Format: format, Capacity: capacity}, true, nil
+}
+
+// CreateVolume creates a sparse volume of capacity bytes in the given format.
+//
+// It never overwrites: a name already taken in the pool is refused rather than reused, so no call
+// here can destroy a volume's contents.
+//
+// The volume is built under a staged name and atomically linked into place without replacing an
+// existing name, so the name asked for either does not exist or names a volume created in full.
+// That matters most for qcow2, where a truncated header is a file QEMU refuses to open at domain
+// start rather than one this can grade.
+func (c *Client) CreateVolume(pool Pool, name, format string, capacity uint64, backingFile, backingFormat string) (Volume, error) {
+	p, target, err := c.poolDirectory(pool)
+	if err != nil {
+		return Volume{}, err
+	}
+
+	switch _, found, volErr := c.volume(p, name, true); {
+	case volErr != nil:
+		return Volume{}, volErr
+	case found:
+		return Volume{}, fmt.Errorf("%w: %q in storage pool %q", errVolumeExists, name, pool.Name)
+	}
+
+	if err = c.stageVolumeIntoPlace(p, target, name, format, capacity, backingFile, backingFormat); err != nil {
+		return Volume{}, err
+	}
+
+	volume, found, err := c.volume(p, name, false)
+
+	switch {
+	case err != nil:
+		return Volume{}, err
+	case !found:
+		return Volume{}, fmt.Errorf("volume %q is missing from storage pool %q after creation", name, pool.Name)
+	}
+
+	return volume, nil
+}
+
+// ErrCopySourceRequired identifies an owned copy which has not yet been provisioned.
+var ErrCopySourceRequired = errors.New("copy source is required for initial provisioning")
+
+func (c *Client) adoptCopy(p libvirt.StoragePool, root *os.Root, name, witness string) (Volume, bool, error) {
+	exists, err := copyowner.Check(root, name, witness)
+	if err != nil {
+		return Volume{}, false, err
+	}
+
+	if !exists {
+		if strings.HasPrefix(witness, ".copy-on-use/image-") {
+			return Volume{}, false, nil // A deleted writable disk is never recovered from hidden guest bytes.
+		}
+
+		exists, err = copyowner.Recover(root, name, witness)
+		if !exists || err != nil {
+			return Volume{}, false, err
+		}
+	} else {
+		// Ownership links may survive an attempt whose directory sync failed.
+		// Restore both ordered barriers before admitting the existing copy.
+		if err := copyowner.Sync(root, ".copy-on-use"); err != nil {
+			return Volume{}, false, err
+		}
+
+		if err := copyowner.Sync(root, "."); err != nil {
+			return Volume{}, false, err
+		}
+	}
+
+	volume, err := c.observedOwnedCopy(p, root, name, witness)
+
+	return volume, true, err
+}
+
+func (c *Client) copiedVolume(p libvirt.StoragePool, name string) (Volume, error) {
+	volume, found, err := c.volume(p, name, true)
+	if err != nil {
+		return Volume{}, err
+	}
+
+	if !found {
+		return Volume{}, fmt.Errorf("copy volume %q has no libvirt observation", name)
+	}
+
+	if volume.Format != rawFormat && volume.Format != "iso" && volume.Format != "qcow2" {
+		return Volume{}, fmt.Errorf("%w: copy volume %q has format %q", ErrCopyFormatUnsupported, name, volume.Format)
+	}
+
+	// Libvirt probes ISO9660 media as "iso"; QEMU attaches its bytes with the raw driver.
+	if volume.Format == "iso" {
+		volume.Format = rawFormat
+	}
+
+	return volume, nil
+}
+
+// poolDirectory resolves a pool to its libvirt handle and the directory its volumes are files in.
+func (c *Client) poolDirectory(pool Pool) (libvirt.StoragePool, string, error) {
+	p, exists, err := c.lookup(pool)
+	if err != nil {
+		return p, "", err
+	}
+
+	if !exists {
+		return p, "", fmt.Errorf("storage pool %q is not defined", pool.Name)
+	}
+
+	target, err := c.target(p)
+	if err != nil {
+		return p, "", err
+	}
+
+	if target == "" {
+		return p, "", fmt.Errorf("storage pool %q has no target directory", pool.Name)
+	}
+
+	return p, target, nil
+}
+
+// stageVolumeIntoPlace builds the volume under a staged name and publishes it without replacement.
+func (c *Client) stageVolumeIntoPlace(p libvirt.StoragePool, target, name, format string, capacity uint64, backingFile, backingFormat string) (result error) {
+	// Leftovers from interrupted or failed creates are cleared first, so a pool directory does not
+	// collect one staged file per attempt. Safe here: StoragePoolVolumeController is the only writer
+	// of a pool's volumes and reconciles one at a time, so no staged name in flight is another
+	// caller's. The error is returned rather than ignored -- publication below needs write access
+	// to this same directory, so a sweep which cannot remove a file predicts a create which cannot
+	// finish.
+	if err := copyowner.SweepStages(target); err != nil {
+		return err
+	}
+
+	root, err := os.OpenRoot(target)
+	if err != nil {
+		return err
+	}
+
+	defer root.Close() //nolint:errcheck
+
+	staged := copyowner.StageName(name)
+
+	releaseStage := copyowner.ProtectStage(target, staged)
+	defer releaseStage()
+
+	// Also remove a partial file when libvirt fails during creation. A successful publication
+	// removes the staged link before refreshing libvirt's cached view of the directory.
+	defer func() {
+		if err := root.Remove(staged); err != nil && !os.IsNotExist(err) {
+			result = errors.Join(result, fmt.Errorf("failed to remove staged volume %q: %w", staged, err))
+		}
+	}()
+
+	if err = c.createStagedVolume(p, staged, format, capacity, backingFile, backingFormat); err != nil {
+		return err
+	}
+
+	// A hard link publishes the completed inode only if the final name is still free. Unlike
+	// rename, link cannot replace a file (or symlink) which appeared since the libvirt lookup.
+	// Both names are resolved under the same rooted pool directory.
+	if err = root.Link(staged, name); err != nil {
+		if os.IsExist(err) {
+			return fmt.Errorf("%w: %q in storage pool %q: %w", errVolumeExists, name, p.Name, err)
+		}
+
+		return fmt.Errorf("failed to publish staged volume %q: %w", staged, err)
+	}
+
+	if err = root.Remove(staged); err != nil {
+		return fmt.Errorf("failed to remove published staged volume %q: %w", staged, err)
+	}
+
+	// Publication happened underneath libvirt, which still has the staged name cached and not
+	// the final one.
+	if err = c.rpc.StoragePoolRefresh(p, 0); err != nil {
+		return fmt.Errorf("failed to refresh storage pool %q: %w", p.Name, err)
+	}
+
+	return nil
+}
+
+// createStagedVolume builds the volume libvirt will later be told to reread under its real name.
+func (c *Client) createStagedVolume(p libvirt.StoragePool, name, format string, capacity uint64, backingFile, backingFormat string) error {
+	desc := libvirtxml.StorageVolume{
+		Name: name,
+		// Allocation is pinned at zero so the volume is sparse. Left unset, libvirt allocates the
+		// whole capacity up front, which for a raw volume on a filesystem without working fallocate
+		// means writing that many zeros -- far longer than any session here is given.
+		Allocation: &libvirtxml.StorageVolumeSize{Unit: "bytes", Value: 0},
+		Capacity:   &libvirtxml.StorageVolumeSize{Unit: "bytes", Value: capacity},
+		Target: &libvirtxml.StorageVolumeTarget{
+			Format:      &libvirtxml.StorageVolumeTargetFormat{Type: format},
+			Permissions: &libvirtxml.StorageVolumeTargetPermissions{Mode: fmt.Sprintf("%04o", volumeMode)},
+		},
+	}
+
+	if backingFile != "" {
+		desc.BackingStore = &libvirtxml.StorageVolumeBackingStore{Path: backingFile}
+		if backingFormat != "" {
+			desc.BackingStore.Format = &libvirtxml.StorageVolumeTargetFormat{Type: backingFormat}
+		}
+	}
+
+	text, err := desc.Marshal()
+	if err != nil {
+		return err
+	}
+
+	if _, err = c.rpc.StorageVolCreateXML(p, text, 0); err != nil {
+		return fmt.Errorf("failed to create volume %q in storage pool %q: %w", name, p.Name, err)
+	}
+
+	return nil
+}
+
+// ResizeVolumeOperation grows a volume to capacity bytes and reports whether the
+// mutation finished, was not submitted, or has an uncertain result.
+//
+// Owned raw images grow by a pinned file descriptor, with a size check that rejects
+// shrink; other volumes keep libvirt's resize RPC without its shrink flag. Resizing
+// a volume a guest has open is the caller's to avoid -- for qcow2 QEMU holds a
+// write lock and this fails, and for raw it succeeds while the guest goes on
+// seeing the old size.
+func (c *Client) ResizeVolumeOperation(pool Pool, name string, capacity uint64) (OperationOutcome, error) {
+	var evidence mutationEvidence
+
+	p, exists, err := c.lookup(pool)
+	if err != nil {
+		return evidence.outcome, err
+	}
+
+	if !exists {
+		return evidence.outcome, fmt.Errorf("storage pool %q is not defined", pool.Name)
+	}
+
+	vol, err := c.rpc.StorageVolLookupByName(p, name)
+	if err != nil {
+		return evidence.outcome, fmt.Errorf("failed to look up volume %q in storage pool %q: %w", name, pool.Name, volumeReadRPCError(err))
+	}
+
+	// A writable raw image owns its format independently of libvirt's content probe.
+	if handled, outcome, growErr := c.growOwnedRawImage(p, name, capacity); handled {
+		return outcome, growErr
+	}
+
+	err = c.rpc.StorageVolResize(vol, capacity, 0)
+	evidence.record(err)
+
+	return evidence.outcome, err
+}
+
+// growOwnedRawImage uses the inode-bound image marker, never guest sector signatures.
+// A missing marker or an owned qcow2 image keeps the usual libvirt resize path.
+func (c *Client) growOwnedRawImage(pool libvirt.StoragePool, name string, capacity uint64) (bool, OperationOutcome, error) {
+	if copyowner.ValidateName(name) != nil {
+		return false, NoMutationSubmitted, nil
+	}
+
+	// Read-only observation: nothing was submitted, so a lost reply is an
+	// observation outage rather than an uncertain mutation.
+	target, err := c.target(pool)
+	if err != nil {
+		return true, NoMutationSubmitted, fmt.Errorf("failed to read storage pool %q target: %w", pool.Name, volumeReadRPCError(err))
+	}
+
+	if target == "" {
+		return true, NoMutationSubmitted, fmt.Errorf("storage pool %q has no target directory", pool.Name)
+	}
+
+	root, err := os.OpenRoot(target)
+	if err != nil {
+		return true, NoMutationSubmitted, err
+	}
+	defer root.Close() //nolint:errcheck
+
+	// An unreadable marker fails closed: falling back to libvirt's resize
+	// would let it reclassify guest-written raw bytes by content probe.
+	witness := copyowner.Witness(name, true)
+	if _, err := root.Lstat(witness); os.IsNotExist(err) {
+		return false, NoMutationSubmitted, nil
+	} else if err != nil {
+		return true, NoMutationSubmitted, err
+	}
+
+	identity, format, valid, err := copyowner.ReadImageMarker(root, witness)
+	if err != nil {
+		return true, NoMutationSubmitted, err
+	}
+
+	if !valid {
+		return true, NoMutationSubmitted, errors.New("invalid writable image ownership marker")
+	}
+
+	if format != rawFormat {
+		err := validateResizeImageOwnership(root, name, witness)
+
+		return err != nil, NoMutationSubmitted, err
+	}
+
+	outcome, err := growPinnedRawImage(root, name, identity, capacity)
+
+	return true, outcome, err
+}
+
+func validateResizeImageOwnership(root *os.Root, name, witness string) error {
+	owned, err := copyowner.Check(root, name, witness)
+	if err != nil || !owned {
+		return errors.Join(err, errors.New("image volume is not owned by its marker"))
+	}
+
+	return nil
+}
+
+func growPinnedRawImage(root *os.Root, name, identity string, capacity uint64) (OperationOutcome, error) {
+	file, err := root.OpenFile(name, os.O_RDWR, 0)
+	if err != nil {
+		return NoMutationSubmitted, err
+	}
+	defer file.Close() //nolint:errcheck
+
+	opened, err := validatePinnedRawImage(root, file, name, identity)
+	if err != nil {
+		return NoMutationSubmitted, err
+	}
+
+	if capacity < uint64(opened.Size()) || capacity > uint64(math.MaxInt64) {
+		return NoMutationSubmitted, fmt.Errorf("raw image volume %q cannot shrink or exceed file size limits", name)
+	}
+
+	if capacity == uint64(opened.Size()) {
+		return NoMutationSubmitted, nil
+	}
+
+	// Truncate acts on the pinned regular file, not libvirt's potentially
+	// reclassified format. Definitive local rejections are not lost RPC replies.
+	if err := file.Truncate(int64(capacity)); err != nil {
+		return rawTruncateOutcome(err), err
+	}
+
+	if err := file.Sync(); err != nil {
+		return Unknown, err
+	}
+
+	return Finished, nil
+}
+
+func rawTruncateOutcome(err error) OperationOutcome {
+	switch {
+	case errors.Is(err, syscall.EFBIG), errors.Is(err, syscall.ENOSPC), errors.Is(err, syscall.EDQUOT),
+		errors.Is(err, syscall.EROFS), errors.Is(err, syscall.EPERM), errors.Is(err, syscall.EINVAL):
+		return Finished
+	default:
+		return Unknown
+	}
+}
+
+func validatePinnedRawImage(root *os.Root, file *os.File, name, identity string) (os.FileInfo, error) {
+	opened, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+
+	current, err := root.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+
+	if !opened.Mode().IsRegular() || !os.SameFile(opened, current) {
+		return nil, fmt.Errorf("raw image volume %q is not owned by its marker", name)
+	}
+
+	owned, err := copyowner.ImageFileMatches(identity, rawFormat, file)
+	if err != nil || !owned {
+		return nil, errors.Join(err, fmt.Errorf("raw image volume %q is not owned by its marker", name))
+	}
+
+	return opened, nil
+}
+
+// isNoStorageVol reports whether err is libvirt saying the volume does not exist.
+func isNoStorageVol(err error) bool {
+	rpcErr, ok := errors.AsType[libvirt.Error](err)
+
+	return ok && rpcErr.Code == uint32(libvirt.ErrNoStorageVol)
+}

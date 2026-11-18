@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"runtime"
 	"strings"
@@ -23,11 +22,11 @@ import (
 	"k8s.io/kubectl/pkg/cmd/util/editor/crlf"
 
 	"github.com/siderolabs/talos/cmd/talosctl/pkg/talos/helpers"
+	"github.com/siderolabs/talos/cmd/talosctl/pkg/talos/safeout"
 	"github.com/siderolabs/talos/cmd/talosctl/pkg/talos/yamlstrip"
 	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
-	"github.com/siderolabs/talos/pkg/machinery/resources/config"
 )
 
 var editCmdFlags struct {
@@ -39,36 +38,19 @@ var editCmdFlags struct {
 }
 
 //nolint:gocyclo
-func editFn(c *client.Client) func(context.Context, string, resource.Resource, error) error {
-	var (
-		path      string
-		lastError string
-	)
-
+func editFn() func(ctx context.Context, c *client.Client, node string, mc resource.Resource) error {
 	edit := editor.NewDefaultEditor([]string{
 		"TALOS_EDITOR",
 		"EDITOR",
 	})
 
-	return func(ctx context.Context, node string, mc resource.Resource, callError error) error {
-		if callError != nil {
-			return fmt.Errorf("%s: %w", node, callError)
-		}
-
-		if mc.Metadata().Type() != config.MachineConfigType {
-			return errors.New("only the machineconfig resource can be edited")
-		}
-
-		id := mc.Metadata().ID()
-
-		if id != config.ActiveID {
-			return nil
-		}
-
+	return func(ctx context.Context, c *client.Client, node string, mc resource.Resource) error {
 		body, err := extractMachineConfigBody(mc)
 		if err != nil {
 			return err
 		}
+
+		var lastError string
 
 		edited := body
 
@@ -84,7 +66,7 @@ func editFn(c *client.Client) func(context.Context, string, resource.Resource, e
 
 			_, err := fmt.Fprintf(
 				w,
-				"# Editing %s/%s at node %s\n", mc.Metadata().Type(), id, node,
+				"# Editing %s/%s at node %s\n", mc.Metadata().Type(), mc.Metadata().ID(), node,
 			)
 			if err != nil {
 				return err
@@ -104,33 +86,40 @@ func editFn(c *client.Client) func(context.Context, string, resource.Resource, e
 
 			editedDiff := edited
 
-			edited, path, err = edit.LaunchTempFile(fmt.Sprintf("%s-%s-edit-", mc.Metadata().Type(), id), ".yaml", &buf)
+			var path string
+
+			edited, path, err = edit.LaunchTempFile(fmt.Sprintf("%s-%s-edit-", mc.Metadata().Type(), mc.Metadata().ID()), ".yaml", &buf)
 			if err != nil {
+				if path != "" {
+					os.Remove(path) //nolint:errcheck
+				}
+
 				return err
 			}
 
-			defer os.Remove(path) //nolint:errcheck
-
 			edited = stripEditingComment(edited)
+			stripped := yamlstrip.Comments(edited)
 
 			// If we're retrying the loop because of an error, and no change was made in the file, short-circuit
-			if lastError != "" && bytes.Equal(yamlstrip.Comments(editedDiff), yamlstrip.Comments(edited)) {
-				if _, err = os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
-					message := addEditingComment(lastError)
-					message += fmt.Sprintf("A copy of your changes has been stored to %q\nEdit canceled, no valid changes were saved.\n", path)
+			// keeping the temporary file around as a recovery copy of the rejected changes.
+			if lastError != "" && bytes.Equal(yamlstrip.Comments(editedDiff), stripped) {
+				message := addEditingComment(lastError)
+				message += fmt.Sprintf("A copy of your changes has been stored to %q\nEdit canceled, no valid changes were saved.\n", path)
 
-					return errors.New(message)
-				}
+				return errors.New(message)
 			}
 
-			if len(bytes.TrimSpace(bytes.TrimSpace(yamlstrip.Comments(edited)))) == 0 {
-				fmt.Fprintln(os.Stderr, "Apply was skipped: empty file.")
+			// The contents have been read already, so the temporary file is no longer needed.
+			os.Remove(path) //nolint:errcheck
+
+			if len(bytes.TrimSpace(stripped)) == 0 {
+				fmt.Fprintln(safeout.Stderr(), "Apply was skipped: empty file.")
 
 				break
 			}
 
 			if bytes.Equal(edited, body) {
-				fmt.Fprintln(os.Stderr, "Apply was skipped: no changes detected.")
+				fmt.Fprintln(safeout.Stderr(), "Apply was skipped: no changes detected.")
 
 				break
 			}
@@ -196,20 +185,20 @@ It will open the editor defined by your TALOS_EDITOR,
 or EDITOR environment variables, or fall back to 'vi' for Linux
 or 'notepad' for Windows.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return WithClient(cmd.Context(), func(ctx context.Context, c *client.Client) error {
-			if err := helpers.ClientVersionCheck(ctx, c); err != nil {
-				return err
-			}
+		ctx := cmd.Context()
 
-			for _, node := range GlobalArgs.Nodes {
-				nodeCtx := client.WithNodes(ctx, node)
-				if err := helpers.ForEachResource(nodeCtx, c, nil, editFn(c), editCmdFlags.namespace, args...); err != nil {
-					return err
-				}
-			}
+		clientFactory, err := NewClientFactory(ctx, &editCmdFlags)
+		if err != nil {
+			return err
+		}
 
-			return nil
-		})
+		defer clientFactory.Close() //nolint:errcheck
+
+		if err := helpers.ClientVersionCheck(ctx, clientFactory); err != nil {
+			return err
+		}
+
+		return helpers.MachineConfigUpdater(ctx, clientFactory, editFn(), args)
 	},
 }
 

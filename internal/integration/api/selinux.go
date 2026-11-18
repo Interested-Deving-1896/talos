@@ -9,6 +9,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"maps"
 	"path/filepath"
@@ -21,10 +22,17 @@ import (
 	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/siderolabs/go-pointer"
 	"github.com/siderolabs/go-procfs/procfs"
+	"github.com/siderolabs/go-retry/retry"
 	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apiresource "k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/siderolabs/talos/cmd/talosctl/pkg/talos/helpers"
 	"github.com/siderolabs/talos/internal/integration/base"
+	"github.com/siderolabs/talos/pkg/machinery/api/common"
 	machineapi "github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	"github.com/siderolabs/talos/pkg/machinery/config/machine"
@@ -48,7 +56,7 @@ func (suite *SELinuxSuite) SuiteName() string {
 
 // SetupTest ...
 func (suite *SELinuxSuite) SetupTest() {
-	suite.ctx, suite.ctxCancel = context.WithTimeout(context.Background(), 15*time.Second)
+	suite.ctx, suite.ctxCancel = context.WithTimeout(context.Background(), 10*time.Minute)
 
 	if suite.Cluster == nil || suite.Cluster.Provisioner() != base.ProvisionerQEMU {
 		suite.T().Skip("skipping SELinux test since provisioner is not qemu")
@@ -90,6 +98,7 @@ func (suite *SELinuxSuite) TestFileMountLabels() {
 		constants.RunPath:             constants.RunSelinuxLabel,
 		"/run/containerd":             "system_u:object_r:pod_containerd_run_t:s0",
 		"/run/lock":                   "system_u:object_r:var_lock_t:s0",
+		"/run/lock/lvm":               "system_u:object_r:var_lock_t:s0",
 		constants.SystemRunPath:       "system_u:object_r:system_run_t:s0",
 		"/var/run":                    constants.RunSelinuxLabel,
 		// Runtime files
@@ -101,7 +110,6 @@ func (suite *SELinuxSuite) TestFileMountLabels() {
 		// Overlays
 		"/etc/cni":                        constants.CNISELinuxLabel,
 		constants.KubernetesConfigBaseDir: constants.KubernetesConfigSELinuxLabel,
-		"/usr/libexec/kubernetes":         constants.KubeletPluginsSELinuxLabel,
 		"/opt":                            constants.OptSELinuxLabel,
 		"/opt/cni":                        "system_u:object_r:cni_plugin_t:s0",
 		"/opt/containerd":                 "system_u:object_r:containerd_plugin_t:s0",
@@ -118,6 +126,8 @@ func (suite *SELinuxSuite) TestFileMountLabels() {
 		// Mounts and runtime-generated files
 		"/etc":                  constants.EtcSelinuxLabel,
 		constants.SystemEtcPath: constants.EtcSelinuxLabel,
+		// Build-time files
+		"/usr/share/containers/selinux/contexts": "system_u:object_r:usr_t:s0",
 	}
 
 	// Only running on controlplane
@@ -131,6 +141,7 @@ func (suite *SELinuxSuite) TestFileMountLabels() {
 		constants.KubernetesSchedulerSecretsDir:         constants.KubernetesSchedulerSecretsDirSELinuxLabel,
 		constants.TrustdRuntimeSocketPath:               constants.TrustdRuntimeSocketLabel,
 	}
+
 	maps.Copy(expectedLabelsControlPlane, expectedLabelsWorker)
 
 	// Devices labeled by subsystems, labeled by udev
@@ -144,8 +155,22 @@ func (suite *SELinuxSuite) TestFileMountLabels() {
 		"/dev/zero":      "system_u:object_r:null_device_t:s0",
 	}
 
-	suite.checkFileLabels(workers, expectedLabelsWorker, false)
-	suite.checkFileLabels(controlplanes, expectedLabelsControlPlane, false)
+	for _, node := range workers {
+		suite.checkFileLabels([]string{node}, suite.withSELinuxCategoriesLabels(node, expectedLabelsWorker), false)
+	}
+
+	for _, node := range controlplanes {
+		suite.checkFileLabels([]string{node}, suite.withSELinuxCategoriesLabels(node, expectedLabelsControlPlane), false)
+
+		// the audit log of the kube-apiserver carries the fixed level of the pod, the same at every boot
+		auditLogLabel := "system_u:object_r:kube_log_t:s0"
+		if suite.selinuxCategories(client.WithNode(suite.ctx, node)) {
+			auditLogLabel = "system_u:object_r:kube_log_t:" + constants.KubernetesAPIServerSELinuxLevel
+		}
+
+		suite.Assert().Equal(auditLogLabel, suite.fileLabel(client.WithNode(suite.ctx, node), filepath.Join(constants.KubernetesAuditLogDir, "kube-apiserver.log")))
+	}
+
 	suite.checkFileLabels(workers, expectedLabelsDevices, true)
 	suite.checkFileLabels(controlplanes, expectedLabelsDevices, true)
 }
@@ -166,7 +191,7 @@ func (suite *SELinuxSuite) checkFileLabels(nodes []string, expectedLabels map[st
 			suite.T().Skip("skipping SELinux test since SELinux is disabled")
 		}
 
-		extensions, err := safe.StateListAll[*runtimeres.ExtensionStatus](nodeCtx, suite.Client.COSI)
+		extensions, err := safe.StateListAll[*runtimeres.ExtensionStatus](nodeCtx, suite.Client.State())
 		suite.Require().NoError(err)
 
 		if extensions.Len() > 0 {
@@ -190,13 +215,13 @@ func (suite *SELinuxSuite) checkFileLabels(nodes []string, expectedLabels map[st
 				}
 
 				if slices.Contains(
-					[]string{
+					append([]string{
 						constants.RunPath,
 						constants.SystemRunPath,
 						"/run/containerd",
 						"/var/run",
 						"/var/log/containers",
-					},
+					}, kubeletPluginDirs...),
 					path,
 				) && info.Name != path {
 					return nil
@@ -335,7 +360,7 @@ func (suite *SELinuxSuite) TestSecurityState() {
 		rtestutils.AssertResource(
 			nodeCtx,
 			suite.T(),
-			suite.Client.COSI,
+			suite.Client.State(),
 			runtimeres.SecurityStateID,
 			func(state *runtimeres.SecurityState, asrt *assert.Assertions) {
 				if suite.SelinuxEnforcing {
@@ -348,9 +373,382 @@ func (suite *SELinuxSuite) TestSecurityState() {
 	}
 }
 
-// TODO: test for system and CRI container labels
-// TODO: test labels for unconfined system extensions, pods
-// TODO: test for no avc denials in dmesg
+type podRunner interface {
+	Name() string
+	Create(ctx context.Context, waitTimeout time.Duration) error
+	Delete(ctx context.Context) error
+	Exec(ctx context.Context, command string) (string, string, error)
+}
+
+func (suite *SELinuxSuite) readStream(stream client.MachineStream) string {
+	reader, err := client.ReadStream(stream)
+	suite.Require().NoError(err)
+
+	body, err := io.ReadAll(reader)
+	suite.Require().NoError(err)
+	suite.Require().NoError(reader.Close())
+
+	return string(body)
+}
+
+func (suite *SELinuxSuite) denials(node, subject string) int {
+	stream, err := suite.Client.Logs(client.WithNode(suite.ctx, node), constants.SystemContainerdNamespace, common.ContainerDriver_CONTAINERD, "auditd", false, -1)
+	suite.Require().NoError(err)
+
+	return strings.Count(suite.readStream(stream), " scontext=system_u:system_r:"+subject+":")
+}
+
+var kubeletPluginDirs = []string{"/var/lib/kubelet/plugins", "/var/lib/kubelet/plugins_registry", "/var/lib/kubelet/device-plugins"}
+
+// podDomains are the workload domains of the base policy.
+var podDomains = []string{"pod_t", "pod_privileged_t"}
+
+// selinuxCategories reports whether the node labels workloads with MCS categories.
+func (suite *SELinuxSuite) selinuxCategories(nodeCtx context.Context) bool {
+	securityState, err := safe.StateGetByID[*runtimeres.SecurityState](nodeCtx, suite.Client.State(), runtimeres.SecurityStateID)
+	suite.Require().NoError(err)
+
+	return securityState.TypedSpec().SELinuxCategories
+}
+
+// withSELinuxCategoriesLabels returns the expected labels of the node, with those of the kubelet plugin directories, which
+// the kubelet relabels for the pods when they run with MCS categories.
+func (suite *SELinuxSuite) withSELinuxCategoriesLabels(node string, expectedLabels map[string]string) map[string]string {
+	pluginDirLabel := "system_u:object_r:kubelet_state_t:s0"
+	if suite.selinuxCategories(client.WithNode(suite.ctx, node)) {
+		pluginDirLabel = "system_u:object_r:pod_file_t:s0"
+	}
+
+	expectedLabels = maps.Clone(expectedLabels)
+
+	for _, dir := range kubeletPluginDirs {
+		expectedLabels[dir] = pluginDirLabel
+	}
+
+	return expectedLabels
+}
+
+// fileLabel returns the SELinux label of a file.
+func (suite *SELinuxSuite) fileLabel(nodeCtx context.Context, path string) string {
+	stream, err := suite.Client.LS(nodeCtx, &machineapi.ListRequest{Root: path, ReportXattrs: true})
+	suite.Require().NoError(err)
+
+	var label string
+
+	suite.Require().NoError(helpers.ReadGRPCStream(stream, func(info *machineapi.FileInfo, _ string, _ bool) error {
+		for _, xattr := range info.Xattrs {
+			if xattr.Name == "security.selinux" {
+				label = string(bytes.Trim(xattr.Data, "\x00\n"))
+			}
+		}
+
+		return nil
+	}))
+
+	return label
+}
+
+// labelingNode returns the address and the name of a node which labels workloads with SELinux categories, and skips the test without one,
+// or in permissive mode when the test checks the denials.
+func (suite *SELinuxSuite) labelingNode(enforcing bool) (string, string) {
+	if enforcing && !suite.SelinuxEnforcing {
+		suite.T().Skip("skipping SELinux negative tests in permissive mode")
+	}
+
+	ip := suite.RandomDiscoveredNodeInternalIP()
+
+	if !suite.selinuxCategories(client.WithNode(suite.ctx, ip)) {
+		suite.T().Skip("skipping SELinux pod domain tests since workloads run without SELinux categories")
+	}
+
+	node, err := suite.GetK8sNodeByInternalIP(suite.ctx, ip)
+	suite.Require().NoError(err)
+
+	return ip, node.Name
+}
+
+func (suite *SELinuxSuite) kubeletMetric(nodeName, metric string) float64 {
+	body, err := suite.Clientset.CoreV1().RESTClient().Get().Resource("nodes").Name(nodeName).SubResource("proxy").Suffix("metrics").DoRaw(suite.ctx)
+	suite.Require().NoError(err)
+
+	for line := range strings.SplitSeq(string(body), "\n") {
+		if value, ok := strings.CutPrefix(line, metric+" "); ok {
+			parsed, err := strconv.ParseFloat(value, 64)
+			suite.Require().NoError(err)
+
+			return parsed
+		}
+	}
+
+	return 0
+}
+
+// exec creates the pod, runs the command in it and deletes it.
+func (suite *SELinuxSuite) exec(pod podRunner, command string) (string, string, error) {
+	suite.Require().NoError(pod.Create(suite.ctx, 5*time.Minute))
+
+	defer pod.Delete(suite.ctx) //nolint:errcheck
+
+	return pod.Exec(suite.ctx, command)
+}
+
+// TestPodDomains verifies the domains pods land in when the CRI labels containers, and that a type the policy does not
+// let pods enter fails the container.
+func (suite *SELinuxSuite) TestPodDomains() {
+	_, node := suite.labelingNode(false)
+
+	for _, test := range []struct {
+		name       string
+		privileged bool
+		options    *corev1.SELinuxOptions
+		label      string // empty when the container must fail
+		enforcing  bool   // a refusal permissive mode does not enforce
+	}{
+		{name: "selinux-pod", label: `^system_u:system_r:pod_t:s0:c\d+,c\d+$`},
+		{name: "selinux-privileged", privileged: true, label: `^system_u:system_r:pod_privileged_t:s0$`},
+		{name: "selinux-spc", options: &corev1.SELinuxOptions{Type: "spc_t", Level: "s0"}, label: `^system_u:system_r:pod_privileged_t:s0$`},
+		{name: "selinux-unknown", options: &corev1.SELinuxOptions{Type: "unknown_t"}},
+		{name: "selinux-kubelet", options: &corev1.SELinuxOptions{Type: "kubelet_t"}, enforcing: true},
+	} {
+		if test.enforcing && !suite.SelinuxEnforcing {
+			continue
+		}
+
+		newPod := suite.NewPod
+		if test.privileged {
+			newPod = suite.NewPrivilegedPod
+		}
+
+		podDef, err := newPod(test.name)
+		suite.Require().NoError(err)
+
+		pod := podDef.WithQuiet(true).WithNamespace("kube-system").WithNodeName(node).WithSELinuxOptions(test.options)
+
+		if test.label == "" {
+			suite.Assert().Error(pod.Create(suite.ctx, 20*time.Second), test.name)
+			suite.Require().NoError(pod.Delete(suite.ctx))
+
+			continue
+		}
+
+		stdout, stderr, err := suite.exec(pod, "cat /proc/self/attr/current")
+		suite.Require().NoError(err, test.name)
+		suite.Assert().Empty(stderr, test.name)
+		suite.Assert().Regexp(test.label, strings.TrimRight(stdout, "\n\x00"), test.name)
+	}
+}
+
+// TestPodMCSIsolation checks the MCS categories on a hostPath: a pod reads the files of another pod only at the same
+// fixed level, which outlives the pods.
+func (suite *SELinuxSuite) TestPodMCSIsolation() {
+	_, node := suite.labelingNode(true)
+
+	file := "/data/mcs-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+
+	// one pod after the other: the files outlive the pod that wrote them
+	for _, step := range []struct {
+		name    string
+		options *corev1.SELinuxOptions
+		command string
+		want    string // the output, or a permission denied when empty
+	}{
+		{"selinux-mcs-writer", nil, "echo secret > " + file + " && echo written", "written\n"},
+		{"selinux-mcs-reader", nil, "cat " + file, ""},
+		{"selinux-level-first", &corev1.SELinuxOptions{Level: "s0:c600,c601"}, "echo secret > " + file + "-fixed && echo written", "written\n"},
+		{"selinux-level-second", &corev1.SELinuxOptions{Level: "s0:c600,c601"}, "cat " + file + "-fixed", "secret\n"},
+		{"selinux-level-other", &corev1.SELinuxOptions{Level: "s0:c602,c603"}, "cat " + file + "-fixed", ""},
+	} {
+		podDef, err := suite.NewPod(step.name)
+		suite.Require().NoError(err)
+
+		pod := podDef.WithQuiet(true).WithNamespace("kube-system").WithNodeName(node).WithHostVolumeMount("/var/selinux-test", "/data").
+			WithSELinuxOptions(step.options)
+
+		stdout, stderr, err := suite.exec(pod, step.command)
+
+		if step.want == "" {
+			suite.Assert().Error(err, step.name)
+			suite.Assert().Contains(stderr, "Permission denied", step.name)
+		} else {
+			suite.Assert().NoError(err, step.name)
+			suite.Assert().Equal(step.want, stdout, step.name)
+		}
+	}
+}
+
+// TestPrivilegedHostAccess runs a host binary from a privileged pod the way TopoLVM does and serves a socket to a sidecar, without denials.
+func (suite *SELinuxSuite) TestPrivilegedHostAccess() {
+	ip, node := suite.labelingNode(true)
+
+	before := suite.denials(ip, "pod_privileged_t")
+
+	podDef, err := suite.NewPrivilegedPod("selinux-nsenter")
+	suite.Require().NoError(err)
+
+	podDef = podDef.WithQuiet(true).WithNodeName(node).WithHostPID()
+
+	suite.Require().NoError(podDef.Create(suite.ctx, 5*time.Minute))
+
+	defer podDef.Delete(suite.ctx) //nolint:errcheck
+
+	stdout, stderr, err := podDef.Exec(suite.ctx, "nsenter -t 1 -m -- /usr/bin/lvm version")
+	suite.Require().NoError(err)
+	suite.Assert().Empty(stderr, "stderr: %s", stderr)
+	suite.Assert().Contains(stdout, "LVM version")
+
+	socket := "/host/var/selinux-test/" + podDef.Name()
+
+	// the directory may not exist on this node yet, and socat fails silently in the background: wait for the socket
+	_, stderr, err = podDef.Exec(suite.ctx, "apk add --update socat && mkdir -p /host/var/selinux-test && "+
+		"(socat UNIX-LISTEN:"+socket+",fork EXEC:cat >/dev/null 2>&1 &) && "+
+		"for i in $(seq 50); do [ -S "+socket+" ] && exit 0; sleep 0.1; done; exit 1")
+	suite.Require().NoError(err, stderr)
+
+	sidecar, err := suite.NewPod("selinux-socket-client")
+	suite.Require().NoError(err)
+
+	sidecar = sidecar.WithQuiet(true).WithNamespace("kube-system").WithNodeName(node).WithHostVolumeMount("/var/selinux-test", "/data")
+
+	stdout, stderr, err = suite.exec(sidecar, "apk add --update socat >/dev/null && echo hello | socat - UNIX-CONNECT:/data/"+podDef.Name())
+	suite.Require().NoError(err, stderr)
+	suite.Assert().Equal("hello\n", stdout)
+	suite.Assert().Equal(before, suite.denials(ip, "pod_privileged_t"))
+}
+
+// TestPodProcAccess reads the /proc of every host process from a pod sharing the host PID namespace: pod_t is denied and
+// the denial audited.
+func (suite *SELinuxSuite) TestPodProcAccess() {
+	ip, node := suite.labelingNode(true)
+
+	for _, test := range []struct {
+		domain  string
+		command string
+		want    string // a regexp the output matches, empty when the command must be denied and audited
+	}{
+		// the shell glob drops the entries it cannot search, hence the explicit loop
+		{domain: "pod_t", command: "rc=0; for p in $(ls /proc | grep -E '^[0-9]+$'); do cat /proc/$p/comm >/dev/null || rc=1; done; exit $rc"},
+	} {
+		podDef, err := suite.NewPod("selinux-proc-" + strings.ReplaceAll(test.domain, "_", "-"))
+		suite.Require().NoError(err)
+
+		pod := podDef.WithQuiet(true).WithNamespace("kube-system").WithNodeName(node).WithHostPID().
+			WithSELinuxOptions(&corev1.SELinuxOptions{Type: test.domain})
+
+		before := suite.denials(ip, test.domain)
+		stdout, stderr, err := suite.exec(pod, test.command)
+		denied := suite.denials(ip, test.domain) - before
+
+		if test.want == "" {
+			suite.Assert().Error(err, test.domain)
+			suite.Assert().Contains(stderr, "Permission denied", test.domain)
+			suite.Assert().Positive(denied, test.domain)
+		} else {
+			suite.Assert().NoError(err, test.domain)
+			suite.Assert().Regexp(test.want, stdout, test.domain)
+			suite.Assert().Zero(denied, test.domain)
+		}
+	}
+}
+
+// TestKubeletVolumeLabels checks the kubelet sees SELinux when the CRI labels containers and computes the mount label of a ReadWriteOncePod volume.
+func (suite *SELinuxSuite) TestKubeletVolumeLabels() {
+	_, nodeName := suite.labelingNode(false)
+
+	name := "selinux-test-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	driver := name + ".csi.talos.dev"
+	metric := `volume_manager_selinux_volumes_admitted_total{access_mode="RWOP",volume_plugin="kubernetes.io/csi/` + driver + `"}`
+
+	_, err := suite.Clientset.StorageV1().CSIDrivers().Create(suite.ctx, &storagev1.CSIDriver{
+		Name: driver,
+		Spec: storagev1.CSIDriverSpec{AttachRequired: new(false), SELinuxMount: new(true)},
+	}, metav1.CreateOptions{})
+	suite.Require().NoError(err)
+
+	defer suite.Clientset.StorageV1().CSIDrivers().Delete(suite.ctx, driver, metav1.DeleteOptions{}) //nolint:errcheck
+
+	_, err = suite.Clientset.CoreV1().PersistentVolumes().Create(suite.ctx, &corev1.PersistentVolume{
+		Name: name,
+		Spec: corev1.PersistentVolumeSpec{
+			Capacity:               corev1.ResourceList{corev1.ResourceStorage: apiresource.MustParse("1Mi")},
+			AccessModes:            []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod},
+			StorageClassName:       name,
+			PersistentVolumeSource: corev1.PersistentVolumeSource{CSI: &corev1.CSIPersistentVolumeSource{Driver: driver, VolumeHandle: name}},
+		},
+	}, metav1.CreateOptions{})
+	suite.Require().NoError(err)
+
+	defer suite.Clientset.CoreV1().PersistentVolumes().Delete(suite.ctx, name, metav1.DeleteOptions{}) //nolint:errcheck
+
+	_, err = suite.Clientset.CoreV1().PersistentVolumeClaims("kube-system").Create(suite.ctx, &corev1.PersistentVolumeClaim{
+		Name: name,
+		Spec: corev1.PersistentVolumeClaimSpec{
+			AccessModes:      []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod},
+			StorageClassName: new(name),
+			VolumeName:       name,
+			Resources:        corev1.VolumeResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceStorage: apiresource.MustParse("1Mi")}},
+		},
+	}, metav1.CreateOptions{})
+	suite.Require().NoError(err)
+
+	defer suite.Clientset.CoreV1().PersistentVolumeClaims("kube-system").Delete(suite.ctx, name, metav1.DeleteOptions{}) //nolint:errcheck
+
+	before := suite.kubeletMetric(nodeName, metric)
+
+	podDef, err := suite.NewPod("selinux-pvc")
+	suite.Require().NoError(err)
+
+	podDef = podDef.WithQuiet(true).WithNamespace("kube-system").WithNodeName(nodeName).
+		WithSELinuxOptions(&corev1.SELinuxOptions{Level: "s0:c600,c601"}).WithPersistentVolumeClaim(name, "/data")
+
+	// no driver serves the volume, the pod never runs
+	suite.Assert().Error(podDef.Create(suite.ctx, 20*time.Second))
+
+	defer podDef.Delete(suite.ctx) //nolint:errcheck
+
+	suite.Require().NoError(retry.Constant(time.Minute, retry.WithUnits(time.Second)).Retry(func() error {
+		if suite.kubeletMetric(nodeName, metric) <= before {
+			return retry.ExpectedErrorf("the kubelet did not admit the volume with a SELinux label")
+		}
+
+		return nil
+	}))
+}
+
+// TestNoHostDenials checks that the policy defines every kernel permission and that AVC denials only ever hit pods, never the host domains.
+func (suite *SELinuxSuite) TestNoHostDenials() {
+	if !suite.SelinuxEnforcing {
+		suite.T().Skip("skipping SELinux negative tests in permissive mode")
+	}
+
+	for _, node := range suite.DiscoverNodeInternalIPs(suite.ctx) {
+		nodeCtx := client.WithNode(suite.ctx, node)
+
+		dmesg, err := suite.Client.Dmesg(nodeCtx, false, false)
+		suite.Require().NoError(err)
+
+		audit, err := suite.Client.Logs(nodeCtx, constants.SystemContainerdNamespace, common.ContainerDriver_CONTAINERD, "auditd", false, -1)
+		suite.Require().NoError(err)
+
+		for _, stream := range []client.MachineStream{dmesg, audit} {
+			for line := range strings.SplitSeq(suite.readStream(stream), "\n") {
+				suite.Assert().NotContains(line, "not defined in policy")
+
+				if !strings.Contains(line, "avc:  denied") {
+					continue
+				}
+
+				_, scontext, _ := strings.Cut(line, " scontext=")
+				scontext, _, _ = strings.Cut(scontext, " ")
+
+				fields := strings.SplitN(scontext, ":", 4)
+				suite.Require().Len(fields, 4, "unexpected AVC record: %s", line)
+				suite.Assert().True(slices.Contains(podDomains, fields[2]) || strings.Contains(fields[3], ":c"), "host domain denied: %s", line)
+			}
+		}
+	}
+}
+
+// TODO: test labels for unconfined system extensions
 
 // TestNoPtrace confirms ptracing system processes is prohibited in enforcing mode.
 func (suite *SELinuxSuite) TestNoPtrace() {
@@ -432,6 +830,9 @@ func (suite *SELinuxSuite) TestNoMachineSocketAccess() {
 }
 
 // TestNoStateAccess verifies mounting STATE does not allow /system/state/config.yaml access.
+//
+// machined labels the files of STATE system_state_t on disk, so a mount of the device from a pod shows them with
+// this label, which no pod domain may read: the policy holds a neverallow for it, checked by secilc at compile time.
 func (suite *SELinuxSuite) TestNoStateAccess() {
 	if !suite.SelinuxEnforcing {
 		suite.T().Skip("skipping SELinux negative tests in permissive mode")
@@ -440,13 +841,16 @@ func (suite *SELinuxSuite) TestNoStateAccess() {
 	node := suite.RandomDiscoveredNodeInternalIP()
 	nodeCtx := client.WithNode(suite.ctx, node)
 
-	state, err := safe.StateGetByID[*block.VolumeStatus](nodeCtx, suite.Client.COSI, "STATE")
+	state, err := safe.StateGetByID[*block.VolumeStatus](nodeCtx, suite.Client.State(), "STATE")
 	suite.Assert().NoError(err)
+
+	k8sNode, err := suite.GetK8sNodeByInternalIP(suite.ctx, node)
+	suite.Require().NoError(err)
 
 	podDef, err := suite.NewPrivilegedPod("system-state-test")
 	suite.Require().NoError(err)
 
-	podDef = podDef.WithQuiet(true)
+	podDef = podDef.WithQuiet(true).WithNodeName(k8sNode.Name)
 
 	suite.Require().NoError(podDef.Create(suite.ctx, 5*time.Minute))
 
@@ -468,6 +872,236 @@ func (suite *SELinuxSuite) TestNoStateAccess() {
 	suite.Require().Error(err)
 	suite.Assert().ErrorContains(err, "command terminated with exit code 1")
 	suite.Assert().Contains(stderr, "cat: can't open '/mnt/config.yaml': Permission denied")
+}
+
+// stateLabels returns the SELinux labels of every entry of STATE on the node, as they are on disk, by the path of
+// the entry relative to the root of the partition.
+//
+// STATE is not mounted on the host, so a privileged pod mounts the partition under the kubelet directory, which
+// propagates the mount to the host, and the labels are read with the Talos API: no pod domain may read the files,
+// and the pod image has no tool to read the labels.
+func (suite *SELinuxSuite) stateLabels(node string) map[string]string {
+	nodeCtx := client.WithNode(suite.ctx, node)
+
+	state, err := safe.StateGetByID[*block.VolumeStatus](nodeCtx, suite.Client.State(), "STATE")
+	suite.Require().NoError(err)
+
+	k8sNode, err := suite.GetK8sNodeByInternalIP(suite.ctx, node)
+	suite.Require().NoError(err)
+
+	podDef, err := suite.NewPrivilegedPod("selinux-state-labels")
+	suite.Require().NoError(err)
+
+	podDef = podDef.WithQuiet(true).WithNodeName(k8sNode.Name).
+		WithHostVolumeMountPropagation(constants.KubeletDataPath, constants.KubeletDataPath, corev1.MountPropagationBidirectional)
+
+	suite.Require().NoError(podDef.Create(suite.ctx, 5*time.Minute))
+
+	defer podDef.Delete(suite.ctx) //nolint:errcheck
+
+	target := filepath.Join(constants.KubeletDataPath, podDef.Name())
+
+	_, stderr, err := podDef.Exec(suite.ctx, "mkdir "+target+" && mount "+state.TypedSpec().MountLocation+" "+target)
+	suite.Require().NoError(err, stderr)
+
+	defer func() {
+		// the mount outlives the pod on the host, so it has to go before the pod does
+		_, stderr, err := podDef.Exec(suite.ctx, "umount "+target+" && rmdir "+target)
+		suite.Assert().NoError(err, stderr)
+	}()
+
+	stream, err := suite.Client.LS(nodeCtx, &machineapi.ListRequest{Root: target, Recurse: true, ReportXattrs: true})
+	suite.Require().NoError(err)
+
+	labels := map[string]string{}
+
+	suite.Require().NoError(helpers.ReadGRPCStream(stream, func(info *machineapi.FileInfo, _ string, _ bool) error {
+		suite.Require().Empty(info.Error, "failed to list %s", info.Name)
+
+		labels[info.RelativeName] = ""
+
+		for _, xattr := range info.Xattrs {
+			if xattr.Name == "security.selinux" {
+				labels[info.RelativeName] = string(bytes.Trim(xattr.Data, "\x00\n"))
+			}
+		}
+
+		return nil
+	}))
+
+	return labels
+}
+
+// TestStateLabels verifies machined labels STATE on disk: a raw mount of the partition shows system_state_t on every
+// entry, which no pod domain may read or relabel, never unlabeled_t, the type of every file without a label.
+func (suite *SELinuxSuite) TestStateLabels() {
+	node := suite.RandomDiscoveredNodeInternalIP()
+
+	if pointer.SafeDeref(procfs.NewCmdline(suite.ReadCmdline(client.WithNode(suite.ctx, node))).Get(constants.KernelParamSELinux).First()) == "" {
+		suite.T().Skip("skipping since SELinux is disabled")
+	}
+
+	labels := suite.stateLabels(node)
+
+	suite.Assert().Contains(labels, ".")
+	suite.Assert().Contains(labels, "config.yaml")
+
+	for name, label := range labels {
+		suite.Assert().Equal(constants.StateSelinuxLabel, label, "label of %s", name)
+	}
+}
+
+// containerOutcome waits for the container of the pod to either fail to be created or print its output, and returns
+// the error or the output. A failed init container fails the test.
+func (suite *SELinuxSuite) containerOutcome(namespace, podName, container string) string {
+	var outcome string
+
+	suite.Require().NoError(retry.Constant(3*time.Minute, retry.WithUnits(time.Second)).Retry(func() error {
+		pod, err := suite.Clientset.CoreV1().Pods(namespace).Get(suite.ctx, podName, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+
+		for _, status := range pod.Status.InitContainerStatuses {
+			if status.State.Terminated != nil && status.State.Terminated.ExitCode != 0 {
+				return fmt.Errorf("init container %s failed: %s", status.Name, status.State.Terminated.Message)
+			}
+		}
+
+		outcome, err = suite.containerStatusOutcome(pod, container)
+		if err != nil {
+			return err
+		}
+
+		if outcome == "" {
+			return retry.ExpectedErrorf("container %s has no outcome yet", container)
+		}
+
+		return nil
+	}))
+
+	return outcome
+}
+
+// containerStatusOutcome returns the error the container failed to be created with, or its output, if any.
+func (suite *SELinuxSuite) containerStatusOutcome(pod *corev1.Pod, container string) (string, error) {
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.Name != container {
+			continue
+		}
+
+		if status.State.Waiting != nil && status.State.Waiting.Reason == "CreateContainerError" {
+			return status.State.Waiting.Message, nil
+		}
+
+		if status.State.Running == nil && status.State.Terminated == nil {
+			return "", nil
+		}
+
+		logs, err := suite.Clientset.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{Container: container}).DoRaw(suite.ctx)
+
+		return string(logs), err
+	}
+
+	return "", nil
+}
+
+// TestNoStateRelabel verifies a privileged pod can't hand STATE over to another container through a volume the CRI
+// relabels for it.
+//
+// An init container mounts STATE over the emptyDir of the pod, and the mount propagates to the host: when the kubelet
+// creates the next container, the CRI relabels the emptyDir for the categories of the container, which must fail, so
+// that the container never reads the machine configuration, and the files of STATE keep their labels.
+func (suite *SELinuxSuite) TestNoStateRelabel() {
+	ip, nodeName := suite.labelingNode(true)
+
+	state, err := safe.StateGetByID[*block.VolumeStatus](client.WithNode(suite.ctx, ip), suite.Client.State(), "STATE")
+	suite.Require().NoError(err)
+
+	labels := suite.stateLabels(ip)
+
+	name := "selinux-state-relabel-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	// the emptyDir on the host, reached through the pods directory of the kubelet
+	target := "/pods/$POD_UID/volumes/kubernetes.io~empty-dir/state"
+	bidirectional := corev1.MountPropagationBidirectional
+	podUID := []corev1.EnvVar{{Name: "POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}}}
+	podsMount := corev1.VolumeMount{Name: "pods", MountPath: "/pods", MountPropagation: &bidirectional}
+
+	_, err = suite.Clientset.CoreV1().Pods("kube-system").Create(suite.ctx, &corev1.Pod{
+		Name:      name,
+		Namespace: "kube-system",
+		Spec: corev1.PodSpec{
+			NodeName:      nodeName,
+			RestartPolicy: corev1.RestartPolicyNever,
+			SecurityContext: &corev1.PodSecurityContext{
+				SELinuxOptions: &corev1.SELinuxOptions{Level: "s0:c610,c611"},
+			},
+			InitContainers: []corev1.Container{
+				{
+					Name:            "mount",
+					Image:           "alpine",
+					Command:         []string{"/bin/sh", "-ec", "mount " + state.TypedSpec().MountLocation + " " + target + " && test -f " + target + "/config.yaml"},
+					Env:             podUID,
+					SecurityContext: &corev1.SecurityContext{Privileged: new(true)},
+					VolumeMounts:    []corev1.VolumeMount{podsMount, {Name: "dev", MountPath: "/dev"}},
+				},
+			},
+			Containers: []corev1.Container{
+				{
+					// takes STATE off the emptyDir before the kubelet tears it down
+					Name:            "unmount",
+					Image:           "alpine",
+					Command:         []string{"/bin/sh", "-c", "trap 'umount " + target + "; exit 0' TERM; sleep 3600 & wait"},
+					Env:             podUID,
+					SecurityContext: &corev1.SecurityContext{Privileged: new(true)},
+					VolumeMounts:    []corev1.VolumeMount{podsMount},
+				},
+				{
+					Name:         "reader",
+					Image:        "alpine",
+					Command:      []string{"/bin/sh", "-c", "if cat /state/config.yaml >/dev/null; then echo leaked; else echo denied; fi; sleep 3600"},
+					VolumeMounts: []corev1.VolumeMount{{Name: "state", MountPath: "/state"}},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{Name: "state", EmptyDir: &corev1.EmptyDirVolumeSource{}},
+				{Name: "pods", HostPath: &corev1.HostPathVolumeSource{Path: "/var/lib/kubelet/pods"}},
+				{Name: "dev", HostPath: &corev1.HostPathVolumeSource{Path: "/dev"}},
+			},
+		},
+	}, metav1.CreateOptions{})
+	suite.Require().NoError(err)
+
+	defer func() {
+		// the grace period lets the unmount container take STATE off the emptyDir
+		suite.Require().NoError(suite.Clientset.CoreV1().Pods("kube-system").Delete(suite.ctx, name, metav1.DeleteOptions{GracePeriodSeconds: new(int64(30))}))
+
+		suite.Require().NoError(retry.Constant(2*time.Minute, retry.WithUnits(time.Second)).Retry(func() error {
+			_, err := suite.Clientset.CoreV1().Pods("kube-system").Get(suite.ctx, name, metav1.GetOptions{})
+			if err == nil {
+				return retry.ExpectedErrorf("pod %s is still terminating", name)
+			}
+
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+
+			return err
+		}))
+
+		// machined may add files to STATE in the meantime, so only the entries seen before are compared
+		after := suite.stateLabels(ip)
+
+		for name, label := range labels {
+			suite.Assert().Equal(label, after[name], "the label of %s on STATE changed", name)
+		}
+	}()
+
+	outcome := suite.containerOutcome("kube-system", name, "reader")
+
+	suite.T().Logf("reader container: %s", outcome)
+
+	suite.Assert().NotContains(outcome, "leaked")
 }
 
 func init() {

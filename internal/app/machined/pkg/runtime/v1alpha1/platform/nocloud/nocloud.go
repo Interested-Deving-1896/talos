@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
+	"github.com/cenkalti/backoff/v7"
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/siderolabs/gen/channel"
 	"github.com/siderolabs/gen/maps"
@@ -20,6 +20,7 @@ import (
 
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime/v1alpha1/platform/errors"
+	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime/v1alpha1/platform/internal/blockutils"
 	"github.com/siderolabs/talos/internal/app/machined/pkg/runtime/v1alpha1/platform/internal/netutils"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
 	"github.com/siderolabs/talos/pkg/machinery/imager/quirks"
@@ -91,7 +92,7 @@ func (n *Nocloud) ParseMetadata(ctx context.Context, unmarshalledNetworkConfig *
 
 // Configuration implements the runtime.Platform interface.
 func (n *Nocloud) Configuration(ctx context.Context, r state.State) ([]byte, error) {
-	_, machineConfigDl, _, err := n.acquireConfig(ctx, r)
+	_, machineConfigDl, _, err := n.acquireConfig(ctx, r, blockutils.RequesterConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +133,7 @@ func (n *Nocloud) NetworkConfiguration(ctx context.Context, st state.State, ch c
 		return fmt.Errorf("error waiting for devices to be ready: %w", err)
 	}
 
-	metadataNetworkConfigDl, _, metadata, err := n.acquireConfig(ctx, st)
+	metadataNetworkConfigDl, _, metadata, err := n.acquireConfig(ctx, st, blockutils.RequesterNetwork)
 	if stderrors.Is(err, errors.ErrNoConfigSource) {
 		err = nil
 	}

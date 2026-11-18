@@ -5,6 +5,7 @@
 package k8s_test
 
 import (
+	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
@@ -13,12 +14,14 @@ import (
 
 	"github.com/cosi-project/runtime/pkg/resource"
 	"github.com/cosi-project/runtime/pkg/resource/rtestutils"
+	"github.com/siderolabs/go-pointer"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/siderolabs/talos/internal/app/machined/pkg/controllers/ctest"
 	k8sctrl "github.com/siderolabs/talos/internal/app/machined/pkg/controllers/k8s"
 	"github.com/siderolabs/talos/pkg/machinery/config/container"
+	k8scfg "github.com/siderolabs/talos/pkg/machinery/config/types/k8s"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/meta"
 	"github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1"
 	"github.com/siderolabs/talos/pkg/machinery/constants"
@@ -49,23 +52,32 @@ func (suite *K8sControlPlaneSuite) TestReconcileDefaults() {
 	u, err := url.Parse("https://foo:6443")
 	suite.Require().NoError(err)
 
-	cfg := config.NewMachineConfig(
-		container.NewV1Alpha1(
-			&v1alpha1.Config{
-				ConfigVersion: "v1alpha1",
-				MachineConfig: &v1alpha1.MachineConfig{
-					MachineType: "controlplane",
-				},
-				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
-						Endpoint: &v1alpha1.Endpoint{
-							URL: u,
-						},
-					},
+	v1alpha1Cfg := &v1alpha1.Config{
+		ConfigVersion: "v1alpha1",
+		MachineConfig: &v1alpha1.MachineConfig{
+			MachineType: "controlplane",
+		},
+		ClusterConfig: &v1alpha1.ClusterConfig{
+			ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
+				Endpoint: &v1alpha1.Endpoint{
+					URL: u,
 				},
 			},
-		),
-	)
+		},
+	}
+
+	cn := k8scfg.NewKubeNetworkConfigV1Alpha1()
+	cn.NetworkPodSubnets = []meta.Prefix{
+		{Prefix: netip.MustParsePrefix(constants.DefaultIPv4PodCIDR)},
+	}
+	cn.NetworkServiceSubnets = []meta.Prefix{
+		{Prefix: netip.MustParsePrefix(constants.DefaultIPv4ServiceCIDR)},
+	}
+
+	ctr, err := container.New(v1alpha1Cfg, cn)
+	suite.Require().NoError(err)
+
+	cfg := config.NewMachineConfig(ctr)
 
 	suite.setupMachine(cfg)
 
@@ -101,41 +113,6 @@ func (suite *K8sControlPlaneSuite) TestReconcileDefaults() {
 	)
 }
 
-func (suite *K8sControlPlaneSuite) TestReconcileEmptyAuthorizationConfigForK8sLessThanv128() {
-	u, err := url.Parse("https://foo:6443")
-	suite.Require().NoError(err)
-
-	cfg := config.NewMachineConfig(
-		container.NewV1Alpha1(
-			&v1alpha1.Config{
-				ConfigVersion: "v1alpha1",
-				MachineConfig: &v1alpha1.MachineConfig{
-					MachineType: "controlplane",
-				},
-				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
-						Endpoint: &v1alpha1.Endpoint{
-							URL: u,
-						},
-					},
-					APIServerConfig: &v1alpha1.APIServerConfig{
-						ContainerImage:            "k8s.gcr.io/kube-apiserver:v1.28.0",
-						AuthorizationConfigConfig: []*v1alpha1.AuthorizationConfigAuthorizerConfig{},
-					},
-				},
-			},
-		),
-	)
-
-	suite.setupMachine(cfg)
-
-	rtestutils.AssertResource[*k8s.AuthorizationConfig](suite.Ctx(), suite.T(), suite.State(), k8s.AuthorizationConfigID, func(authorizationConfig *k8s.AuthorizationConfig, assert *assert.Assertions) {
-		assert.Equal(&k8s.AuthorizationConfigSpec{
-			Image: "k8s.gcr.io/kube-apiserver:v1.28.0",
-		}, authorizationConfig.TypedSpec())
-	})
-}
-
 func (suite *K8sControlPlaneSuite) TestReconcileEmptyAuthorizationConfigAuthorizers() {
 	u, err := url.Parse("https://foo:6443")
 	suite.Require().NoError(err)
@@ -148,13 +125,14 @@ func (suite *K8sControlPlaneSuite) TestReconcileEmptyAuthorizationConfigAuthoriz
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{}, //nolint:staticcheck // testing deprecated field
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
 					},
-					APIServerConfig: &v1alpha1.APIServerConfig{
-						AuthorizationConfigConfig: []*v1alpha1.AuthorizationConfigAuthorizerConfig{},
+					APIServerConfig: &v1alpha1.APIServerConfig{ //nolint:staticcheck // testing deprecated field
+						AuthorizationConfigConfig: []*v1alpha1.AuthorizationConfigAuthorizerConfig{}, //nolint:staticcheck // testing deprecated field
 					},
 				},
 			},
@@ -183,13 +161,14 @@ func (suite *K8sControlPlaneSuite) TestReconcileAdditionalAuthorizationConfigAut
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{}, //nolint:staticcheck // testing deprecated field
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
 					},
-					APIServerConfig: &v1alpha1.APIServerConfig{
-						AuthorizationConfigConfig: []*v1alpha1.AuthorizationConfigAuthorizerConfig{
+					APIServerConfig: &v1alpha1.APIServerConfig{ //nolint:staticcheck // testing deprecated field
+						AuthorizationConfigConfig: []*v1alpha1.AuthorizationConfigAuthorizerConfig{ //nolint:staticcheck // testing deprecated field
 							{
 								AuthorizerType: "Webhook",
 								AuthorizerName: "webhook",
@@ -250,13 +229,14 @@ func (suite *K8sControlPlaneSuite) TestReconcileAdditionalAuthorizationConfigAut
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{}, //nolint:staticcheck // testing deprecated field
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
 					},
-					APIServerConfig: &v1alpha1.APIServerConfig{
-						AuthorizationConfigConfig: []*v1alpha1.AuthorizationConfigAuthorizerConfig{
+					APIServerConfig: &v1alpha1.APIServerConfig{ //nolint:staticcheck // testing deprecated field
+						AuthorizationConfigConfig: []*v1alpha1.AuthorizationConfigAuthorizerConfig{ //nolint:staticcheck // testing deprecated field
 							{
 								AuthorizerType: "RBAC",
 								AuthorizerName: "foo",
@@ -333,13 +313,14 @@ func (suite *K8sControlPlaneSuite) TestReconcileAdditionalAuthorizationConfigAut
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{}, //nolint:staticcheck // testing deprecated field
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
 					},
-					APIServerConfig: &v1alpha1.APIServerConfig{
-						AuthorizationConfigConfig: []*v1alpha1.AuthorizationConfigAuthorizerConfig{
+					APIServerConfig: &v1alpha1.APIServerConfig{ //nolint:staticcheck // testing deprecated field
+						AuthorizationConfigConfig: []*v1alpha1.AuthorizationConfigAuthorizerConfig{ //nolint:staticcheck // testing deprecated field
 							{
 								AuthorizerType: "Node",
 								AuthorizerName: "foo",
@@ -412,7 +393,8 @@ func (suite *K8sControlPlaneSuite) TestReconcileTransitionWorker() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{}, //nolint:staticcheck // testing deprecated field
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
@@ -449,14 +431,14 @@ func (suite *K8sControlPlaneSuite) TestReconcileIPv6() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
 					},
-					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{
-						PodSubnet:     []string{constants.DefaultIPv6PodNet},
-						ServiceSubnet: []string{constants.DefaultIPv6ServiceNet},
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{ //nolint:staticcheck // testing deprecated field
+						PodSubnet:     []string{constants.DefaultIPv6PodCIDR},
+						ServiceSubnet: []string{constants.DefaultIPv6ServiceCIDR},
 					},
 				},
 			},
@@ -486,14 +468,14 @@ func (suite *K8sControlPlaneSuite) TestReconcileDualStack() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
 					},
-					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{
-						PodSubnet:     []string{constants.DefaultIPv4PodNet, constants.DefaultIPv6PodNet},
-						ServiceSubnet: []string{constants.DefaultIPv4ServiceNet, constants.DefaultIPv6ServiceNet},
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{ //nolint:staticcheck // testing deprecated field
+						PodSubnet:     []string{constants.DefaultIPv4PodCIDR, constants.DefaultIPv6PodCIDR},
+						ServiceSubnet: []string{constants.DefaultIPv4ServiceCIDR, constants.DefaultIPv6ServiceCIDR},
 					},
 				},
 			},
@@ -523,12 +505,13 @@ func (suite *K8sControlPlaneSuite) TestReconcileExtraVolumes() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{}, //nolint:staticcheck // testing deprecated field
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
 					},
-					APIServerConfig: &v1alpha1.APIServerConfig{
+					APIServerConfig: &v1alpha1.APIServerConfig{ //nolint:staticcheck // testing deprecated field
 						ExtraVolumesConfig: []v1alpha1.VolumeMountConfig{
 							{
 								VolumeHostPath:  "/var/lib",
@@ -584,12 +567,13 @@ func (suite *K8sControlPlaneSuite) TestReconcileEnvironment() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{}, //nolint:staticcheck // testing deprecated field
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
 					},
-					APIServerConfig: &v1alpha1.APIServerConfig{
+					APIServerConfig: &v1alpha1.APIServerConfig{ //nolint:staticcheck // testing deprecated field
 						EnvConfig: v1alpha1.Env{
 							"HTTP_PROXY": "foo",
 						},
@@ -627,12 +611,13 @@ func (suite *K8sControlPlaneSuite) TestReconcileResources() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{}, //nolint:staticcheck // testing deprecated field
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
 					},
-					APIServerConfig: &v1alpha1.APIServerConfig{
+					APIServerConfig: &v1alpha1.APIServerConfig{ //nolint:staticcheck // testing deprecated field
 						ResourcesConfig: &v1alpha1.ResourcesConfig{
 							Requests: meta.Unstructured{
 								Object: map[string]any{
@@ -648,7 +633,7 @@ func (suite *K8sControlPlaneSuite) TestReconcileResources() {
 							},
 						},
 					},
-					ControllerManagerConfig: &v1alpha1.ControllerManagerConfig{
+					ControllerManagerConfig: &v1alpha1.ControllerManagerConfig{ //nolint:staticcheck // legacy config
 						ResourcesConfig: &v1alpha1.ResourcesConfig{
 							Requests: meta.Unstructured{
 								Object: map[string]any{
@@ -664,7 +649,7 @@ func (suite *K8sControlPlaneSuite) TestReconcileResources() {
 							},
 						},
 					},
-					SchedulerConfig: &v1alpha1.SchedulerConfig{
+					SchedulerConfig: &v1alpha1.SchedulerConfig{ //nolint:staticcheck // legacy config
 						ResourcesConfig: &v1alpha1.ResourcesConfig{
 							Requests: meta.Unstructured{
 								Object: map[string]any{
@@ -760,7 +745,8 @@ func (suite *K8sControlPlaneSuite) TestReconcileExternalCloudProvider() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{}, //nolint:staticcheck // testing deprecated field
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
@@ -830,12 +816,13 @@ func (suite *K8sControlPlaneSuite) TestReconcileInlineManifests() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{}, //nolint:staticcheck // testing deprecated field
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
 					},
-					ClusterInlineManifests: v1alpha1.ClusterInlineManifests{
+					ClusterInlineManifests: v1alpha1.ClusterInlineManifests{ //nolint:staticcheck // legacy config
 						{
 							InlineManifestName: "namespace-ci",
 							InlineManifestContents: strings.TrimSpace(
@@ -886,7 +873,8 @@ func (suite *K8sControlPlaneSuite) TestReconcileKubeProxyMode() {
 					MachineType: "controlplane",
 				},
 				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
+					ClusterNetwork: &v1alpha1.ClusterNetworkConfig{}, //nolint:staticcheck // testing deprecated field
+					ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
 						Endpoint: &v1alpha1.Endpoint{
 							URL: u,
 						},
@@ -909,40 +897,149 @@ func (suite *K8sControlPlaneSuite) TestReconcileKubeProxyMode() {
 	)
 }
 
-func (suite *K8sControlPlaneSuite) TestReconcileKubeProxyModeLegacy() {
+// TestReconcileKubeProxyDisabled verifies that a KubeProxyConfig document with kube-proxy disabled
+// (and, as validation allows in that case, no image set) is handled without a panic.
+func (suite *K8sControlPlaneSuite) TestReconcileKubeProxyDisabled() {
 	u, err := url.Parse("https://foo:6443")
 	suite.Require().NoError(err)
 
-	cfg := config.NewMachineConfig(
-		container.NewV1Alpha1(
-			&v1alpha1.Config{
-				ConfigVersion: "v1alpha1",
-				MachineConfig: &v1alpha1.MachineConfig{
-					MachineType: "controlplane",
-				},
-				ClusterConfig: &v1alpha1.ClusterConfig{
-					ControlPlane: &v1alpha1.ControlPlaneConfig{
-						Endpoint: &v1alpha1.Endpoint{
-							URL: u,
-						},
-					},
-					ProxyConfig: &v1alpha1.ProxyConfig{
-						ContainerImage: constants.KubeProxyImage + ":v1.30.0",
-					},
-				},
-			},
-		),
-	)
+	clusterCfg := k8scfg.NewKubeClusterConfigV1Alpha1()
+	clusterCfg.ClusterNameConfig = "test"
+	clusterCfg.ClusterEndpointConfig = meta.URL{URL: u}
 
-	suite.setupMachine(cfg)
+	networkCfg := k8scfg.NewKubeNetworkConfigV1Alpha1()
+	networkCfg.NetworkPodSubnets = []meta.Prefix{
+		{Prefix: netip.MustParsePrefix(constants.DefaultIPv4PodCIDR)},
+	}
+	networkCfg.NetworkServiceSubnets = []meta.Prefix{
+		{Prefix: netip.MustParsePrefix(constants.DefaultIPv4ServiceCIDR)},
+	}
+
+	// kube-proxy is disabled, so no image is set: this is a valid config,
+	// see TestKubeProxyConfigValidate/disabled
+	proxyCfg := k8scfg.NewKubeProxyConfigV1Alpha1()
+	proxyCfg.ProxyEnabled = new(false)
+
+	ctr, err := container.New(
+		&v1alpha1.Config{
+			ConfigVersion: "v1alpha1",
+			MachineConfig: &v1alpha1.MachineConfig{
+				MachineType: "controlplane",
+			},
+			ClusterConfig: &v1alpha1.ClusterConfig{},
+		},
+		clusterCfg,
+		networkCfg,
+		proxyCfg,
+		k8scfg.NewKubeFlannelCNIConfigV1Alpha1(),
+	)
+	suite.Require().NoError(err)
+
+	suite.setupMachine(config.NewMachineConfig(ctr))
 
 	rtestutils.AssertResources(
 		suite.Ctx(), suite.T(), suite.State(), []resource.ID{k8s.BootstrapManifestsConfigID},
 		func(cfg *k8s.BootstrapManifestsConfig, assert *assert.Assertions) {
-			assert.Contains(
-				cfg.TypedSpec().ProxyArgs,
-				"--proxy-mode=iptables",
+			assert.False(cfg.TypedSpec().ProxyEnabled)
+			assert.Empty(cfg.TypedSpec().ProxyImage)
+
+			// non-configurable images are always rendered
+			assert.Equal("ghcr.io/siderolabs/flannel:"+constants.FlannelVersion, cfg.TypedSpec().FlannelImage)
+			assert.Equal(
+				"registry.k8s.io/networking/kube-network-policies:"+constants.KubeNetworkPoliciesVersion,
+				cfg.TypedSpec().FlannelKubeNetworkPoliciesImage,
 			)
+		},
+	)
+}
+
+func (suite *K8sControlPlaneSuite) TestReconcileWebhookKubeconfigs() {
+	const kubeconfig = `apiVersion: v1
+kind: Config
+clusters:
+  - name: webhook
+    cluster:
+      server: http://127.0.0.1:9051/
+contexts:
+  - name: webhook
+    context:
+      cluster: webhook
+current-context: webhook
+`
+
+	authorizerCfg := k8scfg.NewKubeAuthorizerConfigV1Alpha1()
+	authorizerCfg.MetaName = "webhook"
+	authorizerCfg.AuthorizerType = "Webhook"
+	authorizerCfg.AuthorizerWebhook.Object = map[string]any{
+		"timeout": "3s",
+	}
+	authorizerCfg.AuthorizerWebhookKubeconfig = kubeconfig
+
+	authnWebhookCfg := k8scfg.NewKubeAuthenticationWebhookConfigV1Alpha1()
+	authnWebhookCfg.WebhookKubeconfig = kubeconfig
+	authnWebhookCfg.WebhookVersion = "v1"
+	authnWebhookCfg.WebhookCacheTTL = pointer.To(time.Minute)
+
+	u, err := url.Parse("https://foo:6443")
+	suite.Require().NoError(err)
+
+	cn := k8scfg.NewKubeNetworkConfigV1Alpha1()
+	cn.NetworkPodSubnets = []meta.Prefix{
+		{Prefix: netip.MustParsePrefix(constants.DefaultIPv4PodCIDR)},
+	}
+	cn.NetworkServiceSubnets = []meta.Prefix{
+		{Prefix: netip.MustParsePrefix(constants.DefaultIPv4ServiceCIDR)},
+	}
+
+	ctr, err := container.New(
+		&v1alpha1.Config{
+			ConfigVersion: "v1alpha1",
+			MachineConfig: &v1alpha1.MachineConfig{
+				MachineType: "controlplane",
+			},
+			ClusterConfig: &v1alpha1.ClusterConfig{
+				ControlPlane: &v1alpha1.ControlPlaneConfig{ //nolint:staticcheck // testing deprecated field
+					Endpoint: &v1alpha1.Endpoint{
+						URL: u,
+					},
+				},
+			},
+		},
+		cn,
+		authorizerCfg,
+		authnWebhookCfg,
+	)
+	suite.Require().NoError(err)
+
+	suite.setupMachine(config.NewMachineConfig(ctr))
+
+	rtestutils.AssertResources(
+		suite.Ctx(), suite.T(), suite.State(), []resource.ID{k8s.AuthorizationConfigID},
+		func(authorizationConfig *k8s.AuthorizationConfig, assert *assert.Assertions) {
+			// legacy kube-apiserver configuration injects the default authorizers
+			assert.Equal(slices.Concat(v1alpha1.APIServerDefaultAuthorizationConfigAuthorizers, []k8s.AuthorizationAuthorizersSpec{
+				{
+					Type: "Webhook",
+					Name: "webhook",
+					Webhook: map[string]any{
+						"timeout": "3s",
+					},
+					Kubeconfig: kubeconfig,
+				},
+			}), authorizationConfig.TypedSpec().Config)
+		},
+	)
+
+	rtestutils.AssertResources(
+		suite.Ctx(), suite.T(), suite.State(), []resource.ID{k8s.AuthenticationConfigID},
+		func(authenticationConfig *k8s.AuthenticationConfig, assert *assert.Assertions) {
+			// no KubeAuthenticationConfig document, so the structured authentication config is not set
+			assert.Nil(authenticationConfig.TypedSpec().Config)
+			assert.Equal(&k8s.AuthenticationTokenWebhookSpec{
+				Kubeconfig: kubeconfig,
+				Version:    "v1",
+				CacheTTL:   pointer.To(time.Minute),
+			}, authenticationConfig.TypedSpec().TokenWebhook)
 		},
 	)
 }
@@ -951,18 +1048,17 @@ func TestK8sControlPlaneSuite(t *testing.T) {
 	t.Parallel()
 
 	suite.Run(t, &K8sControlPlaneSuite{
-		DefaultSuite: ctest.DefaultSuite{
-			Timeout: 10 * time.Second,
-			AfterSetup: func(suite *ctest.DefaultSuite) {
-				suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneAPIServerController()))
-				suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneAdmissionControlController()))
-				suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneAuditPolicyController()))
-				suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneAuthorizationController()))
-				suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneBootstrapManifestsController()))
-				suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneControllerManagerController()))
-				suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneExtraManifestsController()))
-				suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneSchedulerController()))
-			},
+		Timeout: 10 * time.Second,
+		AfterSetup: func(suite *ctest.DefaultSuite) {
+			suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneAPIServerController()))
+			suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneAdmissionControlController()))
+			suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneAuditPolicyController()))
+			suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneAuthenticationController()))
+			suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneAuthorizationController()))
+			suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneBootstrapManifestsController()))
+			suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneControllerManagerController()))
+			suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneExtraManifestsController()))
+			suite.Require().NoError(suite.Runtime().RegisterController(k8sctrl.NewControlPlaneSchedulerController()))
 		},
 	})
 }

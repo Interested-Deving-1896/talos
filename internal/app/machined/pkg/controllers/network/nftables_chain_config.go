@@ -7,6 +7,7 @@ package network
 import (
 	"cmp"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net/netip"
 	"slices"
@@ -54,6 +55,11 @@ func (ctrl *NfTablesChainConfigController) Inputs() []controller.Input {
 			Type:      network.NodeAddressType,
 			Kind:      controller.InputWeak,
 		},
+		{
+			Namespace: network.NamespaceName,
+			Type:      network.LinkStatusType,
+			Kind:      controller.InputWeak,
+		},
 	}
 }
 
@@ -99,13 +105,24 @@ func (ctrl *NfTablesChainConfigController) Run(ctx context.Context, r controller
 
 		r.StartTrackingOutputs()
 
-		if cfg != nil && !(cfg.Config().NetworkRules().DefaultAction() == nethelpers.DefaultActionAccept && cfg.Config().NetworkRules().Rules() == nil) {
-			if err = safe.WriterModify(ctx, r, network.NewNfTablesChain(network.NamespaceName, IngressChainName), ctrl.buildIngressChain(cfg)); err != nil {
-				return err
+		if cfg != nil {
+			acceptAllIngress := cfg.Config().NetworkRules().DefaultAction() == nethelpers.DefaultActionAccept && cfg.Config().NetworkRules().Rules() == nil
+			if !acceptAllIngress {
+				if err = safe.WriterModify(ctx, r, network.NewNfTablesChain(network.NamespaceName, IngressChainName), ctrl.buildIngressChain(cfg)); err != nil {
+					return err
+				}
 			}
 
-			if nodeAddresses != nil {
-				if err = safe.WriterModify(ctx, r, network.NewNfTablesChain(network.NamespaceName, PreroutingChainName), ctrl.buildPreroutingChain(cfg, nodeAddresses)); err != nil {
+			noPreroutingChain := acceptAllIngress && len(cfg.Config().NetworkLinkIngressConfigs()) == 0
+			if !noPreroutingChain {
+				linkStatuses, err := safe.ReaderListAll[*network.LinkStatus](ctx, r)
+				if err != nil {
+					return fmt.Errorf("error listing link statuses: %w", err)
+				}
+
+				linkNameResolver := network.NewLinkResolver(linkStatuses.All)
+
+				if err = safe.WriterModify(ctx, r, network.NewNfTablesChain(network.NamespaceName, PreroutingChainName), ctrl.buildPreroutingChain(cfg, nodeAddresses, linkNameResolver)); err != nil {
 					return err
 				}
 			}
@@ -141,6 +158,29 @@ func (ctrl *NfTablesChainConfigController) buildIngressChain(cfg *config.Machine
 				AnonCounter: true,
 				Verdict:     new(nethelpers.VerdictAccept),
 			},
+			// conntrack: accept established and related traffic, drop invalid traffic.
+			//
+			// This applies to both default-accept and default-block modes; otherwise
+			// replies to connections initiated by the machine itself might be dropped.
+			{
+				MatchConntrackState: &network.NfTablesConntrackStateMatch{
+					States: []nethelpers.ConntrackState{
+						nethelpers.ConntrackStateEstablished,
+						nethelpers.ConntrackStateRelated,
+					},
+				},
+				AnonCounter: true,
+				Verdict:     new(nethelpers.VerdictAccept),
+			},
+			{
+				MatchConntrackState: &network.NfTablesConntrackStateMatch{
+					States: []nethelpers.ConntrackState{
+						nethelpers.ConntrackStateInvalid,
+					},
+				},
+				AnonCounter: true,
+				Verdict:     new(nethelpers.VerdictDrop),
+			},
 		}
 
 		defaultAction := cfg.Config().NetworkRules().DefaultAction()
@@ -150,26 +190,6 @@ func (ctrl *NfTablesChainConfigController) buildIngressChain(cfg *config.Machine
 
 			spec.Rules = append(
 				spec.Rules,
-				// conntrack
-				network.NfTablesRule{
-					MatchConntrackState: &network.NfTablesConntrackStateMatch{
-						States: []nethelpers.ConntrackState{
-							nethelpers.ConntrackStateEstablished,
-							nethelpers.ConntrackStateRelated,
-						},
-					},
-					AnonCounter: true,
-					Verdict:     new(nethelpers.VerdictAccept),
-				},
-				network.NfTablesRule{
-					MatchConntrackState: &network.NfTablesConntrackStateMatch{
-						States: []nethelpers.ConntrackState{
-							nethelpers.ConntrackStateInvalid,
-						},
-					},
-					AnonCounter: true,
-					Verdict:     new(nethelpers.VerdictDrop),
-				},
 				// CVE-1999-0524 mitigation: drop timestamp and address mask ICMP requests
 				network.NfTablesRule{
 					MatchLayer4: &network.NfTablesLayer4Match{
@@ -211,52 +231,51 @@ func (ctrl *NfTablesChainConfigController) buildIngressChain(cfg *config.Machine
 
 			if hostDNSConfig := cfg.Config().NetworkHostDNSConfig(); hostDNSConfig != nil {
 				if hostDNSConfig.ForwardKubeDNSToHost() {
-					// allow traffic to host DNS
-					for _, protocol := range []nethelpers.Protocol{nethelpers.ProtocolUDP, nethelpers.ProtocolTCP} {
-						spec.Rules = append(
-							spec.Rules,
-							network.NfTablesRule{
-								MatchSourceAddress: &network.NfTablesAddressMatch{
-									IncludeSubnets: xslices.Map(
-										slices.Concat(
-											cfg.Config().Cluster().Network().PodCIDRs(),
-											cfg.Config().Cluster().Network().ServiceCIDRs(),
+					if k8sNetwork := cfg.Config().K8sNetworkConfig(); k8sNetwork != nil {
+						// allow traffic to host DNS
+						for _, protocol := range []nethelpers.Protocol{nethelpers.ProtocolUDP, nethelpers.ProtocolTCP} {
+							spec.Rules = append(
+								spec.Rules,
+								network.NfTablesRule{
+									MatchSourceAddress: &network.NfTablesAddressMatch{
+										IncludeSubnets: slices.Concat(
+											k8sNetwork.PodCIDRs(),
+											k8sNetwork.ServiceCIDRs(),
 										),
-										netip.MustParsePrefix,
-									),
-								},
-								MatchDestinationAddress: &network.NfTablesAddressMatch{
-									IncludeSubnets: hostDNSSubnets(cfg.Config().Cluster().Network()),
-								},
-								MatchLayer4: &network.NfTablesLayer4Match{
-									Protocol: protocol,
-									MatchDestinationPort: &network.NfTablesPortMatch{
-										Ranges: []network.PortRange{{Lo: 53, Hi: 53}},
 									},
+									MatchDestinationAddress: &network.NfTablesAddressMatch{
+										IncludeSubnets: hostDNSSubnets(k8sNetwork),
+									},
+									MatchLayer4: &network.NfTablesLayer4Match{
+										Protocol: protocol,
+										MatchDestinationPort: &network.NfTablesPortMatch{
+											Ranges: []network.PortRange{{Lo: 53, Hi: 53}},
+										},
+									},
+									AnonCounter: true,
+									Verdict:     new(nethelpers.VerdictAccept),
 								},
-								AnonCounter: true,
-								Verdict:     new(nethelpers.VerdictAccept),
-							},
-						)
+							)
+						}
 					}
 				}
 			}
 
-			if cfg.Config().Cluster() != nil {
+			if k8sNetwork := cfg.Config().K8sNetworkConfig(); k8sNetwork != nil {
 				spec.Rules = append(
 					spec.Rules,
 					// allow Kubernetes pod/service traffic
 					network.NfTablesRule{
 						MatchSourceAddress: &network.NfTablesAddressMatch{
-							IncludeSubnets: xslices.Map(
-								slices.Concat(cfg.Config().Cluster().Network().PodCIDRs(), cfg.Config().Cluster().Network().ServiceCIDRs()),
-								netip.MustParsePrefix,
+							IncludeSubnets: slices.Concat(
+								k8sNetwork.PodCIDRs(),
+								k8sNetwork.ServiceCIDRs(),
 							),
 						},
 						MatchDestinationAddress: &network.NfTablesAddressMatch{
-							IncludeSubnets: xslices.Map(
-								slices.Concat(cfg.Config().Cluster().Network().PodCIDRs(), cfg.Config().Cluster().Network().ServiceCIDRs()),
-								netip.MustParsePrefix,
+							IncludeSubnets: slices.Concat(
+								k8sNetwork.PodCIDRs(),
+								k8sNetwork.ServiceCIDRs(),
 							),
 						},
 						AnonCounter: true,
@@ -307,14 +326,28 @@ func (ctrl *NfTablesChainConfigController) buildIngressChain(cfg *config.Machine
 	}
 }
 
-func (ctrl *NfTablesChainConfigController) buildPreroutingChain(cfg *config.MachineConfig, nodeAddresses *network.NodeAddress) func(*network.NfTablesChain) error {
+func (ctrl *NfTablesChainConfigController) buildPreroutingChain(
+	cfg *config.MachineConfig,
+	nodeAddresses *network.NodeAddress,
+	linkNameResolver *network.LinkResolver,
+) func(*network.NfTablesChain) error {
 	// convert CIDRs to /32 (/128) prefixes matching only the address itself
-	myAddresses := xslices.Map(
-		nodeAddresses.TypedSpec().Addresses,
-		func(addr netip.Prefix) netip.Prefix {
-			return netip.PrefixFrom(addr.Addr(), addr.Addr().BitLen())
-		},
-	)
+	var myAddresses, mySubnetBroadcasts []netip.Prefix
+
+	// built the chain even if the node addresses are not known yet,
+	// so that link ingress filtering fails closed in that window
+	if nodeAddresses != nil {
+		myAddresses = xslices.Map(
+			nodeAddresses.TypedSpec().Addresses,
+			func(addr netip.Prefix) netip.Prefix {
+				return netip.PrefixFrom(addr.Addr(), addr.Addr().BitLen())
+			},
+		)
+
+		mySubnetBroadcasts = subnetBroadcasts(nodeAddresses.TypedSpec().Addresses)
+	}
+
+	defaultLinkIngressDestinations := slices.Concat(myAddresses, mySubnetBroadcasts, implicitLinkIngressDestinations)
 
 	return func(chain *network.NfTablesChain) error {
 		spec := chain.TypedSpec()
@@ -343,9 +376,12 @@ func (ctrl *NfTablesChainConfigController) buildPreroutingChain(cfg *config.Mach
 			},
 		}
 
-		// if the traffic is not addressed to the machine, ignore (accept it)
-		spec.Rules = append(
-			spec.Rules,
+		for _, linkIngress := range cfg.Config().NetworkLinkIngressConfigs() {
+			spec.Rules = append(spec.Rules, networkLinkIngressRule(linkIngress, defaultLinkIngressDestinations, linkNameResolver))
+		}
+
+		// ignore (forward) traffic not addressed to the machine unless it was explicitly blocked by the ingress rules above
+		spec.Rules = append(spec.Rules,
 			network.NfTablesRule{
 				MatchDestinationAddress: &network.NfTablesAddressMatch{
 					IncludeSubnets: myAddresses,
@@ -353,8 +389,7 @@ func (ctrl *NfTablesChainConfigController) buildPreroutingChain(cfg *config.Mach
 				},
 				AnonCounter: true,
 				Verdict:     new(nethelpers.VerdictAccept),
-			},
-		)
+			})
 
 		// drop any 'new' connections to ports outside of the allowed ranges
 		for _, rule := range cfg.Config().NetworkRules().Rules() {
@@ -433,11 +468,34 @@ func (ctrl *NfTablesChainConfigController) buildPreroutingChain(cfg *config.Mach
 	}
 }
 
-func hostDNSSubnets(clusterNetwork cfg.ClusterNetwork) []netip.Prefix {
+// networkLinkIngressRule builds a rule dropping the packets arriving on the link which are not
+// destined to one of the allowed destination addresses.
+func networkLinkIngressRule(linkIngress cfg.NetworkLinkIngressConfig, defaultDestinations []netip.Prefix, linkNameResolver *network.LinkResolver) network.NfTablesRule {
+	destinations := linkIngress.DestinationAddresses()
+
+	if destinations == nil {
+		destinations = defaultDestinations
+	}
+
+	return network.NfTablesRule{
+		MatchIIfName: &network.NfTablesIfNameMatch{
+			InterfaceNames: []string{linkNameResolver.Resolve(linkIngress.Name())},
+			Operator:       nethelpers.OperatorEqual,
+		},
+		MatchDestinationAddress: &network.NfTablesAddressMatch{
+			IncludeSubnets: destinations,
+			Invert:         true,
+		},
+		AnonCounter: true,
+		Verdict:     new(nethelpers.VerdictDrop),
+	}
+}
+
+func hostDNSSubnets(k8sNetwork cfg.K8sNetworkConfig) []netip.Prefix {
 	result := []netip.Addr{hostDNSIPv4}
 
-	for _, podCIDR := range clusterNetwork.PodCIDRs() {
-		if netip.MustParsePrefix(podCIDR).Addr().Is6() {
+	for _, podCIDR := range k8sNetwork.PodCIDRs() {
+		if podCIDR.Addr().Is6() {
 			result = append(result, hostDNSIPv6)
 		}
 	}
@@ -445,7 +503,36 @@ func hostDNSSubnets(clusterNetwork cfg.ClusterNetwork) []netip.Prefix {
 	return xslices.Map(result, func(a netip.Addr) netip.Prefix { return netip.PrefixFrom(a, a.BitLen()) })
 }
 
+// subnetBroadcasts returns the directed broadcast addresses of the IPv4 subnets.
+func subnetBroadcasts(subnets []netip.Prefix) []netip.Prefix {
+	var broadcasts []netip.Prefix
+
+	for _, subnet := range subnets {
+		if !subnet.Addr().Is4() || subnet.Bits() >= 31 {
+			continue
+		}
+
+		addr := subnet.Masked().Addr().As4()
+
+		networkAddr := binary.BigEndian.Uint32(addr[:])
+		hostBits := (^uint32(0)) >> subnet.Bits() // all ones, shifted right past the network bits, e.g. 0x000000ff for /24
+
+		binary.BigEndian.PutUint32(addr[:], networkAddr|hostBits)
+
+		broadcasts = append(broadcasts, netip.PrefixFrom(netip.AddrFrom4(addr), 32))
+	}
+
+	return broadcasts
+}
+
 var (
 	hostDNSIPv4 = netip.MustParseAddr(constants.HostDNSAddress)
 	hostDNSIPv6 = netip.MustParseAddr(constants.HostDNSAddressV6)
+
+	implicitLinkIngressDestinations = []netip.Prefix{
+		netip.MustParsePrefix("255.255.255.255/32"), // IPv4 broadcast
+		netip.MustParsePrefix("224.0.0.0/4"),        // IPv4 multicast
+		netip.MustParsePrefix("ff00::/8"),           // IPv6 multicast
+		netip.MustParsePrefix("fe80::/10"),          // IPv6 link-local
+	}
 )

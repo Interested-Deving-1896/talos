@@ -8,79 +8,50 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/blang/semver/v4"
-	"github.com/siderolabs/gen/xerrors"
-	"google.golang.org/grpc/metadata"
 
-	"github.com/siderolabs/talos/pkg/machinery/api/common"
+	"github.com/siderolabs/talos/cmd/talosctl/pkg/talos/safeout"
+	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/client"
+	"github.com/siderolabs/talos/pkg/machinery/client/multiplex"
 	"github.com/siderolabs/talos/pkg/machinery/version"
 )
 
-// FailIfMultiNodes checks if ctx contains multi-node request metadata.
-func FailIfMultiNodes(ctx context.Context, command string) error {
-	md, ok := metadata.FromOutgoingContext(ctx)
-	if !ok {
-		return nil
-	}
-
-	if len(md.Get("nodes")) <= 1 {
-		return nil
-	}
-
-	return fmt.Errorf("command %q is not supported with multiple nodes", command)
+// ClientFactory is the interface for the client factory.
+type ClientFactory interface {
+	BuildClient(ctx context.Context, node string) (context.Context, *client.Client, error)
+	Nodes() []string
 }
 
-// CheckErrors goes through the returned message list and checks if any messages have errors set.
-func CheckErrors[T interface{ GetMetadata() *common.Metadata }](messages ...T) error {
-	var err error
+// GetTalosVersionBounds returns the lowest and the highest Talos version running across all nodes.
+func GetTalosVersionBounds(ctx context.Context, clientFactory ClientFactory) (lowest, highest semver.Version, err error) {
+	found := false
 
-	for _, msg := range messages {
-		md := msg.GetMetadata()
-		if md != nil && md.Error != "" {
-			err = AppendErrors(err, errors.New(md.Error))
-		}
-	}
-
-	return err
-}
-
-// VersionOutsideRangeError is returned when a node is running a Talos version that is outside the desired range.
-type VersionOutsideRangeError struct{}
-
-// TalosVersionCheck verifies that all nodes are running the desired Talos version.
-func TalosVersionCheck(ctx context.Context, c *client.Client, desired semver.Range) error {
-	serverVersions, err := c.Version(ctx)
-	if err != nil {
-		return fmt.Errorf("error getting server versions: %w", err)
-	}
-
-	var errs error
-
-	for _, msg := range serverVersions.GetMessages() {
-		node := msg.GetMetadata().GetHostname()
-
-		serverVersion, err := semver.ParseTolerant(msg.GetVersion().Tag)
-		if err != nil {
-			return fmt.Errorf("%s: error parsing server version: %w", node, err)
+	if err = forEachServerVersion(ctx, clientFactory, func(_ string, serverVersion semver.Version) {
+		if !found || serverVersion.LT(lowest) {
+			lowest = serverVersion
 		}
 
-		if !desired(serverVersion) {
-			errs = errors.Join(errs, xerrors.NewTaggedf[VersionOutsideRangeError]("%s: server version %s is outside the desired range", node, serverVersion))
+		if !found || serverVersion.GT(highest) {
+			highest = serverVersion
 		}
+
+		found = true
+	}); err != nil {
+		return semver.Version{}, semver.Version{}, err
 	}
 
-	return errs
+	if !found {
+		return semver.Version{}, semver.Version{}, errors.New("no server versions found")
+	}
+
+	return lowest, highest, nil
 }
 
 // ClientVersionCheck verifies that client is not outdated vs. Talos version.
-func ClientVersionCheck(ctx context.Context, c *client.Client) error {
-	// ignore the error, as we are only interested in the nodes which respond
-	serverVersions, _ := c.Version(ctx) //nolint:errcheck
-
+func ClientVersionCheck(ctx context.Context, clientFactory ClientFactory) error {
 	clientVersion, err := semver.ParseTolerant(version.NewVersion().Tag)
 	if err != nil {
 		return fmt.Errorf("error parsing client version: %w", err)
@@ -88,22 +59,50 @@ func ClientVersionCheck(ctx context.Context, c *client.Client) error {
 
 	var warnings []string
 
-	for _, msg := range serverVersions.GetMessages() {
-		node := msg.GetMetadata().GetHostname()
-
-		serverVersion, err := semver.ParseTolerant(msg.GetVersion().Tag)
-		if err != nil {
-			return fmt.Errorf("%s: error parsing server version: %w", node, err)
-		}
-
+	errs := forEachServerVersion(ctx, clientFactory, func(node string, serverVersion semver.Version) {
 		if serverVersion.Compare(clientVersion) < 0 {
 			warnings = append(warnings, fmt.Sprintf("%s: server version %s is older than client version %s", node, serverVersion, clientVersion))
 		}
-	}
+	})
 
 	if warnings != nil {
-		fmt.Fprintf(os.Stderr, "WARNING: %s\n", strings.Join(warnings, ", "))
+		fmt.Fprintf(safeout.Stderr(), "WARNING: %s\n", strings.Join(warnings, ", "))
 	}
 
-	return nil
+	return errs
+}
+
+// forEachServerVersion fetches the Talos version from all nodes and calls fn for each successfully parsed version.
+//
+// Errors fetching or parsing versions are collected and returned after all nodes are processed.
+func forEachServerVersion(ctx context.Context, clientFactory ClientFactory, fn func(node string, serverVersion semver.Version)) error {
+	respCh := multiplex.UnaryViaFactory(
+		ctx, clientFactory,
+		func(ctx context.Context, c *client.Client) (*machine.VersionResponse, error) {
+			return c.Version(ctx)
+		},
+	)
+
+	var errs error
+
+	for resp := range respCh {
+		if resp.Err != nil {
+			errs = errors.Join(errs, fmt.Errorf("%s: error getting server version: %w", resp.Node, resp.Err))
+
+			continue
+		}
+
+		for _, msg := range resp.Payload.GetMessages() {
+			serverVersion, err := semver.ParseTolerant(msg.GetVersion().Tag)
+			if err != nil {
+				errs = errors.Join(errs, fmt.Errorf("%s: error parsing server version: %w", resp.Node, err))
+
+				continue
+			}
+
+			fn(resp.Node, serverVersion)
+		}
+	}
+
+	return errs
 }

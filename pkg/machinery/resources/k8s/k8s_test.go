@@ -11,7 +11,6 @@ import (
 	"github.com/cosi-project/runtime/pkg/resource/protobuf"
 	"github.com/cosi-project/runtime/pkg/state"
 	"github.com/cosi-project/runtime/pkg/state/impl/inmem"
-	"github.com/cosi-project/runtime/pkg/state/impl/namespaced"
 	"github.com/cosi-project/runtime/pkg/state/registry"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/stretchr/testify/assert"
@@ -23,7 +22,7 @@ import (
 func TestRegisterResource(t *testing.T) {
 	ctx := t.Context()
 
-	resources := state.WrapCore(namespaced.NewState(inmem.Build))
+	resources := state.WrapCore(inmem.NewState())
 	resourceRegistry := registry.NewResourceRegistry(resources)
 
 	for _, resource := range []meta.ResourceWithRD{
@@ -31,6 +30,7 @@ func TestRegisterResource(t *testing.T) {
 		&k8s.APIServerConfig{},
 		&k8s.KubePrismEndpoints{},
 		&k8s.AuditPolicyConfig{},
+		&k8s.AuthenticationConfig{},
 		&k8s.ConfigStatus{},
 		&k8s.ControllerManagerConfig{},
 		&k8s.Endpoint{},
@@ -39,6 +39,7 @@ func TestRegisterResource(t *testing.T) {
 		&k8s.KubeletKubeconfig{},
 		&k8s.KubeletLifecycle{},
 		&k8s.KubeletSpec{},
+		&k8s.KubeletStatus{},
 		&k8s.KubePrismStatuses{},
 		&k8s.KubePrismConfig{},
 		&k8s.ManifestStatus{},
